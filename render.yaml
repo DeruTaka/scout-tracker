@@ -1,0 +1,26 @@
+# Render Blueprint — deploys the Team-Scouter web UI as a Docker service with a
+# persistent disk for the datastore. In Render: New -> Blueprint -> pick this repo.
+# You'll be prompted for the env vars marked `sync: false` (they are NOT stored
+# in the repo). A persistent disk requires a paid instance (Starter+).
+services:
+  - type: web
+    name: team-scouter
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    disk:
+      name: scouter-data
+      mountPath: /app/data
+      sizeGB: 1
+    envVars:
+      - key: SHEET_ID
+        sync: false
+      - key: GOOGLE_OAUTH_CLIENT_ID
+        sync: false
+      - key: GOOGLE_OAUTH_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_OAUTH_REFRESH_TOKEN
+        sync: false
+      - key: SCOUT_PASSWORD
+        sync: false

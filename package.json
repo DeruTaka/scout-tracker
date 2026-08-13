@@ -1,0 +1,35 @@
+{
+  "name": "ps-team-scouter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Reconstruct both teams from Pokemon Showdown replays: importable pastes, inferred sets, EV spreads, and an auto-updating Google Sheet / xlsx of unique sets per trainer.",
+  "bin": {
+    "scout": "./src/cli.ts"
+  },
+  "scripts": {
+    "scout": "tsx src/cli.ts",
+    "serve": "tsx src/cli.ts serve",
+    "start": "tsx src/cli.ts serve",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@google-cloud/local-auth": "^3.0.1",
+    "@pkmn/data": "^0.9.30",
+    "@pkmn/dex": "^0.9.30",
+    "@pkmn/sets": "^5.1.1",
+    "@smogon/calc": "^0.10.0",
+    "exceljs": "^4.4.0",
+    "express": "^4.21.2",
+    "googleapis": "^144.0.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

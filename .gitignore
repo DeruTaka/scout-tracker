@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.env
+credentials.json
+oauth_client.json
+data/store.json
+data/google-token.json
+data/cache/
+*.xlsx
+!examples/*.xlsx
+
+# Local Claude Code settings
+.claude/settings.local.json

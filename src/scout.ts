@@ -1,0 +1,83 @@
+// End-to-end pipeline: replay -> parsed reveals -> candidate sets (dex +
+// historical priors) -> damage-based set selection -> EV derivation -> legality
+// -> importable pastes.
+import type { DexSet, MatchedSet, Replay, ScoutedReplay, ScoutedTeam } from './types.js';
+import { getGen, toID } from './data/dex.js';
+import { getSetsForSpecies } from './data/sets-provider.js';
+import { parseReplay } from './replay/parse.js';
+import { candidateMatchedSets } from './match/match-set.js';
+import { extractObservations } from './ev/field-tracker.js';
+import { deriveEvs, selectSetsByDamage, type SideCandidates } from './ev/engine.js';
+import { exportTeam } from './build/team-paste.js';
+import { illegalFilledMoves } from './build/pokemon-set.js';
+
+export interface ScoutOptions {
+  /**
+   * Supply extra candidate sets (a trainer's historical sets and/or common
+   * usage) for a given player + format + species. These join the dex sets in
+   * the pool that damage evidence selects among.
+   */
+  getPriorSets?: (player: string, formatid: string, baseSpecies: string) => DexSet[] | Promise<DexSet[]>;
+}
+
+function setSignature(s: DexSet): string {
+  const moves = [...s.movepool].map(toID).sort().join(',');
+  const item = Array.isArray(s.item) ? s.item.join('/') : s.item ?? '';
+  const nature = Array.isArray(s.nature) ? s.nature.join('/') : s.nature ?? '';
+  return `${moves}|${item}|${nature}|${JSON.stringify(s.evs ?? {})}`;
+}
+
+function mergeSets(dexSets: DexSet[], priors: DexSet[]): DexSet[] {
+  const out: DexSet[] = [];
+  const seen = new Set<string>();
+  for (const s of [...priors, ...dexSets]) {
+    const sig = setSignature(s);
+    if (seen.has(sig)) continue;
+    seen.add(sig);
+    out.push(s);
+  }
+  return out;
+}
+
+export async function scoutReplay(replay: Replay, opts: ScoutOptions = {}): Promise<ScoutedReplay> {
+  const gen = getGen(replay.gen);
+  const teams = parseReplay(replay);
+  const observations = extractObservations(replay);
+
+  // Build candidate pools per mon (dex sets + historical priors).
+  const sideCands: SideCandidates[] = [];
+  for (const team of teams) {
+    const candidates: MatchedSet[][] = [];
+    for (const mon of team.mons) {
+      const dexSets = await getSetsForSpecies(replay.formatid, mon.baseSpecies);
+      const priors = opts.getPriorSets
+        ? await opts.getPriorSets(team.player, replay.formatid, mon.baseSpecies)
+        : [];
+      candidates.push(candidateMatchedSets(gen, mon, mergeSets(dexSets, priors)));
+    }
+    sideCands.push({ side: team.side, candidates });
+  }
+
+  // Let observed damage pick the best-fitting set, then fine-tune EVs.
+  const sideSets = selectSetsByDamage(replay.gen, sideCands, observations);
+  deriveEvs(replay.gen, sideSets, observations);
+
+  // Legality pass (flags dex-filled moves that aren't learnable; revealed moves
+  // are trusted). Then export pastes.
+  const scoutedTeams: ScoutedTeam[] = [];
+  for (let i = 0; i < teams.length; i++) {
+    const sets = sideSets[i]!.sets;
+    for (const ms of sets) {
+      const bad = await illegalFilledMoves(gen, ms);
+      if (bad.length) ms.notes.push(`Possibly illegal filled move(s): ${bad.join(', ')}.`);
+    }
+    scoutedTeams.push({
+      player: teams[i]!.player,
+      side: teams[i]!.side,
+      sets,
+      paste: exportTeam(sets),
+    });
+  }
+
+  return { replay, teams: scoutedTeams, scoutedAt: Date.now() };
+}

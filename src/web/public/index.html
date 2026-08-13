@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>PS Team Scouter</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --panel2:#1e222b; --line:#2a2f3a; --text:#e6e8ee; --muted:#9aa3b2; --accent:#6ea8fe; --good:#5bd6a0; --warn:#e0b25b; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 system-ui, sans-serif; }
+  header { padding:16px 20px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+  header h1 { font-size:18px; margin:0; }
+  header .status { color:var(--muted); font-size:12px; margin-left:auto; }
+  header a { color:var(--accent); }
+  main { max-width:1100px; margin:0 auto; padding:20px; }
+  textarea { width:100%; min-height:90px; background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:8px; padding:10px; font:13px/1.4 ui-monospace, monospace; resize:vertical; }
+  .row { display:flex; gap:10px; margin:10px 0; flex-wrap:wrap; align-items:center; }
+  button { background:var(--accent); color:#08111f; border:0; border-radius:8px; padding:8px 14px; font-weight:600; cursor:pointer; }
+  button.secondary { background:var(--panel2); color:var(--text); border:1px solid var(--line); }
+  button:disabled { opacity:.5; cursor:default; }
+  input[type=text] { background:var(--panel); color:var(--text); border:1px solid var(--line); border-radius:8px; padding:7px 10px; }
+  .replay { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; margin:14px 0; }
+  .replay h3 { margin:0 0 4px; font-size:15px; }
+  .replay .meta { color:var(--muted); font-size:12px; margin-bottom:10px; }
+  .teams { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  @media (max-width:800px){ .teams{ grid-template-columns:1fr; } }
+  .team { background:var(--panel2); border:1px solid var(--line); border-radius:8px; padding:10px; }
+  .team h4 { margin:0 0 8px; display:flex; justify-content:space-between; align-items:center; }
+  pre.paste { background:#0b0d12; border:1px solid var(--line); border-radius:6px; padding:10px; overflow:auto; font:12px/1.4 ui-monospace, monospace; white-space:pre; max-height:340px; }
+  .mon { border-top:1px solid var(--line); padding:6px 0; }
+  .mon .name { font-weight:600; }
+  .mon .sub { color:var(--muted); font-size:12px; }
+  .chip { display:inline-block; font-size:11px; padding:1px 6px; border-radius:20px; border:1px solid var(--line); color:var(--muted); margin-left:6px; }
+  .conf-hi{ color:var(--good);} .conf-lo{ color:var(--warn);}
+  .note { color:var(--muted); font-size:11px; }
+  .copy { font-size:11px; padding:3px 8px; }
+  .err { color:#ff7676; }
+  h2 { border-bottom:1px solid var(--line); padding-bottom:6px; margin-top:28px; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; }
+  .spinner { color:var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>⚔️ PS Team Scouter</h1>
+  <span class="status" id="status">loading…</span>
+</header>
+<main>
+  <p class="note">Paste Pokémon Showdown replay URLs or IDs (any format), one per line or space/comma separated.</p>
+  <textarea id="urls" placeholder="https://replay.pokemonshowdown.com/smogtours-gen8uu-963226&#10;gen9ou-..."></textarea>
+  <div class="row">
+    <button id="ingestBtn">Scout &amp; update sheet</button>
+    <button id="previewBtn" class="secondary">Preview only (don't store)</button>
+    <label class="note"><input type="checkbox" id="force" /> re-scout if already stored</label>
+    <span id="busy" class="spinner"></span>
+  </div>
+
+  <div id="results"></div>
+
+  <h2>Unique sets by trainer</h2>
+  <div class="row">
+    <input type="text" id="trainerFilter" placeholder="filter by trainer…" />
+    <button class="secondary" id="refreshUnique">Refresh</button>
+  </div>
+  <div id="unique"></div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+async function loadStatus() {
+  const s = await (await fetch('/api/status')).json();
+  const sheet = s.googleConfigured ? 'Google Sheet: on' : 'Google Sheet: off (local .xlsx only)';
+  $('status').innerHTML = `${s.replays} replays · ${s.uniqueSets} unique sets · ${sheet}`;
+}
+
+function confClass(c){ return c >= 0.7 ? 'conf-hi' : (c < 0.5 ? 'conf-lo' : ''); }
+
+function monRow(m) {
+  const notes = (m.notes||[]).map((n)=>`<div class="note">• ${esc(n)}</div>`).join('');
+  return `<div class="mon">
+    <div><span class="name">${esc(m.species)}</span>
+      <span class="chip">${esc(m.matchedRole||'no dex set')}</span>
+      <span class="chip ${confClass(m.confidence)}">conf ${m.confidence.toFixed(2)}</span>
+      <span class="chip">${esc(m.evSource)}</span></div>
+    <div class="sub">${esc(m.moves.join(' / '))}</div>
+    <div class="sub">${esc(m.item||'—')} · ${esc(m.ability||'—')} · ${esc(m.nature)} · ${esc(evStr(m.evs))}${m.tera?(' · Tera '+esc(m.tera)):''}</div>
+    ${notes}
+  </div>`;
+}
+function evStr(evs){ const L={hp:'HP',atk:'Atk',def:'Def',spa:'SpA',spd:'SpD',spe:'Spe'};
+  return Object.keys(L).filter(k=>evs&&evs[k]).map(k=>evs[k]+' '+L[k]).join(' / ')||'(none)'; }
+
+function renderReplay(s) {
+  const teams = s.teams.map((t)=>`
+    <div class="team">
+      <h4>${esc(t.player)} <button class="copy secondary" data-paste="${encodeURIComponent(t.paste)}">copy paste</button></h4>
+      ${t.sets.map(monRow).join('')}
+      <details><summary class="note">importable paste</summary><pre class="paste">${esc(t.paste)}</pre></details>
+    </div>`).join('');
+  return `<div class="replay">
+    <h3>${esc(s.replay.format)} — ${esc(s.replay.players.join(' vs '))}</h3>
+    <div class="meta"><a href="${esc(s.replay.url)}" target="_blank">${esc(s.replay.id)}</a>${s.replay.winner?(' · winner: '+esc(s.replay.winner)):''}</div>
+    <div class="teams">${teams}</div>
+  </div>`;
+}
+
+function wireCopy(container){
+  container.querySelectorAll('button[data-paste]').forEach((b)=>{
+    b.onclick = () => { navigator.clipboard.writeText(decodeURIComponent(b.dataset.paste)); b.textContent='copied!'; setTimeout(()=>b.textContent='copy paste',1200); };
+  });
+}
+
+async function run(endpoint) {
+  const urls = $('urls').value;
+  if (!urls.trim()) return;
+  $('busy').textContent = 'working…';
+  $('ingestBtn').disabled = $('previewBtn').disabled = true;
+  try {
+    const body = { urls, force: $('force').checked };
+    const r = await (await fetch(endpoint, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) })).json();
+    if (r.error) { $('results').innerHTML = `<div class="err">${esc(r.error)}</div>`; return; }
+    const list = endpoint.endsWith('ingest')
+      ? r.results.map((x)=> x.error ? `<div class="err">✗ ${esc(x.id)}: ${esc(x.error)}</div>` : x.skipped ? `<div class="note">• ${esc(x.id)} already stored</div>` : renderReplay(x.scouted)).join('')
+      : r.scouted.map(renderReplay).join('');
+    let banner = '';
+    if (endpoint.endsWith('ingest') && r.output) {
+      banner = `<div class="note">Wrote ${esc(r.output.xlsxPath)}${r.output.sheetUrl?` · <a href="${esc(r.output.sheetUrl)}" target="_blank">open Google Sheet</a>`:''}${r.output.sheetError?` · sheet error: ${esc(r.output.sheetError)}`:''}</div>`;
+    }
+    $('results').innerHTML = banner + list;
+    wireCopy($('results'));
+    loadStatus(); loadUnique();
+  } catch (e) { $('results').innerHTML = `<div class="err">${esc(e.message||e)}</div>`; }
+  finally { $('busy').textContent=''; $('ingestBtn').disabled=$('previewBtn').disabled=false; }
+}
+
+async function loadUnique() {
+  const t = encodeURIComponent($('trainerFilter').value.trim());
+  const r = await (await fetch('/api/unique?trainer='+t)).json();
+  if (!r.uniqueSets.length) { $('unique').innerHTML = '<div class="note">No sets stored yet.</div>'; return; }
+  const rows = r.uniqueSets.map((u)=>`<tr>
+    <td>${esc(u.player)}</td><td>${esc(u.format)}</td><td>${esc(u.species)}</td>
+    <td>${u.count}</td><td>${esc(u.set.moves.join(', '))}</td>
+    <td>${esc(u.set.item||'—')}</td><td>${esc(u.set.ability||'—')}</td>
+    <td>${esc(u.set.nature)} ${esc(evStr(u.set.evs))}${u.set.tera?(' · Tera '+esc(u.set.tera)):''}</td>
+    <td><button class="copy secondary" data-paste="${encodeURIComponent(paste(u.set))}">copy</button></td>
+  </tr>`).join('');
+  $('unique').innerHTML = `<table><thead><tr><th>Trainer</th><th>Format</th><th>Pokémon</th><th>×</th><th>Moves</th><th>Item</th><th>Ability</th><th>Spread</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
+  wireCopy($('unique'));
+}
+// minimal client-side paste for the unique table copy button
+function paste(s){
+  const evs = evStr(s.evs);
+  let out = s.species + (s.item?(' @ '+s.item):'') + '\n';
+  if (s.ability) out += 'Ability: '+s.ability+'\n';
+  if (s.tera) out += 'Tera Type: '+s.tera+'\n';
+  if (evs!=='(none)') out += 'EVs: '+evs+'\n';
+  out += (s.nature||'Serious')+' Nature\n';
+  out += s.moves.map((m)=>'- '+m).join('\n');
+  return out;
+}
+
+$('ingestBtn').onclick = () => run('/api/ingest');
+$('previewBtn').onclick = () => run('/api/preview');
+$('refreshUnique').onclick = loadUnique;
+$('trainerFilter').oninput = () => { clearTimeout(window._t); window._t = setTimeout(loadUnique, 250); };
+loadStatus(); loadUnique();
+</script>
+</body>
+</html>
