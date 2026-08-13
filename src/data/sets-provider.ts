@@ -17,14 +17,16 @@ interface RawSet {
   item?: string | string[];
   nature?: string | string[];
   teratypes?: string | string[];
-  evs?: Record<string, number>;
-  ivs?: Record<string, number>;
+  evs?: Record<string, number> | Record<string, number>[];
+  ivs?: Record<string, number> | Record<string, number>[];
   level?: number;
 }
 
 function cachePath(formatid: string): string {
   return join(CACHE_DIR, `sets-${formatid}.json`);
 }
+
+type EvBlock = Record<string, number>;
 
 function normalizeSets(rawByRole: Record<string, RawSet>): DexSet[] {
   const out: DexSet[] = [];
@@ -34,17 +36,29 @@ function normalizeSets(rawByRole: Record<string, RawSet>): DexSet[] {
       if (Array.isArray(slot)) movepool.push(...slot);
       else movepool.push(slot);
     }
-    out.push({
-      role,
-      moves: raw.moves ?? [],
-      movepool: [...new Set(movepool)],
-      ability: raw.ability,
-      item: raw.item,
-      nature: raw.nature,
-      teratypes: raw.teratypes,
-      evs: raw.evs as DexSet['evs'],
-      ivs: raw.ivs as DexSet['ivs'],
-      level: raw.level,
+    // A set can list several alternative EV spreads (and parallel natures).
+    // Emit one candidate DexSet per spread so damage evidence can pick.
+    const evsList: (EvBlock | undefined)[] = Array.isArray(raw.evs)
+      ? (raw.evs as EvBlock[]).slice(0, 3)
+      : [raw.evs as EvBlock | undefined];
+    const ivsList: (EvBlock | undefined)[] = Array.isArray(raw.ivs)
+      ? (raw.ivs as EvBlock[])
+      : [raw.ivs as EvBlock | undefined];
+    const natures = Array.isArray(raw.nature) ? raw.nature : undefined;
+
+    evsList.forEach((evs, i) => {
+      out.push({
+        role: evsList.length > 1 ? `${role} (spread ${i + 1})` : role,
+        moves: raw.moves ?? [],
+        movepool: [...new Set(movepool)],
+        ability: raw.ability,
+        item: raw.item,
+        nature: natures ? natures[i] ?? natures[0] : raw.nature,
+        teratypes: raw.teratypes,
+        evs: evs as DexSet['evs'],
+        ivs: (ivsList[i] ?? ivsList[0]) as DexSet['ivs'],
+        level: raw.level,
+      });
     });
   }
   return out;

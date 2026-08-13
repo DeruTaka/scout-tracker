@@ -10,6 +10,7 @@ import { extractObservations } from './ev/field-tracker.js';
 import { deriveEvs, selectSetsByDamage, type SideCandidates } from './ev/engine.js';
 import { exportTeam } from './build/team-paste.js';
 import { illegalFilledMoves } from './build/pokemon-set.js';
+import { getUsageSets, getUsageSummary } from './data/usage-provider.js';
 
 export interface ScoutOptions {
   /**
@@ -18,6 +19,8 @@ export interface ScoutOptions {
    * the pool that damage evidence selects among.
    */
   getPriorSets?: (player: string, formatid: string, baseSpecies: string) => DexSet[] | Promise<DexSet[]>;
+  /** Pull Smogon usage stats as extra candidates + a reference note (default on). */
+  useUsage?: boolean;
 }
 
 function setSignature(s: DexSet): string {
@@ -27,10 +30,10 @@ function setSignature(s: DexSet): string {
   return `${moves}|${item}|${nature}|${JSON.stringify(s.evs ?? {})}`;
 }
 
-function mergeSets(dexSets: DexSet[], priors: DexSet[]): DexSet[] {
+function mergeSets(...lists: DexSet[][]): DexSet[] {
   const out: DexSet[] = [];
   const seen = new Set<string>();
-  for (const s of [...priors, ...dexSets]) {
+  for (const s of lists.flat()) {
     const sig = setSignature(s);
     if (seen.has(sig)) continue;
     seen.add(sig);
@@ -41,10 +44,11 @@ function mergeSets(dexSets: DexSet[], priors: DexSet[]): DexSet[] {
 
 export async function scoutReplay(replay: Replay, opts: ScoutOptions = {}): Promise<ScoutedReplay> {
   const gen = getGen(replay.gen);
+  const useUsage = opts.useUsage !== false;
   const teams = parseReplay(replay);
   const observations = extractObservations(replay);
 
-  // Build candidate pools per mon (dex sets + historical priors).
+  // Build candidate pools per mon (dex sets + historical priors + usage stats).
   const sideCands: SideCandidates[] = [];
   for (const team of teams) {
     const candidates: MatchedSet[][] = [];
@@ -53,7 +57,8 @@ export async function scoutReplay(replay: Replay, opts: ScoutOptions = {}): Prom
       const priors = opts.getPriorSets
         ? await opts.getPriorSets(team.player, replay.formatid, mon.baseSpecies)
         : [];
-      candidates.push(candidateMatchedSets(gen, mon, mergeSets(dexSets, priors)));
+      const usage = useUsage ? await getUsageSets(gen, replay.formatid, mon.baseSpecies) : [];
+      candidates.push(candidateMatchedSets(gen, mon, mergeSets(priors, dexSets, usage)));
     }
     sideCands.push({ side: team.side, candidates });
   }
@@ -70,6 +75,10 @@ export async function scoutReplay(replay: Replay, opts: ScoutOptions = {}): Prom
     for (const ms of sets) {
       const bad = await illegalFilledMoves(gen, ms);
       if (bad.length) ms.notes.push(`Possibly illegal filled move(s): ${bad.join(', ')}.`);
+      if (useUsage) {
+        const summary = await getUsageSummary(gen, replay.formatid, ms.baseSpecies);
+        if (summary) ms.notes.push(summary);
+      }
     }
     scoutedTeams.push({
       player: teams[i]!.player,

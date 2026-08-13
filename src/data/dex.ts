@@ -31,14 +31,31 @@ export function toID(s: string): string {
  * by the sets data + learnsets (its baseSpecies where the forme is cosmetic or
  * battle-only, otherwise the forme's own name).
  */
-export function resolveSpecies(gen: Generation, name: string): { display: string; setKey: string } {
-  const sp = gen.species.get(name);
-  if (!sp) return { display: name, setKey: name };
+export interface ResolvedForme {
+  display: string;
+  setKey: string;
+  /** An item the forme is locked to (Zacian-Crowned -> Rusted Sword). */
+  forcedItem?: string;
+}
 
-  // Battle-only formes (Aegislash-Blade, Mimikyu-Busted, Darmanitan-Zen ...)
-  // revert to their base form for team-building.
+export function resolveSpecies(gen: Generation, name: string): ResolvedForme {
+  // Team preview hides some formes as "Zacian-*"; strip the placeholder.
+  const cleaned = name.replace(/-\*$/, '');
+  const sp = gen.species.get(cleaned);
+  if (!sp) return { display: cleaned, setKey: cleaned };
+
   const battleOnly = (sp as any).battleOnly;
+  const requiredItem = (sp as any).requiredItem as string | undefined;
+  const forme = sp.forme || '';
+  const isMegaPrimal = /^Mega/.test(forme) || forme === 'Primal';
   if (battleOnly) {
+    // Item-locked permanent formes (Zacian-Crowned, Zamazenta-Crowned) are BUILT
+    // as the forme holding their required item — keep them, don't revert.
+    if (requiredItem && !isMegaPrimal) {
+      return { display: sp.name, setKey: sp.name, forcedItem: requiredItem };
+    }
+    // Mid-battle stances (Aegislash-Blade, Palafin-Hero, Mimikyu-Busted) and
+    // Megas/Primals build as their base form.
     const base = Array.isArray(battleOnly) ? battleOnly[0]! : battleOnly;
     return { display: base, setKey: base };
   }
@@ -66,6 +83,22 @@ function statsEqual(a: Record<string, number>, b: Record<string, number>): boole
 
 function typesEqual(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && [...a].sort().join() === [...b].sort().join();
+}
+
+/**
+ * Roster grouping key: the base-species id, so a mon's preview placeholder
+ * ("Zacian-*") and its revealed forme ("Zacian-Crowned") land in the same slot.
+ */
+export function familyKey(gen: Generation, name: string): string {
+  const cleaned = name.replace(/-\*$/, '');
+  const sp = gen.species.get(cleaned);
+  return toID(sp ? sp.baseSpecies || sp.name : cleaned);
+}
+
+/** True if `setKey` names a non-base forme (Zacian-Crowned, Landorus-Therian). */
+export function isForme(gen: Generation, setKey: string): boolean {
+  const sp = gen.species.get(setKey);
+  return !!(sp && sp.baseSpecies && sp.baseSpecies !== sp.name);
 }
 
 /** Human-readable move name from any id/name. */

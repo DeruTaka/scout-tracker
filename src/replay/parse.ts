@@ -1,7 +1,7 @@
 // Parse a Showdown battle log into each player's revealed team: full roster
 // (team preview) plus every move / item / ability / tera revealed in play.
 import type { Replay, RevealedMon, RevealedTeam } from '../types.js';
-import { getGen, resolveSpecies, moveName, itemName, abilityName, toID } from '../data/dex.js';
+import { getGen, resolveSpecies, familyKey, isForme, moveName, itemName, abilityName, toID } from '../data/dex.js';
 import type { Generation } from '@pkmn/data';
 
 // Moves that CALL another move: the resulting |move| is not part of the user's
@@ -35,7 +35,7 @@ function parseDetails(details: string): Details {
 
 interface SlotRef {
   side: 'p1' | 'p2';
-  setKey: string;
+  fam: string;
 }
 
 function parsePokeName(token: string): { side: 'p1' | 'p2'; nickname: string } | null {
@@ -86,26 +86,37 @@ export function parseReplay(replay: Replay): RevealedTeam[] {
   const nameOf = (side: 'p1' | 'p2') => (side === 'p1' ? p1name : p2name);
 
   function ensureMon(side: 'p1' | 'p2', speciesSeen: string, det?: Partial<Details> & { nickname?: string }): RevealedMon {
-    const { display, setKey } = resolveSpecies(gen, speciesSeen);
-    let mon = rosters[side].get(setKey);
+    // Group by species family so a preview placeholder ("Zacian-*") and its
+    // revealed forme ("Zacian-Crowned") share one roster slot.
+    const fam = familyKey(gen, speciesSeen);
+    const r = resolveSpecies(gen, speciesSeen);
+    let mon = rosters[side].get(fam);
     if (!mon) {
       mon = {
         player: nameOf(side)!,
         side,
-        species: display,
-        baseSpecies: setKey,
+        species: r.display,
+        baseSpecies: r.setKey,
         level: det?.level ?? 100,
         shiny: det?.shiny ?? false,
         moves: [],
         itemHistory: [],
         fainted: false,
       };
-      rosters[side].set(setKey, mon);
+      rosters[side].set(fam, mon);
     }
-    // Prefer the most specific (forme) display we ever see.
-    if (display && display.includes('-') && !mon.species.includes('-')) mon.species = display;
+    if (isForme(gen, r.setKey)) {
+      // A specific forme was revealed (e.g. Zacian-Crowned): adopt it as the
+      // data key + display, and apply its locked item (Rusted Sword).
+      mon.baseSpecies = r.setKey;
+      mon.species = r.display;
+      if (r.forcedItem) setItem(gen, mon, r.forcedItem);
+    } else if (r.display.includes('-') && !mon.species.includes('-')) {
+      // Cosmetic forme display refinement (Zarude-Dada, Gastrodon-East).
+      mon.species = r.display;
+    }
     if (det?.gender && !mon.gender) mon.gender = det.gender;
-    if (det?.nickname && det.nickname !== display) mon.nickname = det.nickname;
+    if (det?.nickname && det.nickname !== r.display) mon.nickname = det.nickname;
     if (det?.level) mon.level = det.level;
     if (det?.shiny) mon.shiny = true;
     return mon;
@@ -114,7 +125,7 @@ export function parseReplay(replay: Replay): RevealedTeam[] {
   function monAt(slot: string): RevealedMon | undefined {
     const ref = active[slot];
     if (!ref) return undefined;
-    return rosters[ref.side].get(ref.setKey);
+    return rosters[ref.side].get(ref.fam);
   }
 
   const lines = replay.log.split('\n');
@@ -152,8 +163,8 @@ export function parseReplay(replay: Replay): RevealedTeam[] {
         const sid = slotId(f[1] || '');
         if (!who || !sid) break;
         const det = parseDetails(f[2] || '');
-        const mon = ensureMon(who.side, det.species, { ...det, nickname: who.nickname });
-        active[sid] = { side: who.side, setKey: mon.baseSpecies };
+        ensureMon(who.side, det.species, { ...det, nickname: who.nickname });
+        active[sid] = { side: who.side, fam: familyKey(gen, det.species) };
         break;
       }
       case 'move': {
@@ -181,6 +192,17 @@ export function parseReplay(replay: Replay): RevealedTeam[] {
         if (!sid) break;
         const mon = monAt(sid);
         if (mon && f[2]) mon.tera = f[2];
+        break;
+      }
+      case 'detailschange': {
+        // Permanent forme change (e.g. Zacian -> Zacian-Crowned if it wasn't
+        // already shown at switch). Adopt the revealed forme for the slot.
+        const sid = slotId(f[1] || '');
+        const ref = sid ? active[sid] : undefined;
+        if (ref) {
+          const det = parseDetails(f[2] || '');
+          ensureMon(ref.side, det.species, det);
+        }
         break;
       }
       case '-mega': {
