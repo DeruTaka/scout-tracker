@@ -6,7 +6,7 @@
 <title>PS Team Scouter</title>
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&display=swap" rel="stylesheet" />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap" rel="stylesheet" />
 <style>
   :root {
     --bg:#f4f5fa; --surface:#ffffff; --surface-2:#fafbfd; --sidebar:#ffffff;
@@ -19,8 +19,8 @@
     --shadow-lg:0 20px 50px -20px rgba(30,34,60,.30);
     --radius:16px; --radius-sm:11px;
     --mono:ui-monospace, SFMono-Regular, Menlo, monospace;
-    --serif:'Newsreader', Georgia, 'Times New Roman', serif;
-    --display:'Fraunces', 'Newsreader', Georgia, serif;
+    --sans:'Inter', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    --display:'Plus Jakarta Sans', 'Inter', system-ui, sans-serif;
   }
   @media (prefers-color-scheme: dark) { :root:not([data-theme=light]) {
     --bg:#0c0e13; --surface:#14171f; --surface-2:#191d27; --sidebar:#101219;
@@ -39,14 +39,14 @@
 
   * { box-sizing:border-box; }
   html, body { height:100%; }
-  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.6 var(--serif); -webkit-font-smoothing:antialiased; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.55 var(--sans); -webkit-font-smoothing:antialiased; }
   a { color:var(--accent); text-decoration:none; }
   a:hover { text-decoration:underline; }
   ::selection { background:var(--accent-soft); }
-  /* Serif display type for headings & titles */
+  /* Display sans for headings & titles */
   h1, .brand .name, .replay-head h3, .team-head .player, .empty h3,
   #unique details.lib-card > summary { font-family:var(--display); }
-  h1 { letter-spacing:-.015em; }
+  h1 { letter-spacing:-.02em; }
 
   /* ---- App shell ---- */
   .app { display:grid; grid-template-columns:250px 1fr; min-height:100vh; }
@@ -219,7 +219,7 @@
       </a>
       <a class="nav-item" data-view="library">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
-        Library
+        User sets
       </a>
       <a class="nav-item" href="/teams">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8"/></svg>
@@ -298,7 +298,7 @@ function toggleTheme(){ const next = currentTheme() === 'dark' ? 'light' : 'dark
 /* ---- View switching ---- */
 const VIEWS = {
   scout:   { title:'Scout replays', sub:'Reconstruct both teams from any Showdown replay' },
-  library: { title:'Set library', sub:'Every unique set, grouped by trainer' },
+  library: { title:'User sets', sub:'Every unique set, grouped by user' },
 };
 function showView(name){
   if (!VIEWS[name]) name = 'scout';

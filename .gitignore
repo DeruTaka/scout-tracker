@@ -11,3 +11,4 @@ data/cache/
 
 # Local Claude Code settings
 .claude/settings.local.json
+data/store.backup.*.json
