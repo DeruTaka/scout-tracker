@@ -18,6 +18,7 @@ function mon(overrides: Partial<RevealedMon> = {}): RevealedMon {
     itemHistory: [],
     fainted: false,
     appeared: true,
+    usedMultipleMoves: false,
     ...overrides,
   };
 }
@@ -122,5 +123,19 @@ describe('move-filling is gated on 3+ revealed moves matching a dex set', () => 
   it('does not complete the set when a revealed move is outside the dex set', () => {
     const ms = matchSet(gen, mon({ moves: ['Ice Beam', 'Thunder', 'Surf'] }), [bigSet]);
     expect(ms.moves).toEqual(['Ice Beam', 'Thunder', 'Surf']); // no bogus 4th move
+  });
+});
+
+describe('Choice items are ruled out when the mon used 2+ moves in one stay-in', () => {
+  it('drops a Choice prior item for a multi-move mon', () => {
+    const ms = matchSet(gen, mon({ usedMultipleMoves: true }), [dexSet('Choice Specs')]);
+    expect(ms.item).toBeUndefined();
+    expect(ms.choicePossible).toBe(false);
+  });
+
+  it('keeps a Choice prior item for a single-move mon', () => {
+    const ms = matchSet(gen, mon({ usedMultipleMoves: false }), [dexSet('Choice Specs')]);
+    expect(ms.item).toBe('Choice Specs');
+    expect(ms.choicePossible).toBe(true);
   });
 });

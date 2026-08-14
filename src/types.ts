@@ -34,6 +34,7 @@ export interface RevealedMon {
   tera?: string; // revealed tera type (gen 9)
   fainted: boolean;
   appeared: boolean; // switched into battle at least once (vs team-preview only)
+  usedMultipleMoves: boolean; // used 2+ distinct moves in one stay-in -> not Choice-locked
 }
 
 /** One player's revealed team from a replay. */
@@ -81,6 +82,9 @@ export interface MatchedSet {
   /** True if the mon revealed nothing in the replay (no move/item/ability/tera).
    *  Such sets are left empty rather than guessed — there is nothing to infer. */
   unrevealed?: boolean;
+  /** False when the mon provably can't hold a Choice item (used 2+ moves in one
+   *  stay-in). The item search never proposes a Choice item for these. */
+  choicePossible?: boolean;
 }
 
 /** A damage observation extracted from the log, used by the EV engine. */

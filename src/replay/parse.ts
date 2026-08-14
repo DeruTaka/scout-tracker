@@ -91,6 +91,7 @@ export function parseReplay(replay: Replay): RevealedTeam[] {
     p2: new Map(),
   };
   const active: Record<string, SlotRef> = {}; // slotId -> ref
+  const stintMoves: Record<string, Set<string>> = {}; // slotId -> distinct move ids used since last switch-in
 
   // Entry-hazard state per side, for Heavy-Duty Boots inference.
   const hazards: Record<'p1' | 'p2', { sr: boolean; spikes: number; tspikes: number }> = {
@@ -147,6 +148,7 @@ export function parseReplay(replay: Replay): RevealedTeam[] {
         itemHistory: [],
         fainted: false,
         appeared: false,
+        usedMultipleMoves: false,
       };
       rosters[side].set(fam, mon);
     }
@@ -211,6 +213,7 @@ export function parseReplay(replay: Replay): RevealedTeam[] {
         const mon = ensureMon(who.side, det.species, { ...det, nickname: who.nickname });
         mon.appeared = true;
         active[sid] = { side: who.side, fam: familyKey(gen, det.species) };
+        stintMoves[sid] = new Set(); // fresh stay-in → Choice lock (if any) resets
         // Record which present hazards this mon is susceptible to on entry.
         const hstate = hazards[who.side];
         if (hstate.sr || hstate.spikes || hstate.tspikes) {
@@ -241,6 +244,14 @@ export function parseReplay(replay: Replay): RevealedTeam[] {
           }
         }
         addMove(gen, mon, rawMove);
+        // A Choice item locks the holder into one move until it switches. If this
+        // mon uses a 2nd distinct move in the same stay-in, it can't be Choiced.
+        const mvId = toID(moveName(gen, rawMove));
+        if (mvId && mvId !== 'struggle') {
+          const set = (stintMoves[sid] ??= new Set());
+          set.add(mvId);
+          if (set.size >= 2) mon.usedMultipleMoves = true;
+        }
         break;
       }
       case '-terastallize': {

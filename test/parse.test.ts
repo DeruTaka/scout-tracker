@@ -96,6 +96,10 @@ describe('proc items and Heavy-Duty Boots inference', () => {
     // Ferrothorn's, not Garchomp's.
     '|-damage|p1a: Garchomp|88/100|[from] item: Rocky Helmet|[of] p2a: Ferrothorn',
     '|turn|4',
+    // Garchomp uses a 2nd move without switching → provably not Choice-locked.
+    '|move|p1a: Garchomp|Stone Edge|p2a: Ferrothorn',
+    '|-damage|p2a: Ferrothorn|20/100',
+    '|turn|5',
   ].join('\n');
 
   const teams = parseReplay(synthReplay(log));
@@ -114,5 +118,10 @@ describe('proc items and Heavy-Duty Boots inference', () => {
 
   it('does NOT infer Boots for a mon that took hazard damage', () => {
     expect(mon(p1, 'Dragapult').item).toBeUndefined();
+  });
+
+  it('flags a mon that used 2+ moves without switching as not Choice-locked', () => {
+    expect(mon(p1, 'Garchomp').usedMultipleMoves).toBe(true); // Earthquake + Stone Edge
+    expect(mon(p2, 'Ferrothorn').usedMultipleMoves).toBe(false); // only Stealth Rock
   });
 });

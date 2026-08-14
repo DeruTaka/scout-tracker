@@ -137,9 +137,14 @@ export function buildMatched(gen: Generation, mon: RevealedMon, best: DexSet | u
 
   const ability = mon.ability ?? pickFirst(best?.ability);
   const itemRevealed = !!mon.item;
-  const item = mon.item ?? fillItem(best?.item, ability);
+  let item = mon.item ?? fillItem(best?.item, ability);
   if (!itemRevealed && best?.item && item === undefined) {
     notes.push('Prior item was self-revealing (e.g. Air Balloon / Life Orb) but never shown — left blank.');
+  }
+  // A Choice item is impossible if the mon used 2+ moves without switching.
+  if (!itemRevealed && item && mon.usedMultipleMoves && toID(item).startsWith('choice')) {
+    notes.push(`Ruled out ${item} — used 2+ moves without switching, so it can't be Choice-locked.`);
+    item = undefined;
   }
   const tera = mon.tera ?? (gen.num >= 9 ? pickFirst(best?.teratypes) : undefined);
 
@@ -197,6 +202,7 @@ export function buildMatched(gen: Generation, mon: RevealedMon, best: DexSet | u
     confidence,
     notes,
     evSource,
+    choicePossible: !mon.usedMultipleMoves,
   };
 }
 

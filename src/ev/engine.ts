@@ -23,8 +23,10 @@ const LAMBDA = 5;
 // Extra cost for flipping the dex-set's nature; only done under strong evidence.
 const NATURE_PENALTY = 6;
 // Extra cost for inferring an unrevealed damage item (Choice Specs/Band, Life
-// Orb). Only adopted when it removes a large violation the spread alone can't.
-const ITEM_PENALTY = 3;
+// Orb). Set ABOVE the nature penalty so the search prefers a plausible nature
+// (e.g. Adamant) over claiming an unrevealed item — an item is only inferred
+// when it removes a violation a spread/nature change cannot.
+const ITEM_PENALTY = 8;
 // If even the best-fit spread can't get within this residual, the evidence
 // doesn't cleanly fit any spread (likely an unrevealed item/ability) — keep the
 // dex prior rather than emit a bogus spread.
@@ -46,9 +48,14 @@ const OFFENSE_ITEMS: Record<'atk' | 'spa', string[]> = {
   spa: ['Choice Specs', 'Life Orb'],
 };
 
-/** Inferable offensive items for this mon, dropping any that would self-reveal. */
+/** Inferable offensive items for this mon, dropping self-revealing ones — and
+ *  Choice items when the mon provably used 2+ moves without switching. */
 function offenseItemCandidates(ms: MatchedSet, stat: 'atk' | 'spa'): string[] {
-  return OFFENSE_ITEMS[stat].filter((it) => !itemWouldReveal(it, ms.ability));
+  const choiceOk = ms.choicePossible !== false;
+  return OFFENSE_ITEMS[stat].filter((it) => {
+    if (!choiceOk && toID(it).startsWith('choice')) return false;
+    return !itemWouldReveal(it, ms.ability);
+  });
 }
 
 function sameItem(a: string, b: string): boolean {
