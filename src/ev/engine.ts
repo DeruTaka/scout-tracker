@@ -8,18 +8,23 @@ import type { GenerationNum } from '@pkmn/data';
 type CalcGen = ReturnType<typeof calc.Generations.get>;
 import type { DamageObservation, FieldSnapshot, MatchedSet, StatsTable } from '../types.js';
 import { toID } from '../data/dex.js';
+import { itemWouldReveal } from '../match/match-set.js';
 
 const TOL = 1.5; // percent-point tolerance for HP% rounding
 const EV_STEP = 4;
 const EV_MAX = 252;
 const EV_TOTAL = 508;
 // Keep the dex prior unless the summed violation exceeds this (percent points).
-const KEEP_THRESHOLD = 2.0;
+// Lower = damage evidence overrides usage/dex priors more readily.
+const KEEP_THRESHOLD = 1.5;
 // Regularization: cost (in violation-equivalent points) of moving the full 252
 // EVs away from the prior. Stops the search overfitting to rounding noise.
 const LAMBDA = 5;
 // Extra cost for flipping the dex-set's nature; only done under strong evidence.
 const NATURE_PENALTY = 6;
+// Extra cost for inferring an unrevealed damage item (Choice Specs/Band, Life
+// Orb). Only adopted when it removes a large violation the spread alone can't.
+const ITEM_PENALTY = 3;
 // If even the best-fit spread can't get within this residual, the evidence
 // doesn't cleanly fit any spread (likely an unrevealed item/ability) — keep the
 // dex prior rather than emit a bogus spread.
@@ -31,6 +36,36 @@ export interface SideSets {
 }
 
 const OFFENSE_NATURE: Record<'atk' | 'spa', string> = { atk: 'Adamant', spa: 'Modest' };
+
+// Unrevealed damage-boosting items to try when the spread alone can't explain a
+// hit. Choice items (1.5x) don't announce themselves, so a mon whose item was
+// never shown may well be holding one. Life Orb (1.3x) is only a candidate for
+// Magic Guard holders — otherwise its recoil would have revealed it in the log.
+const OFFENSE_ITEMS: Record<'atk' | 'spa', string[]> = {
+  atk: ['Choice Band', 'Life Orb'],
+  spa: ['Choice Specs', 'Life Orb'],
+};
+
+/** Inferable offensive items for this mon, dropping any that would self-reveal. */
+function offenseItemCandidates(ms: MatchedSet, stat: 'atk' | 'spa'): string[] {
+  return OFFENSE_ITEMS[stat].filter((it) => !itemWouldReveal(it, ms.ability));
+}
+
+function sameItem(a: string, b: string): boolean {
+  return toID(a) === toID(b);
+}
+
+function dedupeItems(items: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const it of items) {
+    const id = toID(it);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(it);
+  }
+  return out;
+}
 
 function key(side: string, baseSpecies: string): string {
   return `${side}:${baseSpecies.toLowerCase()}`;
@@ -89,6 +124,7 @@ function buildPokemon(
     boosts?: Partial<StatsTable>;
     status?: string;
     tera?: string;
+    item?: string; // explicit override ('' = no item); undefined = use ms.item
   },
 ): calc.Pokemon | null {
   // Some species/formes aren't resolvable in calc's dataset for a given gen
@@ -96,7 +132,7 @@ function buildPokemon(
   try {
     const p = new calc.Pokemon(gen, ms.baseSpecies, {
       level: ms.level,
-      item: ms.item,
+      item: (opts.item !== undefined ? opts.item : ms.item) || undefined,
       ability: ms.ability,
       nature: opts.nature ?? ms.nature,
       evs: opts.evs ?? ms.evs,
@@ -132,11 +168,20 @@ function predictPct(
   }
 }
 
-function violation(observed: number, lo: number, hi: number, koCapped: boolean): number {
+// In the offense pass an observed hit that lands SOFTER than our model predicts
+// (observed below the predicted min) is confounded — it can mean the attacker
+// invested less OR that the defender is bulkier than the spread we assumed. So
+// it's weak evidence about the attacker and is down-weighted, whereas a hit that
+// EXCEEDS our predicted max unambiguously says the attacker hits harder (needs a
+// bigger spread / a Choice item) and is penalized in full. Defense keeps the
+// full weight — there, a softer-than-modeled hit IS the bulk signal.
+const OVERPREDICT_WEIGHT = 0.25;
+
+function violation(observed: number, lo: number, hi: number, koCapped: boolean, underWeight = 1): number {
   // For a KO the observed % is only a LOWER bound on true damage, so we only
   // penalize UNDER-prediction (predicted max can't even reach what we saw).
   if (koCapped) return observed > hi + TOL ? observed - (hi + TOL) : 0;
-  if (observed < lo - TOL) return lo - TOL - observed;
+  if (observed < lo - TOL) return (lo - TOL - observed) * underWeight;
   if (observed > hi + TOL) return observed - (hi + TOL);
   return 0;
 }
@@ -206,6 +251,7 @@ function totalViolationOffense(
   evs: Partial<StatsTable>,
   nature: string,
   obs: DamageObservation[],
+  item?: string,
 ): number {
   let v = 0;
   let n = 0;
@@ -215,6 +261,7 @@ function totalViolationOffense(
     const attacker = buildPokemon(gen, ms, {
       evs,
       nature,
+      item,
       boosts: o.field.attackerBoosts,
       status: o.field.attackerStatus,
       tera: o.field.attackerTera,
@@ -227,7 +274,7 @@ function totalViolationOffense(
     if (!attacker || !defender) continue;
     const range = predictPct(gen, attacker, defender, o.move, buildField(gen, o.field));
     if (!range) continue;
-    v += violation(o.observedPercent, range[0], range[1], o.koCapped);
+    v += violation(o.observedPercent, range[0], range[1], o.koCapped, OVERPREDICT_WEIGHT);
     n++;
   }
   return n ? v / n : 0; // average per-observation, so noisy hits don't compound
@@ -242,7 +289,8 @@ function refineOffense(
 ): void {
   const priorEv = ms.evs[stat] || 0;
   const priorNature = ms.nature;
-  const priorV = totalViolationOffense(gen, ms, byKey, ms.evs, priorNature, obs);
+  const priorItem = ms.item ?? '';
+  const priorV = totalViolationOffense(gen, ms, byKey, ms.evs, priorNature, obs, priorItem);
   if (priorV <= KEEP_THRESHOLD) {
     ms.notes.push(`Observed ${stat.toUpperCase()} damage fits the dex spread (±${priorV.toFixed(1)}%).`);
     ms.confidence = Math.min(0.98, ms.confidence + 0.03);
@@ -250,35 +298,64 @@ function refineOffense(
   }
   const otherSum = evSumExcluding(ms.evs, [stat]);
   const natures = [...new Set([priorNature, OFFENSE_NATURE[stat]])];
-  // Regularized objective: violation + deviation-from-prior cost. EVs only move
-  // when the damage evidence justifies it (prevents overfitting to HP% rounding).
-  let best = { ev: priorEv, nature: priorNature, v: priorV, score: priorV };
-  for (const nature of natures) {
-    for (let ev = 0; ev <= EV_MAX; ev += EV_STEP) {
-      if (otherSum + ev > EV_TOTAL) break;
-      const v = totalViolationOffense(gen, ms, byKey, { ...ms.evs, [stat]: ev }, nature, obs);
-      const devCost = LAMBDA * (Math.abs(ev - priorEv) / EV_MAX);
-      const natCost = nature === priorNature ? 0 : NATURE_PENALTY;
-      const score = v + devCost + natCost;
-      if (score < best.score - 1e-6) best = { ev, nature, v, score };
+  // When the item wasn't revealed, let the search also try the damage items —
+  // a Choice Specs / Life Orb explains "hits harder than any spread should".
+  const items = ms.itemRevealed
+    ? [priorItem]
+    : dedupeItems([priorItem, '', ...offenseItemCandidates(ms, stat)]);
+  // Regularized objective: violation + deviation-from-prior cost. EVs / nature /
+  // item only move when the damage evidence justifies it (prevents overfitting
+  // to HP% rounding).
+  let best = { ev: priorEv, nature: priorNature, item: priorItem, v: priorV, score: priorV };
+  for (const item of items) {
+    const itemCost = sameItem(item, priorItem) ? 0 : ITEM_PENALTY;
+    for (const nature of natures) {
+      for (let ev = 0; ev <= EV_MAX; ev += EV_STEP) {
+        if (otherSum + ev > EV_TOTAL) break;
+        const v = totalViolationOffense(gen, ms, byKey, { ...ms.evs, [stat]: ev }, nature, obs, item);
+        const devCost = LAMBDA * (Math.abs(ev - priorEv) / EV_MAX);
+        const natCost = nature === priorNature ? 0 : NATURE_PENALTY;
+        const score = v + devCost + natCost + itemCost;
+        if (score < best.score - 1e-6) best = { ev, nature, item, v, score };
+      }
     }
   }
-  if (best.v > RESIDUAL_ACCEPT) {
-    ms.notes.push(
-      `Observed ${stat.toUpperCase()} damage doesn't cleanly fit any spread (best residual ${best.v.toFixed(1)}%); keeping the dex spread — likely an unrevealed item/ability.`,
-    );
-    ms.confidence = Math.max(0.3, ms.confidence - 0.1);
-  } else if (best.ev !== priorEv || best.nature !== priorNature) {
-    ms.evs = { ...ms.evs, [stat]: best.ev };
-    ms.nature = best.nature;
-    ms.evSource = 'derived';
-    ms.notes.push(
-      `Derived ${stat.toUpperCase()} = ${best.ev} EVs${best.nature !== priorNature ? ` (${best.nature})` : ''} from observed damage (dex spread was off by ${priorV.toFixed(1)}%, residual ${best.v.toFixed(1)}%).`,
-    );
-    ms.confidence = Math.max(0.3, Math.min(ms.confidence, best.v <= KEEP_THRESHOLD ? 0.75 : 0.55));
-  } else {
-    ms.notes.push(`Observed ${stat.toUpperCase()} damage roughly fits the dex spread (±${priorV.toFixed(1)}%).`);
+  const itemChanged = !sameItem(best.item, priorItem);
+  const changed = best.ev !== priorEv || best.nature !== priorNature || itemChanged;
+  const improvement = priorV - best.v;
+  // Adopt the best spread/item when it MATERIALLY beats the prior — even if the
+  // residual isn't tiny. A defensive dex spread that badly under-predicts a KO
+  // should yield to an offensive Choice-item read, not be kept just because the
+  // fit is imperfect (defenders may still be mis-estimated this pass). Only when
+  // nothing explains the damage better do we keep the prior and flag it.
+  if (!changed || improvement < KEEP_THRESHOLD) {
+    if (priorV > RESIDUAL_ACCEPT) {
+      ms.notes.push(
+        `Observed ${stat.toUpperCase()} damage doesn't cleanly fit any spread (residual ${priorV.toFixed(1)}%); keeping the dex spread — likely an unrevealed item/ability.`,
+      );
+      ms.confidence = Math.max(0.3, ms.confidence - 0.1);
+    } else {
+      ms.notes.push(`Observed ${stat.toUpperCase()} damage roughly fits the dex spread (±${priorV.toFixed(1)}%).`);
+    }
+    return;
   }
+  ms.evs = { ...ms.evs, [stat]: best.ev };
+  ms.nature = best.nature;
+  ms.evSource = 'derived';
+  if (itemChanged) {
+    ms.item = best.item || undefined;
+    ms.notes.push(
+      `Inferred ${best.item || 'no item'} from damage output (a plain spread couldn't reach the observed ${stat.toUpperCase()} damage).`,
+    );
+  }
+  ms.notes.push(
+    `Derived ${stat.toUpperCase()} = ${best.ev} EVs${best.nature !== priorNature ? ` (${best.nature})` : ''} from observed damage (dex spread was off by ${priorV.toFixed(1)}%, residual ${best.v.toFixed(1)}%).`,
+  );
+  // Confidence tracks how well the adopted spread actually fits.
+  ms.confidence = Math.max(
+    0.3,
+    Math.min(ms.confidence, best.v <= KEEP_THRESHOLD ? 0.8 : best.v <= RESIDUAL_ACCEPT ? 0.6 : 0.45),
+  );
 }
 
 function totalViolationDefense(
@@ -339,19 +416,26 @@ function refineDefense(
       if (score < best.score - 1e-6) best = { hp, ev, v, score };
     }
   }
-  if (best.v > RESIDUAL_ACCEPT) {
-    ms.notes.push(
-      `Damage taken doesn't cleanly fit any HP/${stat.toUpperCase()} spread (best residual ${best.v.toFixed(1)}%); keeping the dex spread.`,
-    );
-    ms.confidence = Math.max(0.3, ms.confidence - 0.1);
-  } else if (best.hp !== priorHp || best.ev !== priorDef) {
-    ms.evs = { ...ms.evs, hp: best.hp, [stat]: best.ev };
-    ms.evSource = 'derived';
-    ms.notes.push(
-      `Derived HP/${stat.toUpperCase()} = ${best.hp}/${best.ev} EVs from damage taken (dex spread was off by ${priorV.toFixed(1)}%, residual ${best.v.toFixed(1)}%).`,
-    );
-    ms.confidence = Math.max(0.3, Math.min(ms.confidence, best.v <= KEEP_THRESHOLD ? 0.7 : 0.5));
+  const changed = best.hp !== priorHp || best.ev !== priorDef;
+  const improvement = priorV - best.v;
+  if (!changed || improvement < KEEP_THRESHOLD) {
+    if (priorV > RESIDUAL_ACCEPT) {
+      ms.notes.push(
+        `Damage taken doesn't cleanly fit any HP/${stat.toUpperCase()} spread (residual ${priorV.toFixed(1)}%); keeping the dex spread.`,
+      );
+      ms.confidence = Math.max(0.3, ms.confidence - 0.1);
+    }
+    return;
   }
+  ms.evs = { ...ms.evs, hp: best.hp, [stat]: best.ev };
+  ms.evSource = 'derived';
+  ms.notes.push(
+    `Derived HP/${stat.toUpperCase()} = ${best.hp}/${best.ev} EVs from damage taken (dex spread was off by ${priorV.toFixed(1)}%, residual ${best.v.toFixed(1)}%).`,
+  );
+  ms.confidence = Math.max(
+    0.3,
+    Math.min(ms.confidence, best.v <= KEEP_THRESHOLD ? 0.7 : best.v <= RESIDUAL_ACCEPT ? 0.55 : 0.45),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -368,7 +452,8 @@ export interface SideCandidates {
 }
 
 // Require this much average-residual improvement to abandon the reveal-best set.
-const SELECT_MARGIN = 2.5;
+// Lower = damage evidence overrides the usage/reveal prior set more readily.
+const SELECT_MARGIN = 1.5;
 
 function residualForMon(
   gen: CalcGen,

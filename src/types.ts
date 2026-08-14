@@ -68,6 +68,7 @@ export interface MatchedSet {
   moves: string[]; // final 4 (or fewer) moves
   revealedMoves: string[]; // subset that was actually observed
   item?: string;
+  itemRevealed: boolean; // true only if the item was actually shown in the replay
   ability?: string;
   nature: string;
   evs: Partial<StatsTable>;

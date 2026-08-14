@@ -58,3 +58,26 @@ describe('EV engine on smogtours-gen8uu-963226', () => {
     expect(registeel.evSource).toBe('dex-set');
   });
 });
+
+describe('EV engine infers Choice Specs from damage (smogtours-gen9ubers-952059)', () => {
+  const replay = loadFixture('smogtours-gen9ubers-952059');
+  const gen = getGen(replay.gen);
+  const teams = parseReplay(replay);
+
+  it('reads Fc ❤ Kyogre as a Choice Specs attacker, not a defensive Air Balloon set', async () => {
+    const sideSets: SideSets[] = [];
+    for (const t of teams) {
+      const sets: MatchedSet[] = [];
+      for (const m of t.mons) sets.push(matchSet(gen, m, await getSetsForSpecies(replay.formatid, m.baseSpecies)));
+      sideSets.push({ side: t.side, sets });
+    }
+    deriveEvs(replay.gen, sideSets, extractObservations(replay));
+
+    const kyogre = sideSets.find((s) => s.side === 'p2')!.sets.find((x) => x.baseSpecies === 'Kyogre')!;
+    // The 100% KO on Koraidon is only reachable with a Choice item; Life Orb /
+    // Air Balloon would have revealed themselves, so Choice Specs is the read.
+    expect(kyogre.item).toBe('Choice Specs');
+    expect(kyogre.itemRevealed).toBe(false);
+    expect(kyogre.evSource).toBe('derived');
+  });
+});

@@ -40,11 +40,29 @@
   th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
   th { color:var(--muted); font-weight:600; }
   .spinner { color:var(--muted); }
+  /* Nested unique-sets library */
+  #unique details { border:1px solid var(--line); border-radius:10px; }
+  #unique summary { cursor:pointer; list-style:none; user-select:none; }
+  #unique summary::-webkit-details-marker { display:none; }
+  #unique summary::before { content:'▸'; display:inline-block; width:1em; margin-right:6px; color:var(--muted); transition:transform .15s; }
+  #unique details[open] > summary::before { transform:rotate(90deg); }
+  #unique details.lib-card { background:var(--panel); }
+  #unique details.lib-card > summary { padding:12px 14px; font-weight:600; font-size:15px; }
+  .lib-body { padding:0 12px 12px; display:flex; flex-direction:column; gap:8px; }
+  #unique details.player { background:var(--panel2); }
+  #unique details.player > summary { padding:9px 12px; }
+  #unique details.player > summary .pname { font-weight:600; }
+  .player-body { padding:2px 12px 10px; display:flex; flex-direction:column; gap:10px; }
+  .uset { border-top:1px solid var(--line); padding-top:8px; }
+  .uset:first-child { border-top:0; padding-top:2px; }
+  .uset-head { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .uset-head .name { font-weight:600; }
 </style>
 </head>
 <body>
 <header>
   <h1>⚔️ PS Team Scouter</h1>
+  <a href="/sheet">📊 View sheet</a>
   <span class="status" id="status">loading…</span>
 </header>
 <main>
@@ -137,19 +155,51 @@ async function run(endpoint) {
   finally { $('busy').textContent=''; $('ingestBtn').disabled=$('previewBtn').disabled=false; }
 }
 
+function usetRow(u){
+  return `<div class="uset">
+    <div class="uset-head">
+      <span class="name">${esc(u.species)}</span>
+      <span class="chip">×${u.count}</span>
+      <span class="chip">${esc(u.format)}</span>
+      <button class="copy secondary" data-paste="${encodeURIComponent(paste(u.set))}">copy</button>
+    </div>
+    <div class="sub">${esc(u.set.moves.join(' / '))}</div>
+    <div class="sub">${esc(u.set.item||'—')} · ${esc(u.set.ability||'—')} · ${esc(u.set.nature)} · ${esc(evStr(u.set.evs))}${u.set.tera?(' · Tera '+esc(u.set.tera)):''}</div>
+  </div>`;
+}
+
 async function loadUnique() {
-  const t = encodeURIComponent($('trainerFilter').value.trim());
-  const r = await (await fetch('/api/unique?trainer='+t)).json();
-  if (!r.uniqueSets.length) { $('unique').innerHTML = '<div class="note">No sets stored yet.</div>'; return; }
-  const rows = r.uniqueSets.map((u)=>`<tr>
-    <td>${esc(u.player)}</td><td>${esc(u.format)}</td><td>${esc(u.species)}</td>
-    <td>${u.count}</td><td>${esc(u.set.moves.join(', '))}</td>
-    <td>${esc(u.set.item||'—')}</td><td>${esc(u.set.ability||'—')}</td>
-    <td>${esc(u.set.nature)} ${esc(evStr(u.set.evs))}${u.set.tera?(' · Tera '+esc(u.set.tera)):''}</td>
-    <td><button class="copy secondary" data-paste="${encodeURIComponent(paste(u.set))}">copy</button></td>
-  </tr>`).join('');
-  $('unique').innerHTML = `<table><thead><tr><th>Trainer</th><th>Format</th><th>Pokémon</th><th>×</th><th>Moves</th><th>Item</th><th>Ability</th><th>Spread</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
-  wireCopy($('unique'));
+  const filter = $('trainerFilter').value.trim();
+  const r = await (await fetch('/api/unique?trainer='+encodeURIComponent(filter))).json();
+  const container = $('unique');
+  if (!r.uniqueSets.length) { container.innerHTML = '<div class="note">No sets stored yet.</div>'; return; }
+
+  // Group sets by trainer.
+  const byPlayer = new Map();
+  for (const u of r.uniqueSets) {
+    if (!byPlayer.has(u.player)) byPlayer.set(u.player, []);
+    byPlayer.get(u.player).push(u);
+  }
+  const players = [...byPlayer.keys()].sort((a,b)=>a.localeCompare(b));
+  const totalSets = r.uniqueSets.length;
+  // With a filter narrowing things down, auto-expand so results are visible.
+  const openTop = filter ? ' open' : '';
+  const openPlayer = filter && players.length <= 3 ? ' open' : '';
+
+  const playerCards = players.map((p)=>{
+    const sets = byPlayer.get(p).sort((a,b)=> a.species.localeCompare(b.species) || b.count - a.count);
+    const rows = sets.map(usetRow).join('');
+    return `<details class="player"${openPlayer}>
+      <summary><span class="pname">${esc(p)}</span> <span class="chip">${sets.length} set${sets.length>1?'s':''}</span></summary>
+      <div class="player-body">${rows}</div>
+    </details>`;
+  }).join('');
+
+  container.innerHTML = `<details class="lib-card"${openTop}>
+    <summary>${players.length} trainer${players.length>1?'s':''} · ${totalSets} unique set${totalSets>1?'s':''}</summary>
+    <div class="lib-body">${playerCards}</div>
+  </details>`;
+  wireCopy(container);
 }
 // minimal client-side paste for the unique table copy button
 function paste(s){

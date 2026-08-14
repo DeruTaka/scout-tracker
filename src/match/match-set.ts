@@ -10,6 +10,29 @@ function pickFirst(v: string | string[] | undefined): string | undefined {
   return Array.isArray(v) ? v[0] : v;
 }
 
+/**
+ * Would this item have announced itself in the replay log if the mon held it?
+ * If so and it wasn't revealed, the mon simply isn't holding it — never fill or
+ * infer one from usage/dex priors, or we'd invent an item that was visible.
+ *   - Air Balloon posts an |-item| on switch-in.
+ *   - Life Orb deals recoil (|-damage| [from] item: Life Orb) on every damaging
+ *     hit, unless the holder has Magic Guard (recoil suppressed).
+ */
+export function itemWouldReveal(item: string | undefined, ability: string | undefined): boolean {
+  if (!item) return false;
+  const id = toID(item);
+  if (id === 'airballoon') return true;
+  if (id === 'lifeorb') return toID(ability || '') !== 'magicguard';
+  return false;
+}
+
+/** Pick a prior item to fill an unrevealed slot, skipping self-revealing ones. */
+function fillItem(item: string | string[] | undefined, ability: string | undefined): string | undefined {
+  if (item === undefined) return undefined;
+  const options = Array.isArray(item) ? item : [item];
+  return options.find((o) => !itemWouldReveal(o, ability));
+}
+
 function idSet(names: string[]): Set<string> {
   return new Set(names.map(toID));
 }
@@ -104,8 +127,12 @@ export function buildMatched(gen: Generation, mon: RevealedMon, best: DexSet | u
   const moves = buildMoves(mon, best);
   const notes: string[] = [];
 
-  const item = mon.item ?? pickFirst(best?.item);
   const ability = mon.ability ?? pickFirst(best?.ability);
+  const itemRevealed = !!mon.item;
+  const item = mon.item ?? fillItem(best?.item, ability);
+  if (!itemRevealed && best?.item && item === undefined) {
+    notes.push('Prior item was self-revealing (e.g. Air Balloon / Life Orb) but never shown — left blank.');
+  }
   const tera = mon.tera ?? (gen.num >= 9 ? pickFirst(best?.teratypes) : undefined);
 
   let nature: string;
@@ -153,6 +180,7 @@ export function buildMatched(gen: Generation, mon: RevealedMon, best: DexSet | u
     moves,
     revealedMoves: [...mon.moves],
     item,
+    itemRevealed,
     ability,
     nature,
     evs,

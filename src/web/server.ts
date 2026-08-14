@@ -39,13 +39,18 @@ export function startServer(store: Datastore, config: Config, port: number): voi
     });
   }
 
-  app.use(express.static(fileURLToPath(new URL('./public', import.meta.url))));
+  const publicDir = fileURLToPath(new URL('./public', import.meta.url));
+  app.use(express.static(publicDir));
+
+  // Clean URL for the embedded-sheet page.
+  app.get('/sheet', (_req, res) => res.sendFile(fileURLToPath(new URL('./public/sheet.html', import.meta.url))));
 
   app.get('/api/status', (_req, res) => {
     res.json({
       googleConfigured: !!googleConfigFromEnv() && googleAuthConfigured(),
       replays: store.replays.length,
       uniqueSets: store.uniqueSets.length,
+      sheetEmbedUrl: config.sheetEmbedUrl ?? null,
     });
   });
 
