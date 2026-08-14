@@ -72,6 +72,15 @@ function findOf(parts: string[]): string | undefined {
   return undefined;
 }
 
+/** The raw value after "[from]" (any effect kind), e.g. "Stealth Rock", "item: Leftovers". */
+function findFromAny(parts: string[]): string | undefined {
+  for (const p of parts) {
+    const m = /^\[from\]\s*(.+)$/.exec(p.trim());
+    if (m) return m[1]!.trim();
+  }
+  return undefined;
+}
+
 export function parseReplay(replay: Replay): RevealedTeam[] {
   const gen = getGen(replay.gen);
   const [p1name, p2name] = replay.players;
@@ -82,6 +91,41 @@ export function parseReplay(replay: Replay): RevealedTeam[] {
     p2: new Map(),
   };
   const active: Record<string, SlotRef> = {}; // slotId -> ref
+
+  // Entry-hazard state per side, for Heavy-Duty Boots inference.
+  const hazards: Record<'p1' | 'p2', { sr: boolean; spikes: number; tspikes: number }> = {
+    p1: { sr: false, spikes: 0, tspikes: 0 },
+    p2: { sr: false, spikes: 0, tspikes: 0 },
+  };
+  interface HazardFlags {
+    enteredSR: boolean; enteredSpikes: boolean; enteredTSpikes: boolean;
+    tookSR: boolean; tookSpikes: boolean; tookTSpikes: boolean;
+  }
+  const hz = new Map<RevealedMon, HazardFlags>();
+  const getHz = (mon: RevealedMon): HazardFlags => {
+    let h = hz.get(mon);
+    if (!h) { h = { enteredSR: false, enteredSpikes: false, enteredTSpikes: false, tookSR: false, tookSpikes: false, tookTSpikes: false }; hz.set(mon, h); }
+    return h;
+  };
+  const speciesTypes = (setKey: string): string[] => {
+    const sp = gen.species.get(toID(setKey) as any);
+    return sp?.types ? [...sp.types] : [];
+  };
+  // Grounded = takes ground-based hazards (Spikes / Toxic Spikes). Flying types
+  // and Levitate float; Stealth Rock ignores this and hits everyone. When the
+  // ability isn't revealed but the species CAN have Levitate, stay conservative
+  // and treat it as floating so we don't misread a Levitate dodge as Boots.
+  const canLevitate = (setKey: string): boolean => {
+    const sp = gen.species.get(toID(setKey) as any);
+    return sp?.abilities ? Object.values(sp.abilities).map((a) => toID(a as string)).includes('levitate') : false;
+  };
+  const isGrounded = (mon: RevealedMon): boolean => {
+    if (speciesTypes(mon.baseSpecies).includes('Flying')) return false;
+    const ab = toID(mon.ability || '');
+    if (ab === 'levitate') return false;
+    if (!ab && canLevitate(mon.baseSpecies)) return false;
+    return true;
+  };
 
   const nameOf = (side: 'p1' | 'p2') => (side === 'p1' ? p1name : p2name);
 
@@ -102,6 +146,7 @@ export function parseReplay(replay: Replay): RevealedTeam[] {
         moves: [],
         itemHistory: [],
         fainted: false,
+        appeared: false,
       };
       rosters[side].set(fam, mon);
     }
@@ -163,8 +208,19 @@ export function parseReplay(replay: Replay): RevealedTeam[] {
         const sid = slotId(f[1] || '');
         if (!who || !sid) break;
         const det = parseDetails(f[2] || '');
-        ensureMon(who.side, det.species, { ...det, nickname: who.nickname });
+        const mon = ensureMon(who.side, det.species, { ...det, nickname: who.nickname });
+        mon.appeared = true;
         active[sid] = { side: who.side, fam: familyKey(gen, det.species) };
+        // Record which present hazards this mon is susceptible to on entry.
+        const hstate = hazards[who.side];
+        if (hstate.sr || hstate.spikes || hstate.tspikes) {
+          const h = getHz(mon);
+          const grounded = isGrounded(mon);
+          const types = speciesTypes(mon.baseSpecies);
+          if (hstate.sr) h.enteredSR = true;
+          if (hstate.spikes && grounded) h.enteredSpikes = true;
+          if (hstate.tspikes && grounded && !types.includes('Poison') && !types.includes('Steel')) h.enteredTSpikes = true;
+        }
         break;
       }
       case 'move': {
@@ -247,11 +303,60 @@ export function parseReplay(replay: Replay): RevealedTeam[] {
       }
       case '-heal':
       case '-damage': {
-        // pick up "[from] item: X" for the line's subject (ability handled above)
         const sid = slotId(f[1] || '');
         const mon = sid ? monAt(sid) : undefined;
+        // Entry-hazard damage → this mon did NOT dodge it (rules out Boots).
+        if (cmd === '-damage' && mon) {
+          const eff = toID((findFromAny(f) || '').replace(/^(?:move|item|ability):\s*/i, ''));
+          if (eff === 'stealthrock') getHz(mon).tookSR = true;
+          else if (eff === 'spikes') getHz(mon).tookSpikes = true;
+        }
+        // "[from] item: X": an item that PROCS on another mon (Rocky Helmet,
+        // Jaboca/Rowap Berry) carries an "[of]" holder — the item belongs to the
+        // HOLDER, not the mon taking the damage. Only a self-affecting item
+        // (Leftovers, Black Sludge, Life Orb recoil) with no [of] is the subject's.
         const fromItem = findFrom(f, 'item');
-        if (fromItem && mon) setItem(gen, mon, fromItem);
+        if (fromItem) {
+          const ofTok = findOf(f);
+          if (ofTok) {
+            const owner = monAt(slotId(ofTok) || '');
+            if (owner) setItem(gen, owner, fromItem);
+          } else if (mon) {
+            setItem(gen, mon, fromItem);
+          }
+        }
+        break;
+      }
+      case '-status': {
+        // Toxic Spikes poison on entry rules out Boots (approximate: any poison
+        // gained while Toxic Spikes sit on the mon's side).
+        const sid = slotId(f[1] || '');
+        const mon = sid ? monAt(sid) : undefined;
+        const st = f[2];
+        if (mon && sid && (st === 'psn' || st === 'tox')) {
+          const side = active[sid]?.side;
+          if (side && hazards[side].tspikes > 0) getHz(mon).tookTSpikes = true;
+        }
+        break;
+      }
+      case '-sidestart': {
+        const side = /^(p[12])/.exec(f[1] || '')?.[1] as 'p1' | 'p2' | undefined;
+        const eff = toID((f[2] || '').replace(/^move:\s*/i, ''));
+        if (side) {
+          if (eff === 'stealthrock') hazards[side].sr = true;
+          else if (eff === 'spikes') hazards[side].spikes++;
+          else if (eff === 'toxicspikes') hazards[side].tspikes++;
+        }
+        break;
+      }
+      case '-sideend': {
+        const side = /^(p[12])/.exec(f[1] || '')?.[1] as 'p1' | 'p2' | undefined;
+        const eff = toID((f[2] || '').replace(/^move:\s*/i, ''));
+        if (side) {
+          if (eff === 'stealthrock') hazards[side].sr = false;
+          else if (eff === 'spikes') hazards[side].spikes = 0;
+          else if (eff === 'toxicspikes') hazards[side].tspikes = 0;
+        }
         break;
       }
       case 'faint': {
@@ -262,6 +367,22 @@ export function parseReplay(replay: Replay): RevealedTeam[] {
       }
       default:
         break;
+    }
+  }
+
+  // Heavy-Duty Boots: a mon that switched into a hazard it was susceptible to
+  // but took no damage / poison from it must have been ignoring hazards. (Magic
+  // Guard also ignores them, so skip those; and never override a revealed item.)
+  for (const side of ['p1', 'p2'] as const) {
+    for (const mon of rosters[side].values()) {
+      if (mon.item || toID(mon.ability || '') === 'magicguard') continue;
+      const h = hz.get(mon);
+      if (!h) continue;
+      const dodgedHazard =
+        (h.enteredSR && !h.tookSR) ||
+        (h.enteredSpikes && !h.tookSpikes) ||
+        (h.enteredTSpikes && !h.tookTSpikes);
+      if (dodgedHazard) setItem(gen, mon, 'Heavy-Duty Boots');
     }
   }
 

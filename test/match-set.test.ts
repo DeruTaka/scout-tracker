@@ -17,6 +17,7 @@ function mon(overrides: Partial<RevealedMon> = {}): RevealedMon {
     moves: ['Origin Pulse'],
     itemHistory: [],
     fainted: false,
+    appeared: true,
     ...overrides,
   };
 }
@@ -75,13 +76,12 @@ describe('matchSet does not force self-revealing items from priors', () => {
   });
 });
 
-describe('unrevealed mons are left empty, not guessed', () => {
-  const blank = mon({ moves: [] }); // nothing revealed at all
+describe('never-appeared mons are left empty, not guessed', () => {
+  const blank = mon({ moves: [], appeared: false }); // team-preview only
 
-  it('detects a mon that revealed nothing', () => {
+  it('detects a mon that never switched in', () => {
     expect(isUnrevealed(blank)).toBe(true);
-    expect(isUnrevealed(mon({ moves: ['Origin Pulse'] }))).toBe(false);
-    expect(isUnrevealed(mon({ moves: [], item: 'Air Balloon' }))).toBe(false);
+    expect(isUnrevealed(mon({ appeared: true }))).toBe(false);
   });
 
   it('emits an empty set instead of dex-filling it', () => {
@@ -93,5 +93,34 @@ describe('unrevealed mons are left empty, not guessed', () => {
     expect(ms.evs).toEqual({});
     // Paste is just the species — no hallucinated moves/spread.
     expect(exportSet(ms)).toBe('Kyogre');
+  });
+});
+
+describe('move-filling is gated on 3+ revealed moves matching a dex set', () => {
+  const bigSet: DexSet = {
+    role: 'Test',
+    moves: ['Ice Beam', 'Thunder', 'Origin Pulse', 'Water Spout'],
+    movepool: ['Ice Beam', 'Thunder', 'Origin Pulse', 'Water Spout', 'Calm Mind'],
+    item: 'Choice Specs',
+    nature: 'Modest',
+    evs: { spa: 252, spe: 252 },
+  };
+
+  it('completes the moveset when 3 revealed moves line up', () => {
+    const ms = matchSet(gen, mon({ moves: ['Ice Beam', 'Thunder', 'Origin Pulse'] }), [bigSet]);
+    expect(ms.moves.length).toBe(4);
+    expect(ms.moves).toContain('Water Spout'); // filled 4th slot
+  });
+
+  it('shows only revealed moves when fewer than 3 revealed — but keeps EV/item prediction', () => {
+    const ms = matchSet(gen, mon({ moves: ['Ice Beam', 'Thunder'] }), [bigSet]);
+    expect(ms.moves).toEqual(['Ice Beam', 'Thunder']);
+    expect(ms.item).toBe('Choice Specs');
+    expect(ms.evs.spa).toBe(252);
+  });
+
+  it('does not complete the set when a revealed move is outside the dex set', () => {
+    const ms = matchSet(gen, mon({ moves: ['Ice Beam', 'Thunder', 'Surf'] }), [bigSet]);
+    expect(ms.moves).toEqual(['Ice Beam', 'Thunder', 'Surf']); // no bogus 4th move
   });
 });

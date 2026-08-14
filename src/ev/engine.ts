@@ -199,6 +199,15 @@ function evSumExcluding(evs: Partial<StatsTable>, exclude: (keyof StatsTable)[])
  * same species on both teams is handled correctly.
  */
 export function deriveEvs(genNum: number, teams: SideSets[], observations: DamageObservation[]): void {
+  // Gens 1–2 (RBY/GSC) have no EVs in the modern sense — stat experience / DVs
+  // are effectively maxed, so damage-based EV derivation is meaningless. Keep
+  // the dex-set spread exactly as matched, without calculating.
+  if (genNum <= 2) {
+    for (const t of teams) for (const s of t.sets) {
+      if (!s.unrevealed) s.notes.push('Gen 1/2: EVs left at the dex spread (no EV calc).');
+    }
+    return;
+  }
   const gen = calc.Generations.get(genNum as GenerationNum);
   const byKey = new Map<string, MatchedSet>();
   for (const t of teams) for (const s of t.sets) byKey.set(key(t.side, s.baseSpecies), s);
@@ -507,6 +516,10 @@ export function selectSetsByDamage(
   teams: SideCandidates[],
   observations: DamageObservation[],
 ): SideSets[] {
+  // Gens 1–2: no damage-based set selection — use the reveal-best candidate as-is.
+  if (genNum <= 2) {
+    return teams.map((t) => ({ side: t.side, sets: t.candidates.map((list) => list[0]!) }));
+  }
   const gen = calc.Generations.get(genNum as GenerationNum);
   const usable = observations.filter((o) => o.usable);
   const candByKey = new Map<string, MatchedSet[]>();

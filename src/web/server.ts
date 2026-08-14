@@ -87,14 +87,6 @@ export function startServer(store: Datastore, config: Config, port: number): voi
     }
   });
 
-  app.get('/api/unique', (req, res) => {
-    const trainer = String(req.query.trainer || '').toLowerCase();
-    const rows = store.uniqueSets
-      .filter((u) => !trainer || u.playerId.includes(trainer))
-      .sort((a, b) => a.player.localeCompare(b.player) || a.species.localeCompare(b.species) || b.count - a.count);
-    res.json({ uniqueSets: rows });
-  });
-
   app.get('/api/teams', (_req, res) => {
     const teams = [];
     for (const r of store.replays) {

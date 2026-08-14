@@ -5,6 +5,44 @@ import { genFromFormatId } from '../data/dex.js';
 
 const BASE = 'https://replay.pokemonshowdown.com';
 
+/**
+ * Fetch JSON, but fail loudly-and-clearly when the server returns HTML instead
+ * (a 404 page, a Cloudflare/rate-limit challenge, etc.) rather than throwing the
+ * opaque "Unexpected token '<'" that a blind res.json() produces. Returns the
+ * parsed body, or throws an Error with a human-readable reason.
+ */
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+async function fetchJson(url: string, retries = 2): Promise<unknown> {
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(url);
+    // Rate-limits (429) and transient server errors (5xx) are worth retrying —
+    // large batches hit these — but a 404 (missing/private replay) is not.
+    if (res.status === 429 || res.status >= 500) {
+      if (attempt < retries) {
+        await sleep(600 * (attempt + 1));
+        continue;
+      }
+      throw new Error(`HTTP ${res.status} (rate-limited or server error after ${retries + 1} tries)`);
+    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const text = await res.text();
+    if (text.trimStart().startsWith('<')) {
+      // A challenge / rate-limit page can come back as 200 HTML — retry those too.
+      if (attempt < retries) {
+        await sleep(600 * (attempt + 1));
+        continue;
+      }
+      throw new Error('server returned HTML, not JSON (likely rate-limited or the replay is missing/private)');
+    }
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new Error('response was not valid JSON');
+    }
+  }
+}
+
 /** Extract a replay id from a URL or return the input if it already is one. */
 export function normalizeReplayId(input: string): string {
   const trimmed = input.trim();
@@ -37,9 +75,13 @@ function formatIdFromFormat(format: string): string {
 export async function fetchReplay(input: string): Promise<Replay> {
   const id = normalizeReplayId(input);
   const url = `${BASE}/${id}`;
-  const res = await fetch(`${url}.json`);
-  if (!res.ok) throw new Error(`Failed to fetch replay ${id}: HTTP ${res.status}`);
-  const raw = (await res.json()) as RawReplay;
+  let raw: RawReplay;
+  try {
+    raw = (await fetchJson(`${url}.json`)) as RawReplay;
+  } catch (e) {
+    throw new Error(`Failed to fetch replay ${id}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  if (!raw || !raw.log) throw new Error(`Failed to fetch replay ${id}: no battle log in response`);
   const formatid = raw.formatid || formatIdFromFormat(raw.format);
   return {
     id: raw.id || id,
@@ -69,9 +111,12 @@ export async function listUserReplays(user: string, max = 50): Promise<string[]>
   const userid = user.toLowerCase().replace(/[^a-z0-9]+/g, '');
   const ids: string[] = [];
   for (let page = 1; ids.length < max && page <= 25; page++) {
-    const res = await fetch(`${BASE}/search.json?user=${encodeURIComponent(userid)}&page=${page}`);
-    if (!res.ok) break;
-    const entries = (await res.json()) as SearchEntry[];
+    let entries: SearchEntry[];
+    try {
+      entries = (await fetchJson(`${BASE}/search.json?user=${encodeURIComponent(userid)}&page=${page}`)) as SearchEntry[];
+    } catch {
+      break;
+    }
     if (!Array.isArray(entries) || entries.length === 0) break;
     for (const e of entries) ids.push(e.id);
     if (entries.length < 51) break; // last page

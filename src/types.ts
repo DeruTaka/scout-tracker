@@ -33,6 +33,7 @@ export interface RevealedMon {
   ability?: string; // revealed ability
   tera?: string; // revealed tera type (gen 9)
   fainted: boolean;
+  appeared: boolean; // switched into battle at least once (vs team-preview only)
 }
 
 /** One player's revealed team from a replay. */

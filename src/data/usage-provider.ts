@@ -81,7 +81,15 @@ async function fetchChaos(formatid: string, month: string, bucket: number): Prom
   const url = `https://www.smogon.com/stats/${month}/chaos/${formatid}-${bucket}.json`;
   const res = await fetch(url);
   if (!res.ok) return null;
-  const json = (await res.json()) as { data: Record<string, MonUsage> };
+  const text = await res.text();
+  let json: { data: Record<string, MonUsage> };
+  try {
+    if (text.trimStart().startsWith('<')) return null; // HTML / rate-limit page
+    json = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!json?.data) return null;
   if (!existsSync(CACHE_DIR)) mkdirSync(CACHE_DIR, { recursive: true });
   writeFileSync(path, JSON.stringify({ data: json.data }));
   return { month, bucket, data: json.data };

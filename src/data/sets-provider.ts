@@ -85,7 +85,16 @@ async function loadRaw(formatid: string): Promise<Record<string, Record<string, 
     writeFileSync(path, '{}');
     return {};
   }
-  const json = (await res.json()) as Record<string, Record<string, RawSet>>;
+  const text = await res.text();
+  let json: Record<string, Record<string, RawSet>>;
+  try {
+    if (text.trimStart().startsWith('<')) throw new Error('html');
+    json = JSON.parse(text);
+  } catch {
+    // Transient (HTML / rate-limit page). Degrade to no dex sets, but DON'T cache
+    // it — a bad response shouldn't wedge this format as empty for a week.
+    return {};
+  }
   if (!existsSync(CACHE_DIR)) mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(json));
   return json;

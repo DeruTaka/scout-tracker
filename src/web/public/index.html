@@ -44,8 +44,7 @@
   a:hover { text-decoration:underline; }
   ::selection { background:var(--accent-soft); }
   /* Display sans for headings & titles */
-  h1, .brand .name, .replay-head h3, .team-head .player, .empty h3,
-  #unique details.lib-card > summary { font-family:var(--display); }
+  h1, .brand .name, .replay-head h3, .team-head .player, .empty h3 { font-family:var(--display); }
   h1 { letter-spacing:-.02em; }
 
   /* ---- App shell ---- */
@@ -170,30 +169,6 @@
   .err { color:var(--danger); background:var(--danger-soft); border:1px solid transparent; border-radius:11px; padding:12px 14px; font-size:13px; }
   .note-line { color:var(--muted); font-size:12.5px; padding:2px 0; }
 
-  /* ---- Library (nested cards) ---- */
-  .lib-toolbar { display:flex; gap:10px; margin-bottom:16px; flex-wrap:wrap; align-items:center; }
-  #unique details { border:1px solid var(--line); border-radius:var(--radius-sm); overflow:hidden; }
-  #unique summary { cursor:pointer; list-style:none; user-select:none; display:flex; align-items:center; gap:9px; transition:background .14s; }
-  #unique summary:hover { background:var(--line-2); }
-  #unique summary::-webkit-details-marker { display:none; }
-  #unique summary::before { content:'❯'; display:inline-block; width:12px; font-size:10px; color:var(--muted); transition:transform .16s; }
-  #unique details[open] > summary::before { transform:rotate(90deg); }
-  #unique details.lib-card { background:var(--surface); box-shadow:var(--shadow-sm); }
-  #unique details.lib-card > summary { padding:15px 18px; font-weight:700; font-size:15px; }
-  .lib-body { padding:6px 14px 14px; display:flex; flex-direction:column; gap:10px; }
-  #unique details.player { background:var(--surface-2); }
-  #unique details.player > summary { padding:11px 14px; }
-  #unique details.player > summary .pname { font-weight:650; }
-  #unique details.player > summary .chip { margin-left:auto; }
-  .player-body { padding:4px 16px 14px; display:flex; flex-direction:column; gap:12px; }
-  .uset { border-top:1px solid var(--line-2); padding-top:11px; }
-  .uset:first-child { border-top:0; padding-top:4px; }
-  .uset-head { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
-  .uset-head .name { font-weight:650; font-size:13.5px; }
-  .uset-head .copy { margin-left:auto; }
-  .uset .sub { color:var(--muted); font-size:12.5px; margin-top:3px; }
-  .uset .sub.mono { font-family:var(--mono); font-size:12px; }
-
   @media (max-width:720px){
     .app { grid-template-columns:1fr; }
     .sidebar { position:static; height:auto; flex-direction:row; flex-wrap:wrap; align-items:center; gap:6px; padding:12px 14px; }
@@ -216,10 +191,6 @@
       <a class="nav-item active" data-view="scout">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
         Scout
-      </a>
-      <a class="nav-item" data-view="library">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
-        User sets
       </a>
       <a class="nav-item" href="/teams">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8"/></svg>
@@ -268,17 +239,6 @@
         </div>
         <div id="results"></div>
       </section>
-
-      <!-- LIBRARY VIEW -->
-      <section id="view-library" class="view" hidden>
-        <div class="card pad">
-          <div class="lib-toolbar">
-            <input type="text" id="trainerFilter" placeholder="Filter by trainer…" />
-            <button class="btn-ghost btn-sm" id="refreshUnique">Refresh</button>
-          </div>
-          <div id="unique"></div>
-        </div>
-      </section>
     </div>
   </div>
 </div>
@@ -297,8 +257,7 @@ function toggleTheme(){ const next = currentTheme() === 'dark' ? 'light' : 'dark
 
 /* ---- View switching ---- */
 const VIEWS = {
-  scout:   { title:'Scout replays', sub:'Reconstruct both teams from any Showdown replay' },
-  library: { title:'User sets', sub:'Every unique set, grouped by user' },
+  scout: { title:'Scout replays', sub:'Reconstruct both teams from any Showdown replay' },
 };
 function showView(name){
   if (!VIEWS[name]) name = 'scout';
@@ -307,7 +266,6 @@ function showView(name){
   $('viewTitle').textContent = VIEWS[name].title;
   $('viewSub').textContent = VIEWS[name].sub;
   if (location.hash.slice(1) !== name) history.replaceState(null, '', '#'+name);
-  if (name === 'library') loadUnique();
 }
 
 /* ---- Status ---- */
@@ -417,71 +375,11 @@ async function run(endpoint) {
   finally { $('busy').textContent=''; $('ingestBtn').disabled=$('previewBtn').disabled=false; }
 }
 
-/* ---- Library ---- */
-function usetRow(u){
-  return `<div class="uset">
-    <div class="uset-head">
-      <span class="name">${esc(u.species)}</span>
-      <span class="chip">×${u.count}</span>
-      <span class="chip">${esc(u.format)}</span>
-      <button class="btn-ghost btn-sm copy" data-paste="${encodeURIComponent(paste(u.set))}">Copy</button>
-    </div>
-    <div class="sub">${esc(u.set.moves.join(' / '))}</div>
-    <div class="sub mono">${esc(u.set.item||'—')} · ${esc(u.set.ability||'—')} · ${esc(u.set.nature)} · ${esc(evStr(u.set.evs))}${u.set.tera?(' · Tera '+esc(u.set.tera)):''}</div>
-  </div>`;
-}
-
-async function loadUnique() {
-  const filter = $('trainerFilter').value.trim();
-  const r = await (await fetch('/api/unique?trainer='+encodeURIComponent(filter))).json();
-  const container = $('unique');
-  if (!r.uniqueSets.length) { container.innerHTML = '<div class="empty">No sets stored yet — scout a replay first.</div>'; return; }
-
-  const byPlayer = new Map();
-  for (const u of r.uniqueSets) {
-    if (!byPlayer.has(u.player)) byPlayer.set(u.player, []);
-    byPlayer.get(u.player).push(u);
-  }
-  const players = [...byPlayer.keys()].sort((a,b)=>a.localeCompare(b));
-  const totalSets = r.uniqueSets.length;
-  const openTop = filter ? ' open' : '';
-  const openPlayer = filter && players.length <= 3 ? ' open' : '';
-
-  const playerCards = players.map((p)=>{
-    const sets = byPlayer.get(p).sort((a,b)=> a.species.localeCompare(b.species) || b.count - a.count);
-    const rows = sets.map(usetRow).join('');
-    return `<details class="player"${openPlayer}>
-      <summary><span class="pname">${esc(p)}</span> <span class="chip">${sets.length} set${sets.length>1?'s':''}</span></summary>
-      <div class="player-body">${rows}</div>
-    </details>`;
-  }).join('');
-
-  container.innerHTML = `<details class="lib-card"${openTop}>
-    <summary>${players.length} trainer${players.length>1?'s':''} · ${totalSets} unique set${totalSets>1?'s':''}</summary>
-    <div class="lib-body">${playerCards}</div>
-  </details>`;
-  wireCopy(container);
-}
-
-// minimal client-side paste for the library copy buttons
-function paste(s){
-  const evs = evStr(s.evs);
-  let out = s.species + (s.item?(' @ '+s.item):'') + '\n';
-  if (s.ability) out += 'Ability: '+s.ability+'\n';
-  if (s.tera) out += 'Tera Type: '+s.tera+'\n';
-  if (evs!=='(none)') out += 'EVs: '+evs+'\n';
-  out += (s.nature||'Serious')+' Nature\n';
-  out += s.moves.map((m)=>'- '+m).join('\n');
-  return out;
-}
-
 /* ---- Wiring ---- */
 $('themeBtn').onclick = toggleTheme;
 document.querySelectorAll('.nav-item[data-view]').forEach((a)=> a.onclick = () => showView(a.dataset.view));
 $('ingestBtn').onclick = () => run('/api/ingest');
 $('previewBtn').onclick = () => run('/api/preview');
-$('refreshUnique').onclick = loadUnique;
-$('trainerFilter').oninput = () => { clearTimeout(window._t); window._t = setTimeout(loadUnique, 250); };
 
 paintThemeBtn();
 $('results').innerHTML = emptyResults();

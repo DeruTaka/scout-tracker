@@ -124,8 +124,16 @@ function defaultSpread(gen: Generation, mon: RevealedMon): { nature: string; evs
 
 /** Build a full MatchedSet for `mon` using one specific dex set (or none). */
 export function buildMatched(gen: Generation, mon: RevealedMon, best: DexSet | undefined): MatchedSet {
-  const moves = buildMoves(mon, best);
   const notes: string[] = [];
+  // Only complete the moveset from a dex set when we have 3+ revealed moves that
+  // actually line up with that set — otherwise dex-filling invents nonsensical
+  // move combinations. EVs / item / ability are still inferred either way.
+  const revealedDistinct = new Set(mon.moves.map(toID)).size;
+  const fillMoves = revealedDistinct >= 3 && revealedLinesUp(mon, best);
+  const moves = fillMoves ? buildMoves(mon, best) : dedupeRevealed(mon.moves);
+  if (!fillMoves && best) {
+    notes.push('Moves shown are only those revealed in game (need 3+ revealed moves matching a dex set to complete the moveset).');
+  }
 
   const ability = mon.ability ?? pickFirst(best?.ability);
   const itemRevealed = !!mon.item;
@@ -193,12 +201,34 @@ export function buildMatched(gen: Generation, mon: RevealedMon, best: DexSet | u
 }
 
 /**
- * A mon revealed nothing (never brought in, or brought in but showed no move /
- * item / ability / tera). There is genuinely no evidence to build a set from, so
- * any guess would be a hallucination — we emit an empty, clearly-flagged set.
+ * A mon that never switched into battle (team-preview only). There is genuinely
+ * no evidence to build a set from, so any guess would be a hallucination — we
+ * emit an empty, clearly-flagged set. Mons that DID appear keep their EV/item
+ * predictions (calibrated from damage) even when few moves were revealed.
  */
 export function isUnrevealed(mon: RevealedMon): boolean {
-  return mon.moves.length === 0 && !mon.item && !mon.ability && !mon.tera;
+  return !mon.appeared;
+}
+
+/** Distinct revealed moves this set is allowed to fill toward 4. */
+function dedupeRevealed(moves: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const m of moves) {
+    const id = toID(m);
+    if (id && !seen.has(id) && out.length < 4) {
+      seen.add(id);
+      out.push(m);
+    }
+  }
+  return out;
+}
+
+/** Does every revealed move belong to this set's movepool (i.e. it "lines up")? */
+function revealedLinesUp(mon: RevealedMon, set: DexSet | undefined): boolean {
+  if (!set) return false;
+  const pool = idSet(set.movepool);
+  return mon.moves.length > 0 && mon.moves.every((m) => pool.has(toID(m)));
 }
 
 /** An empty placeholder set for a mon that revealed nothing in the replay. */

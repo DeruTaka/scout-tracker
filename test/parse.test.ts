@@ -65,3 +65,54 @@ describe('parseReplay: smogtours-gen8uu-963226', () => {
     expect(keldeo.species).toBe('Keldeo-Resolute');
   });
 });
+
+function synthReplay(log: string): Replay {
+  return {
+    id: 'synthetic', url: '', format: '[Gen 9] OU', formatid: 'gen9ou', gen: 9,
+    players: ['Alice', 'Bob'], log, uploadtime: 0,
+  };
+}
+
+describe('proc items and Heavy-Duty Boots inference', () => {
+  const log = [
+    '|player|p1|Alice||', '|player|p2|Bob||',
+    '|poke|p1|Garchomp|', '|poke|p1|Dragapult|', '|poke|p2|Ferrothorn|',
+    '|teampreview', '|start',
+    '|switch|p1a: Garchomp|Garchomp|100/100',
+    '|switch|p2a: Ferrothorn|Ferrothorn|100/100',
+    '|turn|1',
+    '|move|p2a: Ferrothorn|Stealth Rock|p1a: Garchomp',
+    '|-sidestart|p1: Alice|move: Stealth Rock',
+    '|turn|2',
+    // Dragapult switches into Stealth Rock and TAKES the damage → no Boots.
+    '|switch|p1a: Dragapult|Dragapult|100/100',
+    '|-damage|p1a: Dragapult|75/100|[from] Stealth Rock',
+    '|turn|3',
+    // Garchomp switches into Stealth Rock and takes NO damage → Heavy-Duty Boots.
+    '|switch|p1a: Garchomp|Garchomp|100/100',
+    '|move|p1a: Garchomp|Earthquake|p2a: Ferrothorn',
+    '|-damage|p2a: Ferrothorn|60/100',
+    // Contact triggers Ferrothorn's Rocky Helmet on Garchomp — the item is
+    // Ferrothorn's, not Garchomp's.
+    '|-damage|p1a: Garchomp|88/100|[from] item: Rocky Helmet|[of] p2a: Ferrothorn',
+    '|turn|4',
+  ].join('\n');
+
+  const teams = parseReplay(synthReplay(log));
+  const p1 = teams.find((t) => t.side === 'p1')!;
+  const p2 = teams.find((t) => t.side === 'p2')!;
+  const mon = (t: typeof p1, sp: string) => t.mons.find((m) => m.baseSpecies === sp)!;
+
+  it('credits Rocky Helmet to the holder, not the mon it damaged', () => {
+    expect(mon(p2, 'Ferrothorn').item).toBe('Rocky Helmet');
+    expect(mon(p1, 'Garchomp').item).not.toBe('Rocky Helmet');
+  });
+
+  it('infers Heavy-Duty Boots for a mon that dodged Stealth Rock', () => {
+    expect(mon(p1, 'Garchomp').item).toBe('Heavy-Duty Boots');
+  });
+
+  it('does NOT infer Boots for a mon that took hazard damage', () => {
+    expect(mon(p1, 'Dragapult').item).toBeUndefined();
+  });
+});
