@@ -77,6 +77,9 @@ export interface MatchedSet {
   confidence: number; // 0..1
   notes: string[]; // human-readable provenance
   evSource: 'dex-set' | 'derived' | 'default';
+  /** True if the mon revealed nothing in the replay (no move/item/ability/tera).
+   *  Such sets are left empty rather than guessed — there is nothing to infer. */
+  unrevealed?: boolean;
 }
 
 /** A damage observation extracted from the log, used by the EV engine. */

@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { matchSet, itemWouldReveal } from '../src/match/match-set.js';
+import { matchSet, itemWouldReveal, isUnrevealed } from '../src/match/match-set.js';
+import { exportSet } from '../src/build/pokemon-set.js';
 import { getGen } from '../src/data/dex.js';
 import type { DexSet, RevealedMon } from '../src/types.js';
 
@@ -71,5 +72,26 @@ describe('matchSet does not force self-revealing items from priors', () => {
     const ms = matchSet(gen, mon(), [dexSet('Choice Specs')]);
     expect(ms.item).toBe('Choice Specs');
     expect(ms.itemRevealed).toBe(false);
+  });
+});
+
+describe('unrevealed mons are left empty, not guessed', () => {
+  const blank = mon({ moves: [] }); // nothing revealed at all
+
+  it('detects a mon that revealed nothing', () => {
+    expect(isUnrevealed(blank)).toBe(true);
+    expect(isUnrevealed(mon({ moves: ['Origin Pulse'] }))).toBe(false);
+    expect(isUnrevealed(mon({ moves: [], item: 'Air Balloon' }))).toBe(false);
+  });
+
+  it('emits an empty set instead of dex-filling it', () => {
+    const ms = matchSet(gen, blank, [dexSet('Choice Specs')]);
+    expect(ms.unrevealed).toBe(true);
+    expect(ms.moves).toEqual([]);
+    expect(ms.item).toBeUndefined();
+    expect(ms.ability).toBeUndefined();
+    expect(ms.evs).toEqual({});
+    // Paste is just the species — no hallucinated moves/spread.
+    expect(exportSet(ms)).toBe('Kyogre');
   });
 });

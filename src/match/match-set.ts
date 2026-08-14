@@ -192,8 +192,44 @@ export function buildMatched(gen: Generation, mon: RevealedMon, best: DexSet | u
   };
 }
 
+/**
+ * A mon revealed nothing (never brought in, or brought in but showed no move /
+ * item / ability / tera). There is genuinely no evidence to build a set from, so
+ * any guess would be a hallucination — we emit an empty, clearly-flagged set.
+ */
+export function isUnrevealed(mon: RevealedMon): boolean {
+  return mon.moves.length === 0 && !mon.item && !mon.ability && !mon.tera;
+}
+
+/** An empty placeholder set for a mon that revealed nothing in the replay. */
+export function buildUnrevealed(mon: RevealedMon): MatchedSet {
+  return {
+    species: mon.species,
+    baseSpecies: mon.baseSpecies,
+    nickname: mon.nickname,
+    gender: mon.gender,
+    level: mon.level || 100,
+    shiny: mon.shiny,
+    matchedRole: undefined,
+    moves: [],
+    revealedMoves: [],
+    item: undefined,
+    itemRevealed: false,
+    ability: undefined,
+    nature: '',
+    evs: {},
+    ivs: undefined,
+    tera: undefined,
+    confidence: 0,
+    notes: ['Never revealed in the replay — no set data to infer from.'],
+    evSource: 'default',
+    unrevealed: true,
+  };
+}
+
 /** The reveal-scored single best match (ignores damage evidence). */
 export function matchSet(gen: Generation, mon: RevealedMon, candidateSets: DexSet[]): MatchedSet {
+  if (isUnrevealed(mon)) return buildUnrevealed(mon);
   return buildMatched(gen, mon, chooseBest(mon, candidateSets));
 }
 
@@ -207,6 +243,7 @@ export function candidateMatchedSets(
   mon: RevealedMon,
   candidateSets: DexSet[],
 ): MatchedSet[] {
+  if (isUnrevealed(mon)) return [buildUnrevealed(mon)];
   if (candidateSets.length === 0) return [buildMatched(gen, mon, undefined)];
   const ranked = [...candidateSets].sort((a, b) => scoreSet(mon, b) - scoreSet(mon, a));
   return ranked.map((s) => buildMatched(gen, mon, s));

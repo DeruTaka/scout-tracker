@@ -73,6 +73,7 @@ export async function scoutReplay(replay: Replay, opts: ScoutOptions = {}): Prom
   for (let i = 0; i < teams.length; i++) {
     const sets = sideSets[i]!.sets;
     for (const ms of sets) {
+      if (ms.unrevealed) continue; // nothing revealed → attach no guessed data
       const bad = await illegalFilledMoves(gen, ms);
       if (bad.length) ms.notes.push(`Possibly illegal filled move(s): ${bad.join(', ')}.`);
       if (useUsage) {

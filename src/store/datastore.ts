@@ -146,6 +146,7 @@ export class Datastore {
     let updatedSets = 0;
     for (const team of scouted.teams) {
       for (const ms of team.sets) {
+        if (ms.unrevealed) continue; // don't pollute the library with empty sets
         const hash = setHash(r.formatid, ms);
         const existing = this.data.uniqueSets.find(
           (u) => u.hash === hash && u.playerId === toID(team.player),

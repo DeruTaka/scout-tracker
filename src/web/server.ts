@@ -42,8 +42,9 @@ export function startServer(store: Datastore, config: Config, port: number): voi
   const publicDir = fileURLToPath(new URL('./public', import.meta.url));
   app.use(express.static(publicDir));
 
-  // Clean URL for the embedded-sheet page.
+  // Clean URLs for the extra pages.
   app.get('/sheet', (_req, res) => res.sendFile(fileURLToPath(new URL('./public/sheet.html', import.meta.url))));
+  app.get('/teams', (_req, res) => res.sendFile(fileURLToPath(new URL('./public/teams.html', import.meta.url))));
 
   app.get('/api/status', (_req, res) => {
     res.json({
@@ -92,6 +93,29 @@ export function startServer(store: Datastore, config: Config, port: number): voi
       .filter((u) => !trainer || u.playerId.includes(trainer))
       .sort((a, b) => a.player.localeCompare(b.player) || a.species.localeCompare(b.species) || b.count - a.count);
     res.json({ uniqueSets: rows });
+  });
+
+  app.get('/api/teams', (_req, res) => {
+    const teams = [];
+    for (const r of store.replays) {
+      for (const t of r.teams) {
+        teams.push({
+          replayId: r.id,
+          url: r.url,
+          format: r.format,
+          formatid: r.formatid,
+          uploadtime: r.uploadtime,
+          date: r.uploadtime ? new Date(r.uploadtime * 1000).toISOString().slice(0, 10) : '',
+          player: t.player,
+          side: t.side,
+          winner: r.winner,
+          result: r.winner ? (r.winner === t.player ? 'W' : 'L') : '',
+          paste: t.paste,
+          mons: t.sets.map((s) => ({ species: s.species, unrevealed: !!s.unrevealed })),
+        });
+      }
+    }
+    res.json({ teams });
   });
 
   app.get('/api/replays', (_req, res) => {
