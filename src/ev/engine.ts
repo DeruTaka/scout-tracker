@@ -193,12 +193,72 @@ function violation(observed: number, lo: number, hi: number, koCapped: boolean, 
   return 0;
 }
 
-function evSumExcluding(evs: Partial<StatsTable>, exclude: (keyof StatsTable)[]): number {
-  let total = 0;
-  for (const k of ['hp', 'atk', 'def', 'spa', 'spd', 'spe'] as const) {
-    if (!exclude.includes(k)) total += evs[k] || 0;
+const ALL_STATS: (keyof StatsTable)[] = ['hp', 'atk', 'def', 'spa', 'spd', 'spe'];
+const STAT_LABEL: Record<keyof StatsTable, string> = { hp: 'HP', atk: 'Atk', def: 'Def', spa: 'SpA', spd: 'SpD', spe: 'Spe' };
+
+/** Non-tested stats, least-invested-first — the natural "what's this build not
+ *  really using" order to draw a trade from. */
+// Tiebreak for donors with equal prior investment: Speed is the stat a real
+// spread sacrifices first for bulk (it doesn't undercut the damage already
+// evidenced elsewhere), offense stats (Atk/SpA) are sacrificed last since
+// they're directly load-bearing for whatever damage output got this mon its
+// prior in the first place.
+const SACRIFICE_ORDER: (keyof StatsTable)[] = ['spe', 'hp', 'spd', 'def', 'spa', 'atk'];
+
+function donorOrder(priorEvs: Partial<StatsTable>, exclude: (keyof StatsTable)[]): (keyof StatsTable)[] {
+  return ALL_STATS.filter((s) => !exclude.includes(s)).sort((a, b) => {
+    const diff = (priorEvs[a] || 0) - (priorEvs[b] || 0);
+    return diff !== 0 ? diff : SACRIFICE_ORDER.indexOf(a) - SACRIFICE_ORDER.indexOf(b);
+  });
+}
+
+/**
+ * Build a full, budget-legal (508-total) EV spread: `fixed` stats take their
+ * given candidate value; every other stat starts at its prior value, then
+ * `donors` are drained — in order, down to their floor (default 0) — to cover
+ * any overage. This is the general form of "trade EVs for bulk": ANY stat can
+ * fund any other, as long as the donor isn't below a proven floor (e.g. a
+ * speedFloor from turn-order evidence) and never GAINS EVs it didn't already
+ * have here (donors only ever shrink). Returns null if fully draining every
+ * donor still doesn't fit — genuinely infeasible, not just "unlikely".
+ */
+function allocateDonors(
+  priorEvs: Partial<StatsTable>,
+  fixed: Partial<Record<keyof StatsTable, number>>,
+  donors: (keyof StatsTable)[],
+  floors: Partial<Record<keyof StatsTable, number>>,
+): Partial<StatsTable> | null {
+  const result: Partial<StatsTable> = {};
+  for (const s of ALL_STATS) result[s] = s in fixed ? fixed[s]! : priorEvs[s] || 0;
+  let over = ALL_STATS.reduce((sum, s) => sum + (result[s] || 0), 0) - EV_TOTAL;
+  if (over > 0) {
+    for (const donor of donors) {
+      if (over <= 0) break;
+      const floor = floors[donor] ?? 0;
+      const cur = result[donor] || 0;
+      const take = Math.min(Math.max(0, cur - floor), over);
+      result[donor] = cur - take;
+      over -= take;
+    }
   }
-  return total;
+  return over > 0 ? null : result;
+}
+
+/** Regularization cost: total EV movement across ALL stats (including any
+ *  donor reallocation), as a fraction of one stat's cap. */
+function totalDeviation(evs: Partial<StatsTable>, priorEvs: Partial<StatsTable>): number {
+  let dev = 0;
+  for (const s of ALL_STATS) dev += Math.abs((evs[s] || 0) - (priorEvs[s] || 0));
+  return dev / EV_MAX;
+}
+
+/** Human-readable list of which donor stats actually moved, for a note. */
+function donorNoteList(evs: Partial<StatsTable>, priorEvs: Partial<StatsTable>, donors: (keyof StatsTable)[]): string {
+  return donors
+    .map((d) => ({ d, delta: (priorEvs[d] || 0) - (evs[d] || 0) }))
+    .filter((x) => x.delta > 0)
+    .map((x) => `${x.delta} ${STAT_LABEL[x.d]}`)
+    .join(', ');
 }
 
 /**
@@ -320,17 +380,21 @@ function refineOffense(
   stat: 'atk' | 'spa',
   obs: DamageObservation[],
 ): void {
-  const priorEv = ms.evs[stat] || 0;
+  const priorEvs = { ...ms.evs };
   const priorNature = ms.nature;
   const priorItem = ms.item ?? '';
-  const { v: priorV, n: obsCount } = totalViolationOffense(gen, ms, byKey, ms.evs, priorNature, obs, priorItem);
+  const { v: priorV, n: obsCount } = totalViolationOffense(gen, ms, byKey, priorEvs, priorNature, obs, priorItem);
   if (priorV <= KEEP_THRESHOLD) {
     ms.notes.push(`Observed ${stat.toUpperCase()} damage fits the dex spread (±${priorV.toFixed(1)}%).`);
     ms.confidence = Math.min(0.98, ms.confidence + 0.03);
     return;
   }
   const scale = evidenceScale(obsCount);
-  const otherSum = evSumExcluding(ms.evs, [stat]);
+  // A mon needing MORE of this stat than the prior's 508-total budget allows
+  // (a maxed spread that under-hits) can fund it from whatever it invests
+  // LEAST in — same trade a scout would infer, generalized beyond Speed.
+  const donors = donorOrder(priorEvs, [stat]);
+  const floors: Partial<Record<keyof StatsTable, number>> = { spe: ms.speedFloor ?? 0 };
   const natures = [...new Set([priorNature, OFFENSE_NATURE[stat]])];
   // When the item wasn't revealed, let the search also try the damage items —
   // a Choice Specs / Life Orb explains "hits harder than any spread should".
@@ -341,22 +405,23 @@ function refineOffense(
   // item only move when the damage evidence justifies it (prevents overfitting
   // to HP% rounding) — but the more independent hits agree, the cheaper that
   // move gets (see evidenceScale).
-  let best = { ev: priorEv, nature: priorNature, item: priorItem, v: priorV, score: priorV };
+  let best = { evs: priorEvs, nature: priorNature, item: priorItem, v: priorV, score: priorV };
   for (const item of items) {
     const itemCost = (sameItem(item, priorItem) ? 0 : ITEM_PENALTY) * scale;
     for (const nature of natures) {
+      const natCost = (nature === priorNature ? 0 : NATURE_PENALTY) * scale;
       for (let ev = 0; ev <= EV_MAX; ev += EV_STEP) {
-        if (otherSum + ev > EV_TOTAL) break;
-        const { v } = totalViolationOffense(gen, ms, byKey, { ...ms.evs, [stat]: ev }, nature, obs, item);
-        const devCost = LAMBDA * scale * (Math.abs(ev - priorEv) / EV_MAX);
-        const natCost = (nature === priorNature ? 0 : NATURE_PENALTY) * scale;
+        const evs = allocateDonors(priorEvs, { [stat]: ev }, donors, floors);
+        if (!evs) continue; // infeasible even after draining every donor
+        const { v } = totalViolationOffense(gen, ms, byKey, evs, nature, obs, item);
+        const devCost = LAMBDA * scale * totalDeviation(evs, priorEvs);
         const score = v + devCost + natCost + itemCost;
-        if (score < best.score - 1e-6) best = { ev, nature, item, v, score };
+        if (score < best.score - 1e-6) best = { evs, nature, item, v, score };
       }
     }
   }
   const itemChanged = !sameItem(best.item, priorItem);
-  const changed = best.ev !== priorEv || best.nature !== priorNature || itemChanged;
+  const changed = totalDeviation(best.evs, priorEvs) > 1e-9 || best.nature !== priorNature || itemChanged;
   const improvement = priorV - best.v;
   // Adopt the best spread/item when it MATERIALLY beats the prior — even if the
   // residual isn't tiny. A defensive dex spread that badly under-predicts a KO
@@ -374,7 +439,8 @@ function refineOffense(
     }
     return;
   }
-  ms.evs = { ...ms.evs, [stat]: best.ev };
+  const donorNote = donorNoteList(best.evs, priorEvs, donors);
+  ms.evs = best.evs;
   ms.nature = best.nature;
   ms.evSource = 'derived';
   if (itemChanged) {
@@ -383,8 +449,9 @@ function refineOffense(
       `Inferred ${best.item || 'no item'} from damage output (a plain spread couldn't reach the observed ${stat.toUpperCase()} damage).`,
     );
   }
+  if (donorNote) ms.notes.push(`Traded ${donorNote} to afford ${stat.toUpperCase()} — the prior spread had no spare room.`);
   ms.notes.push(
-    `Derived ${stat.toUpperCase()} = ${best.ev} EVs${best.nature !== priorNature ? ` (${best.nature})` : ''} from observed damage (dex spread was off by ${priorV.toFixed(1)}%, residual ${best.v.toFixed(1)}%).`,
+    `Derived ${stat.toUpperCase()} = ${best.evs[stat] || 0} EVs${best.nature !== priorNature ? ` (${best.nature})` : ''} from observed damage (dex spread was off by ${priorV.toFixed(1)}%, residual ${best.v.toFixed(1)}%).`,
   );
   // Confidence tracks how well the adopted spread actually fits.
   ms.confidence = Math.max(
@@ -441,44 +508,39 @@ function refineDefense(
   stat: 'def' | 'spd',
   obs: DamageObservation[],
 ): void {
-  const priorHp = ms.evs.hp || 0;
-  const priorDef = ms.evs[stat] || 0;
-  const priorSpe = ms.evs.spe || 0;
+  const priorEvs = { ...ms.evs };
   const priorNature = ms.nature;
-  const { v: priorV, n: obsCount } = totalViolationDefense(gen, ms, byKey, ms.evs, obs, priorNature);
+  const { v: priorV, n: obsCount } = totalViolationDefense(gen, ms, byKey, priorEvs, obs, priorNature);
   if (priorV <= KEEP_THRESHOLD) {
     ms.confidence = Math.min(0.98, ms.confidence + 0.03);
     return;
   }
   const scale = evidenceScale(obsCount);
-  // Speed is excluded from the fixed baseline: a dex/usage prior often already
-  // spends the full 508 EVs on offense (e.g. 252/4/252), which would otherwise
-  // make added bulk mathematically impossible to reach regardless of evidence.
-  // Let the search sacrifice Speed to make room — the same trade a human scout
-  // would infer ("hit for less than a maxed build should, and nothing else
-  // grew, so something got sacrificed for bulk") — at its own regularized cost.
-  // Never below speedFloor: turn order already PROVED that much Speed is real.
-  const speedFloor = ms.speedFloor ?? 0;
-  const otherSum = evSumExcluding(ms.evs, ['hp', stat, 'spe']);
-  const hpCandidates = [...new Set([priorHp, 0, 248, 252])].filter((h) => h <= EV_MAX);
+  // hp/stat are fixed by the search below; anything else (commonly Speed, but
+  // now genuinely any stat) can fund the difference when the prior's 508-total
+  // budget leaves no spare room — the same trade a scout would infer ("hit for
+  // less than a maxed build should, and nothing else grew, so something got
+  // sacrificed for bulk"). Never below speedFloor: turn order already PROVED
+  // that much Speed is real.
+  const donors = donorOrder(priorEvs, ['hp', stat]);
+  const floors: Partial<Record<keyof StatsTable, number>> = { spe: ms.speedFloor ?? 0 };
+  const hpCandidates = [...new Set([priorEvs.hp || 0, 0, 248, 252])].filter((h) => h <= EV_MAX);
   const natures = [...new Set([priorNature, ...DEFENSE_NATURE_CANDIDATES[stat]])];
-  let best = { hp: priorHp, ev: priorDef, spe: priorSpe, nature: priorNature, v: priorV, score: priorV };
+  let best = { evs: priorEvs, nature: priorNature, v: priorV, score: priorV };
   for (const nature of natures) {
     const natCost = (nature === priorNature ? 0 : NATURE_PENALTY) * scale;
     for (const hp of hpCandidates) {
       for (let ev = 0; ev <= EV_MAX; ev += EV_STEP) {
-        if (otherSum + hp + ev > EV_TOTAL) break; // infeasible even sacrificing all Speed
-        const speBudget = EV_TOTAL - otherSum - hp - ev;
-        const spe = Math.max(speedFloor, Math.min(priorSpe, speBudget));
-        if (spe < speedFloor) continue; // can't fit without violating proven Speed
-        const { v } = totalViolationDefense(gen, ms, byKey, { ...ms.evs, hp, [stat]: ev, spe }, obs, nature);
-        const dev = (Math.abs(hp - priorHp) + Math.abs(ev - priorDef) + Math.abs(spe - priorSpe)) / EV_MAX;
+        const evs = allocateDonors(priorEvs, { hp, [stat]: ev }, donors, floors);
+        if (!evs) continue; // infeasible even after draining every donor
+        const { v } = totalViolationDefense(gen, ms, byKey, evs, obs, nature);
+        const dev = totalDeviation(evs, priorEvs);
         const score = v + LAMBDA * scale * dev + natCost;
-        if (score < best.score - 1e-6) best = { hp, ev, spe, nature, v, score };
+        if (score < best.score - 1e-6) best = { evs, nature, v, score };
       }
     }
   }
-  const changed = best.hp !== priorHp || best.ev !== priorDef || best.spe !== priorSpe || best.nature !== priorNature;
+  const changed = totalDeviation(best.evs, priorEvs) > 1e-9 || best.nature !== priorNature;
   const improvement = priorV - best.v;
   if (!changed || improvement < KEEP_THRESHOLD) {
     if (priorV > RESIDUAL_ACCEPT) {
@@ -489,14 +551,13 @@ function refineDefense(
     }
     return;
   }
-  ms.evs = { ...ms.evs, hp: best.hp, [stat]: best.ev, spe: best.spe };
+  const donorNote = donorNoteList(best.evs, priorEvs, donors);
+  ms.evs = best.evs;
   if (best.nature !== priorNature) ms.nature = best.nature;
-  if (best.spe !== priorSpe) {
-    ms.notes.push(`Traded ${priorSpe - best.spe} Speed EVs for bulk — the maxed offensive prior left no other room.`);
-  }
+  if (donorNote) ms.notes.push(`Traded ${donorNote} for bulk — the maxed prior spread left no other room.`);
   ms.evSource = 'derived';
   ms.notes.push(
-    `Derived HP/${stat.toUpperCase()} = ${best.hp}/${best.ev}${best.nature !== priorNature ? ` (${best.nature})` : ''} EVs from damage taken (dex spread was off by ${priorV.toFixed(1)}%, residual ${best.v.toFixed(1)}%).`,
+    `Derived HP/${stat.toUpperCase()} = ${best.evs.hp || 0}/${best.evs[stat] || 0}${best.nature !== priorNature ? ` (${best.nature})` : ''} EVs from damage taken (dex spread was off by ${priorV.toFixed(1)}%, residual ${best.v.toFixed(1)}%).`,
   );
   ms.confidence = Math.max(
     0.3,
@@ -591,20 +652,31 @@ function refineSpeed(gen: CalcGen, ms: MatchedSet, byKey: Map<string, MatchedSet
 
   const natures = [...new Set([priorNature, ...SPEED_NATURE_CANDIDATES])];
   const items = ms.itemRevealed ? [priorItem] : dedupeItems([priorItem, '', 'Choice Scarf']);
-  const otherSum = evSumExcluding(ms.evs, ['spe']);
+  const priorEvs = { ...ms.evs };
+  // Any other stat can fund the Speed increase when the prior's 508-total
+  // budget leaves no spare room — turn order proved the Speed is real, so the
+  // search must be able to reach it even from an already-maxed prior.
+  const donors = donorOrder(priorEvs, ['spe']);
   // Violations dominate the score (a contradiction is never acceptable); EV
   // deviation and nature/item cost only break ties among equally-valid fits.
-  let best = { spe: priorSpe, nature: priorNature, item: priorItem, viol: priorViol, score: priorViol * 1000 };
+  let best: { evs: Partial<StatsTable>; nature: string; item: string; viol: number; score: number } = {
+    evs: priorEvs,
+    nature: priorNature,
+    item: priorItem,
+    viol: priorViol,
+    score: priorViol * 1000,
+  };
   for (const item of items) {
     const itemCost = sameItem(item, priorItem) ? 0 : ITEM_PENALTY;
     for (const nature of natures) {
       const natCost = nature === priorNature ? 0 : NATURE_PENALTY;
       for (let spe = 0; spe <= EV_MAX; spe += EV_STEP) {
-        if (otherSum + spe > EV_TOTAL) break;
+        const evs = allocateDonors(priorEvs, { spe }, donors, {});
+        if (!evs) continue; // infeasible even after draining every donor
         const { violations } = speedViolations(gen, ms, byKey, selfKey, obs, spe, nature, item);
-        const dev = LAMBDA * (Math.abs(spe - priorSpe) / EV_MAX);
+        const dev = LAMBDA * totalDeviation(evs, priorEvs);
         const score = violations * 1000 + dev + natCost + itemCost;
-        if (score < best.score - 1e-6) best = { spe, nature, item, viol: violations, score };
+        if (score < best.score - 1e-6) best = { evs, nature, item, viol: violations, score };
       }
     }
   }
@@ -619,20 +691,22 @@ function refineSpeed(gen: CalcGen, ms: MatchedSet, byKey: Map<string, MatchedSet
   }
 
   const itemChanged = !sameItem(best.item, priorItem);
-  ms.evs = { ...ms.evs, spe: best.spe };
+  const donorNote = donorNoteList(best.evs, priorEvs, donors);
+  ms.evs = best.evs;
   if (best.nature !== priorNature) ms.nature = best.nature;
   if (itemChanged) {
     ms.item = best.item || undefined;
     ms.itemRevealed = false; // still an inference, not a reveal
     ms.notes.push(`Inferred ${best.item || 'no item'} — no plain Speed spread explains the observed turn order.`);
   }
+  if (donorNote) ms.notes.push(`Traded ${donorNote} for Speed — the prior spread had no room, but turn order proved it.`);
   ms.evSource = 'derived';
   ms.notes.push(
-    `Derived Speed = ${best.spe} EVs${best.nature !== priorNature ? ` (${best.nature})` : ''} from turn order (${checked} observation(s)).`,
+    `Derived Speed = ${best.evs.spe || 0} EVs${best.nature !== priorNature ? ` (${best.nature})` : ''} from turn order (${checked} observation(s)).`,
   );
   ms.confidence = Math.max(0.3, Math.min(ms.confidence, 0.85));
   // Record the floor at this (now-corrected) nature/item for the bulk trade below.
-  for (let spe = 0; spe <= best.spe; spe += EV_STEP) {
+  for (let spe = 0; spe <= (best.evs.spe || 0); spe += EV_STEP) {
     if (speedViolations(gen, ms, byKey, selfKey, obs, spe, best.nature, best.item).violations === 0) {
       ms.speedFloor = spe;
       break;

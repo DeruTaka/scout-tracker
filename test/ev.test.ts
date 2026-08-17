@@ -3,11 +3,11 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { parseReplay } from '../src/replay/parse.js';
 import { extractObservations } from '../src/ev/field-tracker.js';
-import { deriveEvs, type SideSets } from '../src/ev/engine.js';
+import { deriveEvs, deriveSpeed, type SideSets } from '../src/ev/engine.js';
 import { matchSet } from '../src/match/match-set.js';
 import { getSetsForSpecies } from '../src/data/sets-provider.js';
 import { genFromFormatId, getGen } from '../src/data/dex.js';
-import type { DamageObservation, MatchedSet, Replay } from '../src/types.js';
+import type { DamageObservation, MatchedSet, Replay, SpeedObservation } from '../src/types.js';
 
 function loadFixture(name: string): Replay {
   const path = fileURLToPath(new URL(`./fixtures/${name}.json`, import.meta.url));
@@ -128,8 +128,101 @@ describe('defense EV search trades Speed for bulk when the prior is already maxe
     const teams: SideSets[] = [{ side: 'p1', sets: [koraidon()] }, { side: 'p2', sets: [zac] }];
     deriveEvs(9, teams, [hit(), hit()]);
     expect(zac.evs.def).toBeGreaterThan(0);
-    expect(zac.evs.spe).toBeLessThan(252); // paid for with Speed, not free EVs
-    expect((zac.evs.spe ?? 0) + (zac.evs.def ?? 0)).toBe(252); // Speed lost == Def gained, not free EVs from nowhere
-    expect(zac.notes.some((n) => n.includes('Traded') && n.includes('Speed'))).toBe(true);
+    expect(zac.evs.spe).toBeLessThan(252); // paid for by donors, not free EVs
+    // Budget conserved: the Def gain came from other stats shrinking, not from nowhere.
+    const total = (['hp', 'atk', 'def', 'spa', 'spd', 'spe'] as const).reduce((s, k) => s + (zac.evs[k] ?? 0), 0);
+    expect(total).toBe(508);
+    expect(zac.notes.some((n) => n.includes('Traded'))).toBe(true);
+  });
+});
+
+describe('offense EV search donates from any unused stat, not just a hardcoded one', () => {
+  // A Koraidon dex-matched as a pure defensive wall (0 Atk investment) — but if
+  // it hits hard enough that no plain 0-Atk spread explains the damage, the
+  // generalized donor search must find room for real Atk investment by
+  // shrinking whatever it invested least in (here: SpD/Spe before HP/Def).
+  function wallKoraidon(): MatchedSet {
+    return {
+      species: 'Koraidon', baseSpecies: 'Koraidon', level: 100, shiny: false,
+      moves: ['Flame Charge'], revealedMoves: ['Flame Charge'],
+      item: undefined, itemRevealed: false, ability: 'Orichalcum Pulse',
+      nature: 'Impish', evs: { hp: 252, def: 252, spe: 4 },
+      confidence: 0.6, notes: [], evSource: 'dex-set', choicePossible: true, tera: 'Fire',
+    };
+  }
+  function fixedZacian(): MatchedSet {
+    return {
+      species: 'Zacian-Crowned', baseSpecies: 'Zacian-Crowned', level: 100, shiny: false,
+      moves: ['Behemoth Blade'], revealedMoves: ['Behemoth Blade'],
+      item: 'Rusted Sword', itemRevealed: true, ability: 'Intrepid Sword',
+      nature: 'Jolly', evs: { hp: 252, spd: 4, spe: 252 },
+      confidence: 0.7, notes: [], evSource: 'dex-set', choicePossible: true,
+    };
+  }
+  function bigHit(): DamageObservation {
+    return {
+      turn: 3, attackerSide: 'p1', attackerSpecies: 'Koraidon', defenderSide: 'p2',
+      defenderSpecies: 'Zacian-Crowned', move: 'Flame Charge', observedPercent: 80,
+      koCapped: false, field: {
+        attackerBoosts: {}, defenderBoosts: {}, reflect: false, lightScreen: false,
+        auroraVeil: false, attackerHpPercent: 100, defenderHpPercent: 100, attackerTera: 'Fire',
+      }, crit: false, usable: true,
+    };
+  }
+
+  it('funds Atk investment from other stats when the 0-Atk prior cannot explain the damage', () => {
+    const kora = wallKoraidon();
+    const teams: SideSets[] = [{ side: 'p1', sets: [kora] }, { side: 'p2', sets: [fixedZacian()] }];
+    deriveEvs(9, teams, [bigHit(), bigHit()]);
+    expect(kora.evs.atk).toBeGreaterThan(0);
+    const total = (['hp', 'atk', 'def', 'spa', 'spd', 'spe'] as const).reduce((s, k) => s + (kora.evs[k] ?? 0), 0);
+    expect(total).toBe(508);
+    expect(kora.notes.some((n) => n.includes('Traded'))).toBe(true);
+  });
+});
+
+describe('speed EV search donates from other stats when a maxed non-Speed prior blocks the derived floor', () => {
+  // A Koraidon dex-matched as bulky/support (0 Speed investment, budget already
+  // spent on HP/SpD) that turn order proves is faster than a max-Speed Zacian.
+  // The old refineSpeed had no donor logic at all here — it would hit the
+  // budget wall and silently keep the (contradicted) 0-Speed prior.
+  function slowKoraidon(): MatchedSet {
+    return {
+      species: 'Koraidon', baseSpecies: 'Koraidon', level: 100, shiny: false,
+      moves: ['Flame Charge'], revealedMoves: ['Flame Charge'],
+      item: 'Leftovers', itemRevealed: true, ability: 'Orichalcum Pulse',
+      nature: 'Impish', evs: { hp: 252, spd: 252, atk: 4 },
+      confidence: 0.6, notes: [], evSource: 'dex-set', choicePossible: true, tera: 'Fire',
+    };
+  }
+  // Neutral nature + maxed Speed puts Zacian's effective Speed (395) just
+  // under Koraidon's absolute ceiling (405, Jolly + 252 EVs) but well above
+  // Koraidon's 0-investment floor (336 w/ Jolly) — so beating it is possible,
+  // but only with real EV investment, not a free nature swap alone.
+  function fastZacian(): MatchedSet {
+    return {
+      species: 'Zacian-Crowned', baseSpecies: 'Zacian-Crowned', level: 100, shiny: false,
+      moves: ['Behemoth Blade'], revealedMoves: ['Behemoth Blade'],
+      item: 'Rusted Sword', itemRevealed: true, ability: 'Intrepid Sword',
+      nature: 'Bashful', evs: { spe: 252 },
+      confidence: 0.7, notes: [], evSource: 'dex-set', choicePossible: true,
+    };
+  }
+  function speedObs(): SpeedObservation {
+    return {
+      turn: 1, fasterSide: 'p1', fasterSpecies: 'Koraidon', slowerSide: 'p2', slowerSpecies: 'Zacian-Crowned',
+      fasterBoosts: {}, slowerBoosts: {}, trickRoom: false,
+    };
+  }
+
+  it('funds Speed investment from other stats when the 0-Speed prior cannot explain being faster', () => {
+    const kora = slowKoraidon();
+    const teams: SideSets[] = [{ side: 'p1', sets: [kora] }, { side: 'p2', sets: [fastZacian()] }];
+    deriveSpeed(9, teams, [speedObs()]);
+    expect(kora.evs.spe).toBeGreaterThan(0);
+    const total = (['hp', 'atk', 'def', 'spa', 'spd', 'spe'] as const).reduce((s, k) => s + (kora.evs[k] ?? 0), 0);
+    expect(total).toBe(508);
+    expect(kora.notes.some((n) => n.includes('Traded'))).toBe(true);
+    expect(kora.speedFloor).toBeGreaterThan(0);
   });
 });
