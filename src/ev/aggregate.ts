@@ -13,7 +13,7 @@ import type { Datastore, StoredReplay } from '../store/datastore.js';
 import type { DamageObservation, MatchedSet, Replay } from '../types.js';
 import { toID } from '../data/dex.js';
 import { extractObservations } from './field-tracker.js';
-import { deriveEvs, type SideSets } from './engine.js';
+import { deriveEvs, pickReferenceEvs, type SideSets } from './engine.js';
 import { exportTeam } from '../build/team-paste.js';
 
 /** Exact-roster identity: the sorted set of base species across the team. */
@@ -111,7 +111,12 @@ export function aggregateGroup(
     }
   });
 
-  deriveEvs(gen, teams, observations);
+  // Pass C (leftover-EV fill) can fall back to this trainer's other builds of
+  // the species — same history source used for initial candidate matching,
+  // just consulted again for whichever stat the pooled evidence never touches.
+  deriveEvs(gen, teams, observations, {
+    referenceEvs: (_side, baseSpecies) => pickReferenceEvs(store.getPriorSets(playerId, formatid, baseSpecies)),
+  });
 
   for (const m of members) {
     for (const ms of m.sets) {

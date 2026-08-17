@@ -226,3 +226,132 @@ describe('speed EV search donates from other stats when a maxed non-Speed prior 
     expect(kora.speedFloor).toBeGreaterThan(0);
   });
 });
+
+describe('a derived-down offense stat frees EVs into HP instead of leaving them unspent', () => {
+  // Weak, repeated Behemoth Blade hits force Zacian's Atk down from a maxed
+  // 252/4/252 prior — a plain decrease, not a donor trade — so nothing else
+  // automatically fills the freed budget. A real spread wouldn't just leave
+  // 248 EVs unspent; they should land in HP by default.
+  function zacian(): MatchedSet {
+    return {
+      species: 'Zacian-Crowned', baseSpecies: 'Zacian-Crowned', level: 100, shiny: false,
+      moves: ['Behemoth Blade'], revealedMoves: ['Behemoth Blade'],
+      item: 'Rusted Sword', itemRevealed: true, ability: 'Intrepid Sword',
+      nature: 'Jolly', evs: { atk: 252, spd: 4, spe: 252 },
+      confidence: 0.7, notes: [], evSource: 'dex-set', choicePossible: true,
+    };
+  }
+  function fodder(): MatchedSet {
+    return {
+      species: 'Blissey', baseSpecies: 'Blissey', level: 100, shiny: false,
+      moves: ['Seismic Toss'], revealedMoves: ['Seismic Toss'],
+      item: 'Leftovers', itemRevealed: true, ability: 'Natural Cure',
+      nature: 'Calm', evs: { hp: 252, spd: 252, spe: 4 },
+      confidence: 0.7, notes: [], evSource: 'dex-set', choicePossible: true,
+    };
+  }
+  function weakHit(): DamageObservation {
+    return {
+      turn: 5, attackerSide: 'p1', attackerSpecies: 'Zacian-Crowned', defenderSide: 'p2',
+      defenderSpecies: 'Blissey', move: 'Behemoth Blade', observedPercent: 5,
+      koCapped: false, field: {
+        attackerBoosts: {}, defenderBoosts: {}, reflect: false, lightScreen: false,
+        auroraVeil: false, attackerHpPercent: 100, defenderHpPercent: 100,
+      }, crit: false, usable: true,
+    };
+  }
+
+  it('tops HP up to a full 508-EV spread when the freed stat has no other claim', () => {
+    const zac = zacian();
+    const teams: SideSets[] = [{ side: 'p1', sets: [zac] }, { side: 'p2', sets: [fodder()] }];
+    deriveEvs(9, teams, [weakHit(), weakHit()]);
+    expect(zac.evs.atk).toBeLessThan(252);
+    const total = (['hp', 'atk', 'def', 'spa', 'spd', 'spe'] as const).reduce((s, k) => s + (zac.evs[k] ?? 0), 0);
+    expect(total).toBe(508);
+    expect(zac.evs.hp).toBeGreaterThan(0);
+    expect(zac.notes.some((n) => n.includes('Filled') && n.includes('HP'))).toBe(true);
+  });
+
+  it('does NOT auto-fill HP for a mon whose HP/Def was already weighed against damage taken', () => {
+    const zac = zacian();
+    const kora: MatchedSet = {
+      species: 'Koraidon', baseSpecies: 'Koraidon', level: 100, shiny: false,
+      moves: ['Flame Charge'], revealedMoves: ['Flame Charge'],
+      item: undefined, itemRevealed: false, ability: 'Orichalcum Pulse',
+      nature: 'Jolly', evs: { atk: 4, def: 252, spe: 252 },
+      confidence: 0.6, notes: [], evSource: 'dex-set', choicePossible: true, tera: 'Fire',
+    };
+    const hitOnKoraidon = (): DamageObservation => ({
+      turn: 5, attackerSide: 'p1', attackerSpecies: 'Zacian-Crowned', defenderSide: 'p2',
+      defenderSpecies: 'Koraidon', move: 'Behemoth Blade', observedPercent: 90,
+      koCapped: false, field: {
+        attackerBoosts: {}, defenderBoosts: {}, reflect: false, lightScreen: false,
+        auroraVeil: false, attackerHpPercent: 100, defenderHpPercent: 100,
+      }, crit: false, usable: true,
+    });
+    const teams: SideSets[] = [{ side: 'p1', sets: [zac] }, { side: 'p2', sets: [kora] }];
+    deriveEvs(9, teams, [hitOnKoraidon(), hitOnKoraidon()]);
+    expect(kora.notes.some((n) => n.includes('Filled'))).toBe(false);
+  });
+});
+
+describe('leftover-EV fill prefers a trainer-history reference over a blind HP max', () => {
+  function zacian(): MatchedSet {
+    return {
+      species: 'Zacian-Crowned', baseSpecies: 'Zacian-Crowned', level: 100, shiny: false,
+      moves: ['Behemoth Blade'], revealedMoves: ['Behemoth Blade'],
+      item: 'Rusted Sword', itemRevealed: true, ability: 'Intrepid Sword',
+      nature: 'Jolly', evs: { atk: 252, spd: 4, spe: 252 },
+      confidence: 0.7, notes: [], evSource: 'dex-set', choicePossible: true,
+    };
+  }
+  function fodder(): MatchedSet {
+    return {
+      species: 'Blissey', baseSpecies: 'Blissey', level: 100, shiny: false,
+      moves: ['Seismic Toss'], revealedMoves: ['Seismic Toss'],
+      item: 'Leftovers', itemRevealed: true, ability: 'Natural Cure',
+      nature: 'Calm', evs: { hp: 252, spd: 252, spe: 4 },
+      confidence: 0.7, notes: [], evSource: 'dex-set', choicePossible: true,
+    };
+  }
+  function weakHit(): DamageObservation {
+    return {
+      turn: 5, attackerSide: 'p1', attackerSpecies: 'Zacian-Crowned', defenderSide: 'p2',
+      defenderSpecies: 'Blissey', move: 'Behemoth Blade', observedPercent: 5,
+      koCapped: false, field: {
+        attackerBoosts: {}, defenderBoosts: {}, reflect: false, lightScreen: false,
+        auroraVeil: false, attackerHpPercent: 100, defenderHpPercent: 100,
+      }, crit: false, usable: true,
+    };
+  }
+
+  it("uses this trainer's other build of the species instead of maxing HP blind", () => {
+    const zac = zacian();
+    const teams: SideSets[] = [{ side: 'p1', sets: [zac] }, { side: 'p2', sets: [fodder()] }];
+    // This trainer's other Zacian-Crowned games show a bulky-Def build, not a
+    // pure-HP dump — a smarter fill should reflect that instead of always HP.
+    deriveEvs(9, teams, [weakHit(), weakHit()], {
+      referenceEvs: (side, baseSpecies) =>
+        side === 'p1' && baseSpecies === 'Zacian-Crowned' ? { hp: 100, def: 148 } : undefined,
+    });
+    expect(zac.evs.atk).toBeLessThan(252);
+    expect(zac.evs.hp).toBe(100);
+    expect(zac.evs.def).toBe(148);
+    const total = (['hp', 'atk', 'def', 'spa', 'spd', 'spe'] as const).reduce((s, k) => s + (zac.evs[k] ?? 0), 0);
+    expect(total).toBe(508);
+    expect(zac.notes.some((n) => n.includes('Filled') && n.includes("trainer's other"))).toBe(true);
+  });
+
+  it('still tops up with a blind HP max for whatever the reference leaves short', () => {
+    const zac = zacian();
+    const teams: SideSets[] = [{ side: 'p1', sets: [zac] }, { side: 'p2', sets: [fodder()] }];
+    // Reference only accounts for a small slice of the freed budget — the rest
+    // must still land somewhere so the spread stays a complete 508.
+    deriveEvs(9, teams, [weakHit(), weakHit()], {
+      referenceEvs: (side, baseSpecies) => (side === 'p1' && baseSpecies === 'Zacian-Crowned' ? { hp: 20 } : undefined),
+    });
+    const total = (['hp', 'atk', 'def', 'spa', 'spd', 'spe'] as const).reduce((s, k) => s + (zac.evs[k] ?? 0), 0);
+    expect(total).toBe(508);
+    expect(zac.evs.hp).toBeGreaterThan(20);
+  });
+});

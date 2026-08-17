@@ -8,7 +8,7 @@ import { parseReplay } from './replay/parse.js';
 import { candidateMatchedSets } from './match/match-set.js';
 import { extractObservations } from './ev/field-tracker.js';
 import { extractSpeedObservations } from './ev/speed-tracker.js';
-import { deriveEvs, deriveSpeed, selectSetsByDamage, type SideCandidates } from './ev/engine.js';
+import { deriveEvs, deriveSpeed, pickReferenceEvs, selectSetsByDamage, type SideCandidates } from './ev/engine.js';
 import { exportTeam } from './build/team-paste.js';
 import { illegalFilledMoves } from './build/pokemon-set.js';
 import { getUsageSets, getUsageSummary } from './data/usage-provider.js';
@@ -50,6 +50,10 @@ export async function scoutReplay(replay: Replay, opts: ScoutOptions = {}): Prom
   const observations = extractObservations(replay);
 
   // Build candidate pools per mon (dex sets + historical priors + usage stats).
+  // Cache each mon's own priors (trainer history + common usage, already
+  // fetched here) keyed by side+species, so Pass C below can consult "how does
+  // this trainer usually build this Pokemon" without a second, async lookup.
+  const priorsBySideSpecies = new Map<string, DexSet[]>();
   const sideCands: SideCandidates[] = [];
   for (const team of teams) {
     const candidates: MatchedSet[][] = [];
@@ -58,6 +62,7 @@ export async function scoutReplay(replay: Replay, opts: ScoutOptions = {}): Prom
       const priors = opts.getPriorSets
         ? await opts.getPriorSets(team.player, replay.formatid, mon.baseSpecies)
         : [];
+      priorsBySideSpecies.set(`${team.side}:${toID(mon.baseSpecies)}`, priors);
       const usage = useUsage ? await getUsageSets(gen, replay.formatid, mon.baseSpecies) : [];
       candidates.push(candidateMatchedSets(gen, mon, mergeSets(priors, dexSets, usage)));
     }
@@ -69,7 +74,9 @@ export async function scoutReplay(replay: Replay, opts: ScoutOptions = {}): Prom
   // then fine-tune the rest of the spread.
   const sideSets = selectSetsByDamage(replay.gen, sideCands, observations);
   deriveSpeed(replay.gen, sideSets, extractSpeedObservations(replay));
-  deriveEvs(replay.gen, sideSets, observations);
+  deriveEvs(replay.gen, sideSets, observations, {
+    referenceEvs: (side, baseSpecies) => pickReferenceEvs(priorsBySideSpecies.get(`${side}:${toID(baseSpecies)}`) ?? []),
+  });
 
   // Legality pass (flags dex-filled moves that aren't learnable; revealed moves
   // are trusted). Then export pastes.

@@ -6,7 +6,7 @@
 import * as calc from '@smogon/calc';
 import type { GenerationNum } from '@pkmn/data';
 type CalcGen = ReturnType<typeof calc.Generations.get>;
-import type { DamageObservation, FieldSnapshot, MatchedSet, SpeedObservation, StatsTable } from '../types.js';
+import type { DamageObservation, DexSet, FieldSnapshot, MatchedSet, SpeedObservation, StatsTable } from '../types.js';
 import { toID } from '../data/dex.js';
 import { itemWouldReveal } from '../match/match-set.js';
 
@@ -265,7 +265,38 @@ function donorNoteList(evs: Partial<StatsTable>, priorEvs: Partial<StatsTable>, 
  * Refine `sets` in place. `teams` supplies the side of each set so that the
  * same species on both teams is handled correctly.
  */
-export function deriveEvs(genNum: number, teams: SideSets[], observations: DamageObservation[]): void {
+/**
+ * Pick the best reference EV spread out of a trainer's-history-then-common-
+ * usage candidate list (the same shape `getPriorSets` already returns) for
+ * Pass C to fill leftover EVs from. Prefers whichever candidate actually
+ * invests in HP — the stat Pass C most often needs — falling back to any
+ * candidate with SOME investment at all.
+ */
+export function pickReferenceEvs(sets: DexSet[]): Partial<StatsTable> | undefined {
+  const withHp = sets.find((s) => (s.evs?.hp || 0) > 0);
+  if (withHp?.evs) return withHp.evs;
+  const withAny = sets.find((s) => s.evs && ALL_STATS.some((k) => (s.evs![k] || 0) > 0));
+  return withAny?.evs;
+}
+
+export interface DeriveEvsOptions {
+  /**
+   * Called when Pass C needs to fill leftover EVs and wants a smarter target
+   * than a blind HP max — return this trainer's (or the species' common)
+   * other build for `baseSpecies`, if one with real stat investment exists.
+   * Synchronous: the store-backed implementation (Datastore.getPriorSets) is
+   * plain sync, and threading a Promise through the search loop isn't worth
+   * it for a fallback path.
+   */
+  referenceEvs?: (side: 'p1' | 'p2', baseSpecies: string) => Partial<StatsTable> | undefined;
+}
+
+export function deriveEvs(
+  genNum: number,
+  teams: SideSets[],
+  observations: DamageObservation[],
+  opts: DeriveEvsOptions = {},
+): void {
   // Gens 1–2 (RBY/GSC) have no EVs in the modern sense — stat experience / DVs
   // are effectively maxed, so damage-based EV derivation is meaningless. Keep
   // the dex-set spread exactly as matched, without calculating.
@@ -306,6 +337,7 @@ export function deriveEvs(genNum: number, teams: SideSets[], observations: Damag
     const k = key(o.defenderSide, o.defenderSpecies);
     (defenseByDefender.get(k) ?? defenseByDefender.set(k, []).get(k)!).push(o);
   }
+  const hpEvidenced = new Set<string>(); // mons whose HP was actually weighed against damage taken
   for (const [k, obs] of defenseByDefender) {
     const ms = byKey.get(k);
     if (!ms) continue;
@@ -315,8 +347,59 @@ export function deriveEvs(genNum: number, teams: SideSets[], observations: Damag
         return (stat === 'def' && c === 'Physical') || (stat === 'spd' && c === 'Special');
       });
       if (catObs.length === 0) continue;
+      hpEvidenced.add(k);
       refineDefense(gen, ms, byKey, stat, catObs);
     }
+  }
+
+  // ---- Pass C: a lower-than-prior Atk/SpA/Def/SpD read frees EVs that a real
+  // spread wouldn't just leave unspent (donor trades that INCREASE a stat
+  // already re-balance to exactly 508 — see allocateDonors — so this only
+  // fires on a plain decrease). Prefer filling the gap the way this trainer
+  // (or common usage) actually builds this species elsewhere; fall back to a
+  // blind HP max — the one stat always safe to pad without contradicting an
+  // offense/speed fit — for whatever that reference doesn't cover.
+  for (const [k, ms] of byKey) {
+    if (ms.unrevealed || ms.evSource !== 'derived' || hpEvidenced.has(k)) continue;
+    const total = ALL_STATS.reduce((s, stat) => s + (ms.evs[stat] || 0), 0);
+    let remaining = EV_TOTAL - total;
+    if (remaining <= 0) continue;
+    const side = k.split(':')[0] as 'p1' | 'p2';
+    const reference = opts.referenceEvs?.(side, ms.baseSpecies);
+    const evs = { ...ms.evs };
+    const filled: string[] = [];
+    if (reference) {
+      // HP first (the primary gap this pass exists to close), then whatever
+      // else the reference invests in — never atk/spa, which stay pinned to
+      // this run's own offensive evidence regardless of what history shows.
+      for (const stat of ['hp', 'def', 'spd', 'spe'] as const) {
+        if (remaining <= 0) break;
+        const refVal = reference[stat] || 0;
+        const cur = evs[stat] || 0;
+        if (refVal <= cur) continue; // reference doesn't suggest more here
+        const add = Math.min(EV_MAX - cur, refVal - cur, Math.floor(remaining / EV_STEP) * EV_STEP);
+        if (add <= 0) continue;
+        evs[stat] = cur + add;
+        remaining -= add;
+        filled.push(`${add} ${STAT_LABEL[stat]}`);
+      }
+    }
+    if (remaining > 0) {
+      const priorHp = evs.hp || 0;
+      const add = Math.min(EV_MAX - priorHp, Math.floor(remaining / EV_STEP) * EV_STEP);
+      if (add > 0) {
+        evs.hp = priorHp + add;
+        remaining -= add;
+        filled.push(`${add} HP`);
+      }
+    }
+    if (filled.length === 0) continue;
+    ms.evs = evs;
+    ms.notes.push(
+      reference
+        ? `Filled ${filled.join(', ')} from this trainer's other ${ms.baseSpecies} builds (no direct evidence this replay) to reach a full ${EV_TOTAL}-EV spread.`
+        : `Filled ${filled.join(', ')} into HP (no direct evidence for this stat) to reach a full ${EV_TOTAL}-EV spread.`,
+    );
   }
 }
 
