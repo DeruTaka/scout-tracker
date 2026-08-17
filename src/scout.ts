@@ -7,7 +7,8 @@ import { getSetsForSpecies } from './data/sets-provider.js';
 import { parseReplay } from './replay/parse.js';
 import { candidateMatchedSets } from './match/match-set.js';
 import { extractObservations } from './ev/field-tracker.js';
-import { deriveEvs, selectSetsByDamage, type SideCandidates } from './ev/engine.js';
+import { extractSpeedObservations } from './ev/speed-tracker.js';
+import { deriveEvs, deriveSpeed, selectSetsByDamage, type SideCandidates } from './ev/engine.js';
 import { exportTeam } from './build/team-paste.js';
 import { illegalFilledMoves } from './build/pokemon-set.js';
 import { getUsageSets, getUsageSummary } from './data/usage-provider.js';
@@ -63,8 +64,11 @@ export async function scoutReplay(replay: Replay, opts: ScoutOptions = {}): Prom
     sideCands.push({ side: team.side, candidates });
   }
 
-  // Let observed damage pick the best-fitting set, then fine-tune EVs.
+  // Let observed damage pick the best-fitting set, derive Speed from turn order
+  // FIRST (its speedFloor gates how far the bulk trade below may sacrifice it),
+  // then fine-tune the rest of the spread.
   const sideSets = selectSetsByDamage(replay.gen, sideCands, observations);
+  deriveSpeed(replay.gen, sideSets, extractSpeedObservations(replay));
   deriveEvs(replay.gen, sideSets, observations);
 
   // Legality pass (flags dex-filled moves that aren't learnable; revealed moves

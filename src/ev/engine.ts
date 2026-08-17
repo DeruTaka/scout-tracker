@@ -6,7 +6,7 @@
 import * as calc from '@smogon/calc';
 import type { GenerationNum } from '@pkmn/data';
 type CalcGen = ReturnType<typeof calc.Generations.get>;
-import type { DamageObservation, FieldSnapshot, MatchedSet, StatsTable } from '../types.js';
+import type { DamageObservation, FieldSnapshot, MatchedSet, SpeedObservation, StatsTable } from '../types.js';
 import { toID } from '../data/dex.js';
 import { itemWouldReveal } from '../match/match-set.js';
 
@@ -260,6 +260,11 @@ export function deriveEvs(genNum: number, teams: SideSets[], observations: Damag
   }
 }
 
+interface ViolationResult {
+  v: number; // average violation (percent points) across the observations
+  n: number; // how many observations that average is built from
+}
+
 function totalViolationOffense(
   gen: CalcGen,
   ms: MatchedSet,
@@ -268,7 +273,7 @@ function totalViolationOffense(
   nature: string,
   obs: DamageObservation[],
   item?: string,
-): number {
+): ViolationResult {
   let v = 0;
   let n = 0;
   for (const o of obs) {
@@ -293,7 +298,19 @@ function totalViolationOffense(
     v += violation(o.observedPercent, range[0], range[1], o.koCapped, OVERPREDICT_WEIGHT);
     n++;
   }
-  return n ? v / n : 0; // average per-observation, so noisy hits don't compound
+  return { v: n ? v / n : 0, n }; // average per-observation, so noisy hits don't compound
+}
+
+/**
+ * Confidence discount on the regularizer: one hit with a small residual is
+ * cheap to dismiss as rounding noise, but the SAME average residual repeated
+ * across several independent hits (more turns this replay, or pooled from
+ * other replays of the same team) is much less likely to be noise and should
+ * move the spread more readily. Standard 1/sqrt(n) shrinkage — n=1 leaves the
+ * regularizer at full strength (today's behavior); n=4 halves it.
+ */
+function evidenceScale(n: number): number {
+  return 1 / Math.sqrt(Math.max(n, 1));
 }
 
 function refineOffense(
@@ -306,12 +323,13 @@ function refineOffense(
   const priorEv = ms.evs[stat] || 0;
   const priorNature = ms.nature;
   const priorItem = ms.item ?? '';
-  const priorV = totalViolationOffense(gen, ms, byKey, ms.evs, priorNature, obs, priorItem);
+  const { v: priorV, n: obsCount } = totalViolationOffense(gen, ms, byKey, ms.evs, priorNature, obs, priorItem);
   if (priorV <= KEEP_THRESHOLD) {
     ms.notes.push(`Observed ${stat.toUpperCase()} damage fits the dex spread (±${priorV.toFixed(1)}%).`);
     ms.confidence = Math.min(0.98, ms.confidence + 0.03);
     return;
   }
+  const scale = evidenceScale(obsCount);
   const otherSum = evSumExcluding(ms.evs, [stat]);
   const natures = [...new Set([priorNature, OFFENSE_NATURE[stat]])];
   // When the item wasn't revealed, let the search also try the damage items —
@@ -321,16 +339,17 @@ function refineOffense(
     : dedupeItems([priorItem, '', ...offenseItemCandidates(ms, stat)]);
   // Regularized objective: violation + deviation-from-prior cost. EVs / nature /
   // item only move when the damage evidence justifies it (prevents overfitting
-  // to HP% rounding).
+  // to HP% rounding) — but the more independent hits agree, the cheaper that
+  // move gets (see evidenceScale).
   let best = { ev: priorEv, nature: priorNature, item: priorItem, v: priorV, score: priorV };
   for (const item of items) {
-    const itemCost = sameItem(item, priorItem) ? 0 : ITEM_PENALTY;
+    const itemCost = (sameItem(item, priorItem) ? 0 : ITEM_PENALTY) * scale;
     for (const nature of natures) {
       for (let ev = 0; ev <= EV_MAX; ev += EV_STEP) {
         if (otherSum + ev > EV_TOTAL) break;
-        const v = totalViolationOffense(gen, ms, byKey, { ...ms.evs, [stat]: ev }, nature, obs, item);
-        const devCost = LAMBDA * (Math.abs(ev - priorEv) / EV_MAX);
-        const natCost = nature === priorNature ? 0 : NATURE_PENALTY;
+        const { v } = totalViolationOffense(gen, ms, byKey, { ...ms.evs, [stat]: ev }, nature, obs, item);
+        const devCost = LAMBDA * scale * (Math.abs(ev - priorEv) / EV_MAX);
+        const natCost = (nature === priorNature ? 0 : NATURE_PENALTY) * scale;
         const score = v + devCost + natCost + itemCost;
         if (score < best.score - 1e-6) best = { ev, nature, item, v, score };
       }
@@ -380,7 +399,8 @@ function totalViolationDefense(
   byKey: Map<string, MatchedSet>,
   evs: Partial<StatsTable>,
   obs: DamageObservation[],
-): number {
+  nature?: string,
+): ViolationResult {
   let v = 0;
   let n = 0;
   for (const o of obs) {
@@ -393,6 +413,7 @@ function totalViolationDefense(
     });
     const defender = buildPokemon(gen, ms, {
       evs,
+      nature,
       boosts: o.field.defenderBoosts,
       status: o.field.defenderStatus,
       tera: o.field.defenderTera,
@@ -403,8 +424,15 @@ function totalViolationDefense(
     v += violation(o.observedPercent, range[0], range[1], o.koCapped);
     n++;
   }
-  return n ? v / n : 0; // average per-observation
+  return { v: n ? v / n : 0, n }; // average per-observation
 }
+
+// Bulk natures to try per defensive stat — both polarities, since we can't
+// always be sure whether the mon leans physical or special offensively.
+const DEFENSE_NATURE_CANDIDATES: Record<'def' | 'spd', string[]> = {
+  def: ['Bold', 'Impish'],
+  spd: ['Calm', 'Careful'],
+};
 
 function refineDefense(
   gen: CalcGen,
@@ -415,24 +443,42 @@ function refineDefense(
 ): void {
   const priorHp = ms.evs.hp || 0;
   const priorDef = ms.evs[stat] || 0;
-  const priorV = totalViolationDefense(gen, ms, byKey, ms.evs, obs);
+  const priorSpe = ms.evs.spe || 0;
+  const priorNature = ms.nature;
+  const { v: priorV, n: obsCount } = totalViolationDefense(gen, ms, byKey, ms.evs, obs, priorNature);
   if (priorV <= KEEP_THRESHOLD) {
     ms.confidence = Math.min(0.98, ms.confidence + 0.03);
     return;
   }
-  const otherSum = evSumExcluding(ms.evs, ['hp', stat]);
+  const scale = evidenceScale(obsCount);
+  // Speed is excluded from the fixed baseline: a dex/usage prior often already
+  // spends the full 508 EVs on offense (e.g. 252/4/252), which would otherwise
+  // make added bulk mathematically impossible to reach regardless of evidence.
+  // Let the search sacrifice Speed to make room — the same trade a human scout
+  // would infer ("hit for less than a maxed build should, and nothing else
+  // grew, so something got sacrificed for bulk") — at its own regularized cost.
+  // Never below speedFloor: turn order already PROVED that much Speed is real.
+  const speedFloor = ms.speedFloor ?? 0;
+  const otherSum = evSumExcluding(ms.evs, ['hp', stat, 'spe']);
   const hpCandidates = [...new Set([priorHp, 0, 248, 252])].filter((h) => h <= EV_MAX);
-  let best = { hp: priorHp, ev: priorDef, v: priorV, score: priorV };
-  for (const hp of hpCandidates) {
-    for (let ev = 0; ev <= EV_MAX; ev += EV_STEP) {
-      if (otherSum + hp + ev > EV_TOTAL) break;
-      const v = totalViolationDefense(gen, ms, byKey, { ...ms.evs, hp, [stat]: ev }, obs);
-      const dev = (Math.abs(hp - priorHp) + Math.abs(ev - priorDef)) / EV_MAX;
-      const score = v + LAMBDA * dev;
-      if (score < best.score - 1e-6) best = { hp, ev, v, score };
+  const natures = [...new Set([priorNature, ...DEFENSE_NATURE_CANDIDATES[stat]])];
+  let best = { hp: priorHp, ev: priorDef, spe: priorSpe, nature: priorNature, v: priorV, score: priorV };
+  for (const nature of natures) {
+    const natCost = (nature === priorNature ? 0 : NATURE_PENALTY) * scale;
+    for (const hp of hpCandidates) {
+      for (let ev = 0; ev <= EV_MAX; ev += EV_STEP) {
+        if (otherSum + hp + ev > EV_TOTAL) break; // infeasible even sacrificing all Speed
+        const speBudget = EV_TOTAL - otherSum - hp - ev;
+        const spe = Math.max(speedFloor, Math.min(priorSpe, speBudget));
+        if (spe < speedFloor) continue; // can't fit without violating proven Speed
+        const { v } = totalViolationDefense(gen, ms, byKey, { ...ms.evs, hp, [stat]: ev, spe }, obs, nature);
+        const dev = (Math.abs(hp - priorHp) + Math.abs(ev - priorDef) + Math.abs(spe - priorSpe)) / EV_MAX;
+        const score = v + LAMBDA * scale * dev + natCost;
+        if (score < best.score - 1e-6) best = { hp, ev, spe, nature, v, score };
+      }
     }
   }
-  const changed = best.hp !== priorHp || best.ev !== priorDef;
+  const changed = best.hp !== priorHp || best.ev !== priorDef || best.spe !== priorSpe || best.nature !== priorNature;
   const improvement = priorV - best.v;
   if (!changed || improvement < KEEP_THRESHOLD) {
     if (priorV > RESIDUAL_ACCEPT) {
@@ -443,15 +489,176 @@ function refineDefense(
     }
     return;
   }
-  ms.evs = { ...ms.evs, hp: best.hp, [stat]: best.ev };
+  ms.evs = { ...ms.evs, hp: best.hp, [stat]: best.ev, spe: best.spe };
+  if (best.nature !== priorNature) ms.nature = best.nature;
+  if (best.spe !== priorSpe) {
+    ms.notes.push(`Traded ${priorSpe - best.spe} Speed EVs for bulk — the maxed offensive prior left no other room.`);
+  }
   ms.evSource = 'derived';
   ms.notes.push(
-    `Derived HP/${stat.toUpperCase()} = ${best.hp}/${best.ev} EVs from damage taken (dex spread was off by ${priorV.toFixed(1)}%, residual ${best.v.toFixed(1)}%).`,
+    `Derived HP/${stat.toUpperCase()} = ${best.hp}/${best.ev}${best.nature !== priorNature ? ` (${best.nature})` : ''} EVs from damage taken (dex spread was off by ${priorV.toFixed(1)}%, residual ${best.v.toFixed(1)}%).`,
   );
   ms.confidence = Math.max(
     0.3,
     Math.min(ms.confidence, best.v <= KEEP_THRESHOLD ? 0.7 : best.v <= RESIDUAL_ACCEPT ? 0.55 : 0.45),
   );
+}
+
+// ---------------------------------------------------------------------------
+// Speed derivation: the ONLY direct evidence a replay gives about a mon's
+// actual Speed is turn order. Unlike damage (which has HP%-rounding and RNG-
+// roll noise, so single deviations are treated cautiously), a same-priority
+// turn-order fact is deterministic — one clean contradiction is proof the
+// current spread is wrong, not something to average away.
+// ---------------------------------------------------------------------------
+
+// Stage multiplier for stat stages -6..+6, indexed by stage+6.
+const STAGE_MULT = [2 / 8, 2 / 7, 2 / 6, 2 / 5, 2 / 4, 2 / 3, 1, 1.5, 2, 2.5, 3, 3.5, 4];
+
+/** Effective (boosted, status-adjusted, item-adjusted) Speed for a comparison. */
+function effectiveSpeed(
+  gen: CalcGen,
+  ms: MatchedSet,
+  evs: Partial<StatsTable>,
+  nature: string,
+  item: string,
+  boostStage: number,
+  status: string | undefined,
+): number | null {
+  const p = buildPokemon(gen, ms, { evs, nature, item });
+  if (!p) return null;
+  const stage = Math.max(-6, Math.min(6, Math.round(boostStage)));
+  let spe = p.rawStats.spe * STAGE_MULT[stage + 6]!;
+  if (status === 'par') spe *= gen.num >= 7 ? 0.5 : 0.25;
+  if (toID(item).startsWith('choicescarf')) spe *= 1.5;
+  return Math.floor(spe);
+}
+
+/** How many of `obs` contradict this (spe, nature, item) for `ms`? */
+function speedViolations(
+  gen: CalcGen,
+  ms: MatchedSet,
+  byKey: Map<string, MatchedSet>,
+  selfKey: string,
+  obs: SpeedObservation[],
+  spe: number,
+  nature: string,
+  item: string,
+): { violations: number; checked: number } {
+  let violations = 0;
+  let checked = 0;
+  for (const o of obs) {
+    const selfIsFaster = key(o.fasterSide, o.fasterSpecies) === selfKey;
+    const oppKey = selfIsFaster ? key(o.slowerSide, o.slowerSpecies) : key(o.fasterSide, o.fasterSpecies);
+    const opp = byKey.get(oppKey);
+    if (!opp) continue;
+    const selfBoost = (selfIsFaster ? o.fasterBoosts.spe : o.slowerBoosts.spe) || 0;
+    const selfStatus = selfIsFaster ? o.fasterStatus : o.slowerStatus;
+    const oppBoost = (selfIsFaster ? o.slowerBoosts.spe : o.fasterBoosts.spe) || 0;
+    const oppStatus = selfIsFaster ? o.slowerStatus : o.fasterStatus;
+
+    const selfSpeed = effectiveSpeed(gen, ms, { ...ms.evs, spe }, nature, item, selfBoost, selfStatus);
+    const oppSpeed = effectiveSpeed(gen, opp, opp.evs, opp.nature, opp.item ?? '', oppBoost, oppStatus);
+    if (selfSpeed === null || oppSpeed === null) continue;
+    checked++;
+    if (selfIsFaster ? selfSpeed <= oppSpeed : selfSpeed >= oppSpeed) violations++;
+  }
+  return { violations, checked };
+}
+
+const SPEED_NATURE_CANDIDATES = ['Timid', 'Jolly'];
+
+function refineSpeed(gen: CalcGen, ms: MatchedSet, byKey: Map<string, MatchedSet>, selfKey: string, obs: SpeedObservation[]): void {
+  const priorSpe = ms.evs.spe || 0;
+  const priorNature = ms.nature;
+  const priorItem = ms.item ?? '';
+
+  const { violations: priorViol, checked } = speedViolations(gen, ms, byKey, selfKey, obs, priorSpe, priorNature, priorItem);
+  if (checked === 0) return; // no opponent data to verify against yet
+  if (priorViol === 0) {
+    ms.notes.push(`Speed confirmed by turn order (${checked} observation${checked > 1 ? 's' : ''}).`);
+    ms.confidence = Math.min(0.98, ms.confidence + 0.05);
+    // Still record the floor: the lowest Speed EVs consistent with the evidence,
+    // for the bulk-trade below to respect even when nothing needed correcting.
+    for (let spe = 0; spe <= priorSpe; spe += EV_STEP) {
+      if (speedViolations(gen, ms, byKey, selfKey, obs, spe, priorNature, priorItem).violations === 0) {
+        ms.speedFloor = spe;
+        break;
+      }
+    }
+    return;
+  }
+
+  const natures = [...new Set([priorNature, ...SPEED_NATURE_CANDIDATES])];
+  const items = ms.itemRevealed ? [priorItem] : dedupeItems([priorItem, '', 'Choice Scarf']);
+  const otherSum = evSumExcluding(ms.evs, ['spe']);
+  // Violations dominate the score (a contradiction is never acceptable); EV
+  // deviation and nature/item cost only break ties among equally-valid fits.
+  let best = { spe: priorSpe, nature: priorNature, item: priorItem, viol: priorViol, score: priorViol * 1000 };
+  for (const item of items) {
+    const itemCost = sameItem(item, priorItem) ? 0 : ITEM_PENALTY;
+    for (const nature of natures) {
+      const natCost = nature === priorNature ? 0 : NATURE_PENALTY;
+      for (let spe = 0; spe <= EV_MAX; spe += EV_STEP) {
+        if (otherSum + spe > EV_TOTAL) break;
+        const { violations } = speedViolations(gen, ms, byKey, selfKey, obs, spe, nature, item);
+        const dev = LAMBDA * (Math.abs(spe - priorSpe) / EV_MAX);
+        const score = violations * 1000 + dev + natCost + itemCost;
+        if (score < best.score - 1e-6) best = { spe, nature, item, viol: violations, score };
+      }
+    }
+  }
+
+  if (best.viol > 0) {
+    ms.notes.push(
+      `Speed doesn't fit any spread cleanly (${best.viol}/${checked} turn-order observation(s) unexplained) — keeping the dex spread; ` +
+        'possibly an unmodeled speed modifier (weather-boosted ability, Tailwind) or an inaccurate opponent Speed read.',
+    );
+    ms.confidence = Math.max(0.3, ms.confidence - 0.1);
+    return;
+  }
+
+  const itemChanged = !sameItem(best.item, priorItem);
+  ms.evs = { ...ms.evs, spe: best.spe };
+  if (best.nature !== priorNature) ms.nature = best.nature;
+  if (itemChanged) {
+    ms.item = best.item || undefined;
+    ms.itemRevealed = false; // still an inference, not a reveal
+    ms.notes.push(`Inferred ${best.item || 'no item'} — no plain Speed spread explains the observed turn order.`);
+  }
+  ms.evSource = 'derived';
+  ms.notes.push(
+    `Derived Speed = ${best.spe} EVs${best.nature !== priorNature ? ` (${best.nature})` : ''} from turn order (${checked} observation(s)).`,
+  );
+  ms.confidence = Math.max(0.3, Math.min(ms.confidence, 0.85));
+  // Record the floor at this (now-corrected) nature/item for the bulk trade below.
+  for (let spe = 0; spe <= best.spe; spe += EV_STEP) {
+    if (speedViolations(gen, ms, byKey, selfKey, obs, spe, best.nature, best.item).violations === 0) {
+      ms.speedFloor = spe;
+      break;
+    }
+  }
+}
+
+/** Derive each mon's Speed from observed turn order. Run before deriveEvs so
+ *  its speedFloor is available when the defense pass considers a bulk trade. */
+export function deriveSpeed(genNum: number, teams: SideSets[], observations: SpeedObservation[]): void {
+  if (genNum <= 2) return; // no calculable EVs for RBY/GSC
+  const gen = calc.Generations.get(genNum as GenerationNum);
+  const byKey = new Map<string, MatchedSet>();
+  for (const t of teams) for (const s of t.sets) byKey.set(key(t.side, s.baseSpecies), s);
+
+  for (const t of teams) {
+    for (const ms of t.sets) {
+      if (ms.unrevealed) continue;
+      const selfKey = key(t.side, ms.baseSpecies);
+      const relevant = observations.filter(
+        (o) => key(o.fasterSide, o.fasterSpecies) === selfKey || key(o.slowerSide, o.slowerSpecies) === selfKey,
+      );
+      if (relevant.length === 0) continue;
+      refineSpeed(gen, ms, byKey, selfKey, relevant);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

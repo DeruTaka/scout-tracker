@@ -7,7 +7,7 @@ import { deriveEvs, type SideSets } from '../src/ev/engine.js';
 import { matchSet } from '../src/match/match-set.js';
 import { getSetsForSpecies } from '../src/data/sets-provider.js';
 import { genFromFormatId, getGen } from '../src/data/dex.js';
-import type { MatchedSet, Replay } from '../src/types.js';
+import type { DamageObservation, MatchedSet, Replay } from '../src/types.js';
 
 function loadFixture(name: string): Replay {
   const path = fileURLToPath(new URL(`./fixtures/${name}.json`, import.meta.url));
@@ -79,5 +79,57 @@ describe('EV engine infers Choice Specs from damage (smogtours-gen9ubers-952059)
     expect(kyogre.item).toBe('Choice Specs');
     expect(kyogre.itemRevealed).toBe(false);
     expect(kyogre.evSource).toBe('derived');
+  });
+});
+
+describe('defense EV search trades Speed for bulk when the prior is already maxed', () => {
+  // Reproduces smogtours-gen9ubers-956423 turn 14: 252 Atk Tera Fire Koraidon
+  // Flame Charge predicts 55.3-65.2% against a 0 HP / 0 Def Zacian-Crowned (the
+  // prior, which already spends the full 508 EVs offensively) but only 52% was
+  // observed. That's below even the worst roll, so it can't be variance.
+  function zacian(): MatchedSet {
+    return {
+      species: 'Zacian-Crowned', baseSpecies: 'Zacian-Crowned', level: 100, shiny: false,
+      moves: ['Behemoth Blade'], revealedMoves: ['Behemoth Blade'],
+      item: 'Rusted Sword', itemRevealed: true, ability: 'Intrepid Sword',
+      nature: 'Jolly', evs: { atk: 252, spd: 4, spe: 252 },
+      confidence: 0.7, notes: [], evSource: 'dex-set', choicePossible: true,
+    };
+  }
+  function koraidon(): MatchedSet {
+    return {
+      species: 'Koraidon', baseSpecies: 'Koraidon', level: 100, shiny: false,
+      moves: ['Flame Charge'], revealedMoves: ['Flame Charge'],
+      item: undefined, itemRevealed: false, ability: 'Orichalcum Pulse',
+      nature: 'Jolly', evs: { atk: 252, def: 4, spe: 252 },
+      confidence: 0.6, notes: [], evSource: 'dex-set', choicePossible: true, tera: 'Fire',
+    };
+  }
+  function hit(): DamageObservation {
+    return {
+      turn: 14, attackerSide: 'p1', attackerSpecies: 'Koraidon', defenderSide: 'p2',
+      defenderSpecies: 'Zacian-Crowned', move: 'Flame Charge', observedPercent: 52,
+      koCapped: false, field: {
+        attackerBoosts: {}, defenderBoosts: {}, reflect: false, lightScreen: false,
+        auroraVeil: false, attackerHpPercent: 76, defenderHpPercent: 94, attackerTera: 'Fire',
+      }, crit: false, usable: true,
+    };
+  }
+
+  it('stays conservative on a single ambiguous hit (avoids overfitting one data point)', () => {
+    const zac = zacian();
+    const teams: SideSets[] = [{ side: 'p1', sets: [koraidon()] }, { side: 'p2', sets: [zac] }];
+    deriveEvs(9, teams, [hit()]);
+    expect(zac.evs).toEqual({ atk: 252, spd: 4, spe: 252 });
+  });
+
+  it('derives the Speed-for-bulk trade once 2+ consistent hits confirm it', () => {
+    const zac = zacian();
+    const teams: SideSets[] = [{ side: 'p1', sets: [koraidon()] }, { side: 'p2', sets: [zac] }];
+    deriveEvs(9, teams, [hit(), hit()]);
+    expect(zac.evs.def).toBeGreaterThan(0);
+    expect(zac.evs.spe).toBeLessThan(252); // paid for with Speed, not free EVs
+    expect((zac.evs.spe ?? 0) + (zac.evs.def ?? 0)).toBe(252); // Speed lost == Def gained, not free EVs from nowhere
+    expect(zac.notes.some((n) => n.includes('Traded') && n.includes('Speed'))).toBe(true);
   });
 });

@@ -89,6 +89,10 @@ export interface MatchedSet {
   /** False when the mon provably can't hold a Choice item (used 2+ moves in one
    *  stay-in). The item search never proposes a Choice item for these. */
   choicePossible?: boolean;
+  /** Minimum Speed EVs consistent with every observed turn-order fact for this
+   *  mon (undefined if no speed evidence exists). A hard floor: bulk/offense
+   *  passes may sacrifice Speed for other stats, but never below this. */
+  speedFloor?: number;
 }
 
 /** A damage observation extracted from the log, used by the EV engine. */
@@ -105,6 +109,27 @@ export interface DamageObservation {
   crit: boolean;
   usable: boolean; // false if crit / multi-hit / substitute / roll-ambiguous
   reason?: string; // why unusable
+}
+
+/**
+ * A same-priority-bracket turn where both sides acted, proving one mon's
+ * effective Speed exceeded the other's at that moment (order was NOT decided
+ * by priority, Quick Claw/Custap/Quick Draw, etc. — those turns are excluded
+ * at extraction time). The only direct Speed evidence a replay offers.
+ */
+export interface SpeedObservation {
+  turn: number;
+  fasterSide: 'p1' | 'p2';
+  fasterSpecies: string;
+  slowerSide: 'p1' | 'p2';
+  slowerSpecies: string;
+  fasterBoosts: Partial<StatsTable>;
+  slowerBoosts: Partial<StatsTable>;
+  fasterStatus?: string;
+  slowerStatus?: string;
+  fasterTera?: string;
+  slowerTera?: string;
+  trickRoom: boolean; // if true, order is REVERSED (slower-speed mon acted first)
 }
 
 /** Field / battle conditions captured at the moment of a hit. */
