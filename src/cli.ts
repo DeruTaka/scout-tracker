@@ -63,11 +63,12 @@ async function main() {
     }
     case 'user': {
       const user = positionals[0];
-      if (!user) return fail('Usage: scout user <name> [--max N]');
+      if (!user) return fail('Usage: scout user <name> [--max N] [--format gen9ubers]');
       const max = Number(flags.max) || 50;
-      console.log(`Fetching up to ${max} replays for "${user}"...`);
+      const format = flags.format;
+      console.log(`Fetching up to ${max} replays for "${user}"${format ? ` in ${format}` : ''}...`);
       const store = new Datastore(config.storePath);
-      const { found, results } = await scoutUserReplays(user, store, { max });
+      const { found, results } = await scoutUserReplays(user, store, { max, format });
       console.log(`Found ${found} replays.`);
       store.save();
       const added = results.filter((r) => !r.skipped && !r.error).length;

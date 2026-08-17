@@ -92,7 +92,8 @@ export function startServer(store: Datastore, config: Config, port: number): voi
       const user = String(req.body?.user || '').trim();
       if (!user) { res.status(400).json({ error: 'user is required' }); return; }
       const max = Math.max(1, Math.min(200, Number(req.body?.max) || 50));
-      const { found, results } = await scoutUserReplays(user, store, { max, force: !!req.body?.force });
+      const format = req.body?.format ? String(req.body.format).trim() : undefined;
+      const { found, results } = await scoutUserReplays(user, store, { max, force: !!req.body?.force, format });
       store.save();
       const output = await writeOutputs(store, config.xlsxPath);
       res.json({

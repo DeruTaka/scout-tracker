@@ -88,9 +88,9 @@ export interface ScoutUserResult {
 export async function scoutUserReplays(
   user: string,
   store: Datastore,
-  opts: { max?: number; force?: boolean } = {},
+  opts: { max?: number; force?: boolean; format?: string } = {},
 ): Promise<ScoutUserResult> {
-  const ids = await listUserReplays(user, opts.max ?? 50);
+  const ids = await listUserReplays(user, opts.max ?? 50, opts.format);
   const results = await ingestReplays(ids, store, { force: opts.force });
   return { user, found: ids.length, results };
 }

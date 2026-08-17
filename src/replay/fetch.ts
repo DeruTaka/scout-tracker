@@ -105,15 +105,20 @@ interface SearchEntry {
 
 /**
  * List a user's public replays (most recent first). The search endpoint is
- * paginated; we walk pages until exhausted or `max` is reached.
+ * paginated; we walk pages until exhausted or `max` is reached. `format`, when
+ * given, is a formatid (e.g. "gen9ubers") and is passed straight through to
+ * Showdown's own search filter, so only replays in that tier come back.
  */
-export async function listUserReplays(user: string, max = 50): Promise<string[]> {
+export async function listUserReplays(user: string, max = 50, format?: string): Promise<string[]> {
   const userid = user.toLowerCase().replace(/[^a-z0-9]+/g, '');
+  const formatParam = format ? `&format=${encodeURIComponent(format.toLowerCase().replace(/[^a-z0-9]+/g, ''))}` : '';
   const ids: string[] = [];
   for (let page = 1; ids.length < max && page <= 25; page++) {
     let entries: SearchEntry[];
     try {
-      entries = (await fetchJson(`${BASE}/search.json?user=${encodeURIComponent(userid)}&page=${page}`)) as SearchEntry[];
+      entries = (await fetchJson(
+        `${BASE}/search.json?user=${encodeURIComponent(userid)}${formatParam}&page=${page}`,
+      )) as SearchEntry[];
     } catch {
       break;
     }
