@@ -398,9 +398,16 @@ export function deriveEvs(
       }
     }
     // Blind fallback for whatever's still unaccounted for: HP first if it's
-    // not blocked, then whichever untested defense stat has room.
+    // not blocked, then whichever untested defense stat has room. Speed is a
+    // true last resort — it's excluded from the normal preference order (an
+    // unfounded speed claim is worse than an unfounded HP one), but when a
+    // mon took BOTH a physical and special hit that already fit the prior
+    // (blocking hp/def/spd) on top of a reduced Atk/SpA, nothing else is left
+    // and the spread would otherwise stay silently incomplete. More Speed
+    // never contradicts turn-order evidence — proven "faster than" facts are
+    // lower bounds, not exact pins — so padding it here is safe.
     const blindFilled: string[] = [];
-    for (const stat of ['hp', 'def', 'spd'] as const) {
+    for (const stat of ['hp', 'def', 'spd', 'spe'] as const) {
       if (remaining <= 0) break;
       if (blocked.has(stat)) continue;
       const cur = evs[stat] || 0;
@@ -411,10 +418,33 @@ export function deriveEvs(
       filled.push(`${add} ${STAT_LABEL[stat]}`);
       blindFilled.push(`${add} ${STAT_LABEL[stat]}`);
     }
+    // Emergency last resort: hp/def/spd/spe are all still blocked or capped
+    // (e.g. a mon that took both a physical AND special hit, each already
+    // fitting the prior — "confirmed", not searched — while a separate
+    // offense read pulled Atk/SpA down hard). A real spread is ALWAYS exactly
+    // 508 EVs; leaving it visibly incomplete is a worse failure than nudging
+    // a stat that was only ever passively confirmed (never actually
+    // fit-searched against alternatives), so relax the block here — but
+    // Atk/SpA remain untouchable even now, since inventing offense a mon
+    // never showed is worse than a slightly-off bulk number.
+    let emergency = false;
+    if (remaining > 0) {
+      for (const stat of ['hp', 'def', 'spd', 'spe'] as const) {
+        if (remaining <= 0) break;
+        const cur = evs[stat] || 0;
+        const add = Math.min(EV_MAX - cur, Math.floor(remaining / EV_STEP) * EV_STEP);
+        if (add <= 0) continue;
+        evs[stat] = cur + add;
+        remaining -= add;
+        filled.push(`${add} ${STAT_LABEL[stat]}`);
+        emergency = true;
+      }
+    }
     if (filled.length === 0) continue;
     ms.evs = evs;
     let reason: string;
-    if (fromReference && blindFilled.length === 0) reason = `matched to this trainer's other ${ms.baseSpecies} builds`;
+    if (emergency) reason = "budget didn't add up from evidence alone — nudged a passively-confirmed stat rather than leave the spread incomplete";
+    else if (fromReference && blindFilled.length === 0) reason = `matched to this trainer's other ${ms.baseSpecies} builds`;
     else if (fromReference) reason = `matched to this trainer's other ${ms.baseSpecies} builds where possible, no direct evidence for the rest`;
     else reason = 'no direct evidence for this stat';
     ms.notes.push(`Filled ${filled.join(', ')} (${reason}) to reach a full ${EV_TOTAL}-EV spread.`);

@@ -30,6 +30,10 @@ interface Pending {
   move: string;
   crit: boolean;
   hits: number;
+  /** Focus Sash / Sturdy / Endure clipped this hit to 1 HP — the observed %
+   *  reflects the SAVE, not the real damage (which could be far higher), so
+   *  it's not just imprecise like a KO-cap, it's genuinely uninformative. */
+  survivedAtOne: boolean;
 }
 
 function slotKey(token: string): string | null {
@@ -219,7 +223,7 @@ export function extractObservations(replay: Replay): DamageObservation[] {
         const targetSlot = slotKey(f[3] || '');
         finishPending();
         if (atkSlot && targetSlot && slots[atkSlot] && slots[targetSlot] && atkSlot !== targetSlot) {
-          pending = { atkSlot, targetSlot, move, crit: false, hits: 0 };
+          pending = { atkSlot, targetSlot, move, crit: false, hits: 0, survivedAtOne: false };
         }
         break;
       }
@@ -230,6 +234,19 @@ export function extractObservations(replay: Replay): DamageObservation[] {
       }
       case '-hitcount': {
         if (pending) pending.hits = Number(f[2]) || 2;
+        break;
+      }
+      case '-enditem': {
+        const slot = slotKey(f[1] || '');
+        if (pending && slot === pending.targetSlot && /focus sash/i.test(f[2] || '')) pending.survivedAtOne = true;
+        break;
+      }
+      case '-activate': {
+        const slot = slotKey(f[1] || '');
+        const eff = f[2] || '';
+        if (pending && slot === pending.targetSlot && (/ability:\s*sturdy/i.test(eff) || /move:\s*endure/i.test(eff))) {
+          pending.survivedAtOne = true;
+        }
         break;
       }
       case '-miss':
@@ -266,7 +283,12 @@ export function extractObservations(replay: Replay): DamageObservation[] {
           const dealt = Math.max(0, before - newHp);
           const moveId = toID(p.move);
           const usable =
-            p.hits === 1 && !p.crit && !slots[slot].subActive && !NON_EV_MOVES.has(moveId) && dealt > 0;
+            p.hits === 1 &&
+            !p.crit &&
+            !slots[slot].subActive &&
+            !NON_EV_MOVES.has(moveId) &&
+            dealt > 0 &&
+            !p.survivedAtOne;
           const a = slots[p.atkSlot]!;
           obs.push({
             turn,
@@ -289,7 +311,9 @@ export function extractObservations(replay: Replay): DamageObservation[] {
                     ? 'substitute'
                     : NON_EV_MOVES.has(moveId)
                       ? 'fixed/redirected damage'
-                      : 'zero damage'
+                      : p.survivedAtOne
+                        ? 'focus sash / sturdy / endure (clipped to 1 HP, true damage unknown)'
+                        : 'zero damage'
               : undefined,
           });
           slots[slot].hp = newHp;

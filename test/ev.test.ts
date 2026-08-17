@@ -364,3 +364,91 @@ describe('leftover-EV fill prefers a trainer-history reference over a blind HP m
     expect(zac.evs.hp).toBeGreaterThan(20);
   });
 });
+
+describe('leftover-EV fill has an emergency last resort when every other stat is blocked', () => {
+  // A mon that takes BOTH a physical and special hit which each already fit
+  // the maxed-offense prior (no correction needed — but both still count as
+  // "weighed against damage taken", blocking hp/def/spd from Pass C) while a
+  // separate weak offense hit pulls its own Atk down hard. Every normal
+  // fallback stat (atk/spa always, hp/def/spd via defense evidence) ends up
+  // blocked, and Speed is already maxed — nothing is left to absorb the
+  // freed budget without the emergency tier.
+  function zacian(): MatchedSet {
+    return {
+      species: 'Zacian-Crowned', baseSpecies: 'Zacian-Crowned', level: 100, shiny: false,
+      moves: ['Behemoth Blade'], revealedMoves: ['Behemoth Blade'],
+      item: 'Rusted Sword', itemRevealed: true, ability: 'Intrepid Sword',
+      nature: 'Jolly', evs: { atk: 252, spd: 4, spe: 252 },
+      confidence: 0.7, notes: [], evSource: 'dex-set', choicePossible: true,
+    };
+  }
+  function arceus(): MatchedSet {
+    return {
+      species: 'Arceus', baseSpecies: 'Arceus', level: 100, shiny: false,
+      moves: ['Extreme Speed'], revealedMoves: ['Extreme Speed'],
+      item: 'Silk Scarf', itemRevealed: true, ability: 'Multitype',
+      nature: 'Adamant', evs: { atk: 252 },
+      confidence: 0.6, notes: [], evSource: 'dex-set', choicePossible: true,
+    };
+  }
+  function kyogre(): MatchedSet {
+    return {
+      species: 'Kyogre', baseSpecies: 'Kyogre', level: 100, shiny: false,
+      moves: ['Origin Pulse'], revealedMoves: ['Origin Pulse'],
+      item: undefined, itemRevealed: false, ability: 'Drizzle',
+      nature: 'Modest', evs: { spa: 252 },
+      confidence: 0.6, notes: [], evSource: 'dex-set', choicePossible: true,
+    };
+  }
+  function glimmoraFodder(): MatchedSet {
+    return {
+      species: 'Glimmora', baseSpecies: 'Glimmora', level: 100, shiny: false,
+      moves: ['Power Gem'], revealedMoves: ['Power Gem'],
+      item: 'Focus Sash', itemRevealed: true, ability: 'Toxic Debris',
+      nature: 'Timid', evs: { spa: 4 },
+      confidence: 0.6, notes: [], evSource: 'dex-set', choicePossible: true,
+    };
+  }
+  const fieldBase = {
+    attackerBoosts: {}, defenderBoosts: {}, reflect: false, lightScreen: false,
+    auroraVeil: false, attackerHpPercent: 100, defenderHpPercent: 100,
+  };
+  // Percentages a maxed-Atk Arceus/Kyogre deal to the dex-default 0 HP/4 SpD
+  // Zacian prior — pre-computed via @smogon/calc so both defense categories
+  // "confirm, don't correct" (priorV under KEEP_THRESHOLD).
+  function physHit(): DamageObservation {
+    return {
+      turn: 3, attackerSide: 'p1', attackerSpecies: 'Arceus', defenderSide: 'p2',
+      defenderSpecies: 'Zacian-Crowned', move: 'Extreme Speed', observedPercent: 24.134615384615383,
+      koCapped: false, field: fieldBase, crit: false, usable: true,
+    };
+  }
+  function specHit(): DamageObservation {
+    return {
+      turn: 5, attackerSide: 'p1', attackerSpecies: 'Kyogre', defenderSide: 'p2',
+      defenderSpecies: 'Zacian-Crowned', move: 'Origin Pulse', observedPercent: 65.01923076923077,
+      koCapped: false, field: fieldBase, crit: false, usable: true,
+    };
+  }
+  function weakOffenseHit(): DamageObservation {
+    return {
+      turn: 7, attackerSide: 'p2', attackerSpecies: 'Zacian-Crowned', defenderSide: 'p1',
+      defenderSpecies: 'Glimmora', move: 'Behemoth Blade', observedPercent: 20,
+      koCapped: false, field: fieldBase, crit: false, usable: true,
+    };
+  }
+
+  it('fills the leftover budget by nudging a passively-confirmed stat rather than leaving the spread incomplete', () => {
+    const zac = zacian();
+    const teams: SideSets[] = [
+      { side: 'p1', sets: [arceus(), kyogre(), glimmoraFodder()] },
+      { side: 'p2', sets: [zac] },
+    ];
+    deriveEvs(9, teams, [physHit(), physHit(), specHit(), specHit(), weakOffenseHit(), weakOffenseHit()]);
+    expect(zac.evSource).toBe('derived');
+    expect(zac.evs.atk).toBeLessThan(252); // offense evidence genuinely pulled Atk down
+    const total = (['hp', 'atk', 'def', 'spa', 'spd', 'spe'] as const).reduce((s, k) => s + (zac.evs[k] ?? 0), 0);
+    expect(total).toBe(508);
+    expect(zac.notes.some((n) => n.includes('Filled') && n.includes("didn't add up"))).toBe(true);
+  });
+});
