@@ -337,7 +337,11 @@ export function deriveEvs(
     const k = key(o.defenderSide, o.defenderSpecies);
     (defenseByDefender.get(k) ?? defenseByDefender.set(k, []).get(k)!).push(o);
   }
-  const hpEvidenced = new Set<string>(); // mons whose HP was actually weighed against damage taken
+  // Which defense category (def/spd) actually got weighed against damage
+  // taken, per mon — HP is jointly optimized by EITHER, but Def/SpD are only
+  // pinned individually (a mon that only ever took physical hits never had
+  // its SpD evidence-checked at all, and stays free for Pass C to fill).
+  const defenseTested = new Map<string, Set<'def' | 'spd'>>();
   for (const [k, obs] of defenseByDefender) {
     const ms = byKey.get(k);
     if (!ms) continue;
@@ -347,7 +351,7 @@ export function deriveEvs(
         return (stat === 'def' && c === 'Physical') || (stat === 'spd' && c === 'Special');
       });
       if (catObs.length === 0) continue;
-      hpEvidenced.add(k);
+      (defenseTested.get(k) ?? defenseTested.set(k, new Set()).get(k)!).add(stat);
       refineDefense(gen, ms, byKey, stat, catObs);
     }
   }
@@ -357,23 +361,31 @@ export function deriveEvs(
   // already re-balance to exactly 508 — see allocateDonors — so this only
   // fires on a plain decrease). Prefer filling the gap the way this trainer
   // (or common usage) actually builds this species elsewhere; fall back to a
-  // blind HP max — the one stat always safe to pad without contradicting an
-  // offense/speed fit — for whatever that reference doesn't cover.
+  // blind HP max — the safest stat to pad without contradicting a fit — for
+  // whatever a reference doesn't cover. Never touches Atk/SpA (pinned to this
+  // run's own offensive evidence) or a stat that WAS weighed against damage
+  // taken this run, even if the search chose to leave it unchanged.
   for (const [k, ms] of byKey) {
-    if (ms.unrevealed || ms.evSource !== 'derived' || hpEvidenced.has(k)) continue;
+    if (ms.unrevealed || ms.evSource !== 'derived') continue;
     const total = ALL_STATS.reduce((s, stat) => s + (ms.evs[stat] || 0), 0);
     let remaining = EV_TOTAL - total;
     if (remaining <= 0) continue;
+    const tested = defenseTested.get(k);
+    const blocked = new Set<keyof StatsTable>(['atk', 'spa']);
+    if (tested?.size) blocked.add('hp'); // hp is jointly optimized by either defense category
+    if (tested?.has('def')) blocked.add('def');
+    if (tested?.has('spd')) blocked.add('spd');
     const side = k.split(':')[0] as 'p1' | 'p2';
     const reference = opts.referenceEvs?.(side, ms.baseSpecies);
     const evs = { ...ms.evs };
     const filled: string[] = [];
+    let fromReference = false;
     if (reference) {
       // HP first (the primary gap this pass exists to close), then whatever
-      // else the reference invests in — never atk/spa, which stay pinned to
-      // this run's own offensive evidence regardless of what history shows.
+      // else the reference invests in.
       for (const stat of ['hp', 'def', 'spd', 'spe'] as const) {
         if (remaining <= 0) break;
+        if (blocked.has(stat)) continue;
         const refVal = reference[stat] || 0;
         const cur = evs[stat] || 0;
         if (refVal <= cur) continue; // reference doesn't suggest more here
@@ -382,24 +394,30 @@ export function deriveEvs(
         evs[stat] = cur + add;
         remaining -= add;
         filled.push(`${add} ${STAT_LABEL[stat]}`);
+        fromReference = true;
       }
     }
-    if (remaining > 0) {
-      const priorHp = evs.hp || 0;
-      const add = Math.min(EV_MAX - priorHp, Math.floor(remaining / EV_STEP) * EV_STEP);
-      if (add > 0) {
-        evs.hp = priorHp + add;
-        remaining -= add;
-        filled.push(`${add} HP`);
-      }
+    // Blind fallback for whatever's still unaccounted for: HP first if it's
+    // not blocked, then whichever untested defense stat has room.
+    const blindFilled: string[] = [];
+    for (const stat of ['hp', 'def', 'spd'] as const) {
+      if (remaining <= 0) break;
+      if (blocked.has(stat)) continue;
+      const cur = evs[stat] || 0;
+      const add = Math.min(EV_MAX - cur, Math.floor(remaining / EV_STEP) * EV_STEP);
+      if (add <= 0) continue;
+      evs[stat] = cur + add;
+      remaining -= add;
+      filled.push(`${add} ${STAT_LABEL[stat]}`);
+      blindFilled.push(`${add} ${STAT_LABEL[stat]}`);
     }
     if (filled.length === 0) continue;
     ms.evs = evs;
-    ms.notes.push(
-      reference
-        ? `Filled ${filled.join(', ')} from this trainer's other ${ms.baseSpecies} builds (no direct evidence this replay) to reach a full ${EV_TOTAL}-EV spread.`
-        : `Filled ${filled.join(', ')} into HP (no direct evidence for this stat) to reach a full ${EV_TOTAL}-EV spread.`,
-    );
+    let reason: string;
+    if (fromReference && blindFilled.length === 0) reason = `matched to this trainer's other ${ms.baseSpecies} builds`;
+    else if (fromReference) reason = `matched to this trainer's other ${ms.baseSpecies} builds where possible, no direct evidence for the rest`;
+    else reason = 'no direct evidence for this stat';
+    ms.notes.push(`Filled ${filled.join(', ')} (${reason}) to reach a full ${EV_TOTAL}-EV spread.`);
   }
 }
 
@@ -607,21 +625,47 @@ function refineDefense(
   // that much Speed is real.
   const donors = donorOrder(priorEvs, ['hp', stat]);
   const floors: Partial<Record<keyof StatsTable, number>> = { spe: ms.speedFloor ?? 0 };
-  const hpCandidates = [...new Set([priorEvs.hp || 0, 0, 248, 252])].filter((h) => h <= EV_MAX);
   const natures = [...new Set([priorNature, ...DEFENSE_NATURE_CANDIDATES[stat]])];
   let best = { evs: priorEvs, nature: priorNature, v: priorV, score: priorV };
-  for (const nature of natures) {
-    const natCost = (nature === priorNature ? 0 : NATURE_PENALTY) * scale;
-    for (const hp of hpCandidates) {
-      for (let ev = 0; ev <= EV_MAX; ev += EV_STEP) {
-        const evs = allocateDonors(priorEvs, { hp, [stat]: ev }, donors, floors);
-        if (!evs) continue; // infeasible even after draining every donor
-        const { v } = totalViolationDefense(gen, ms, byKey, evs, obs, nature);
-        const dev = totalDeviation(evs, priorEvs);
-        const score = v + LAMBDA * scale * dev + natCost;
-        if (score < best.score - 1e-6) best = { evs, nature, v, score };
+  const searchHp = (hpCandidates: number[]) => {
+    for (const nature of natures) {
+      const natCost = (nature === priorNature ? 0 : NATURE_PENALTY) * scale;
+      for (const hp of hpCandidates) {
+        for (let ev = 0; ev <= EV_MAX; ev += EV_STEP) {
+          const evs = allocateDonors(priorEvs, { hp, [stat]: ev }, donors, floors);
+          if (!evs) continue; // infeasible even after draining every donor
+          const { v } = totalViolationDefense(gen, ms, byKey, evs, obs, nature);
+          const dev = totalDeviation(evs, priorEvs);
+          const score = v + LAMBDA * scale * dev + natCost;
+          if (score < best.score - 1e-6) best = { evs, nature, v, score };
+        }
       }
     }
+  };
+  // A single damage% observation constrains {hp, stat} to a whole curve, not a
+  // point — one hit can never tell "extra HP" from "extra Def" apart, so
+  // searching a fine HP grid on thin evidence just means the regularizer picks
+  // an arbitrary point on that curve instead of admitting the ambiguity. Stay
+  // on the old conservative 4-point shortlist ({prior, 0, 248, 252}) until
+  // there's enough independent evidence (MIN_OBS_FOR_WIDE_HP+) to trust a
+  // specific point — then widen coarse-then-fine so mid-range bulk (e.g. 208
+  // HP) that shortlist could never reach becomes reachable. Full resolution
+  // everywhere would be ~16x the search cost for no benefit outside the
+  // eventual answer's neighborhood.
+  const MIN_OBS_FOR_WIDE_HP = 3;
+  if (obsCount >= MIN_OBS_FOR_WIDE_HP) {
+    const HP_COARSE_STEP = 24;
+    const coarseHp = new Set<number>([priorEvs.hp || 0, 0, EV_MAX]);
+    for (let h = 0; h <= EV_MAX; h += HP_COARSE_STEP) coarseHp.add(h);
+    searchHp([...coarseHp]);
+    const center = best.evs.hp || 0;
+    const fineHp = new Set<number>();
+    for (let h = Math.max(0, center - HP_COARSE_STEP); h <= Math.min(EV_MAX, center + HP_COARSE_STEP); h += EV_STEP) {
+      fineHp.add(h);
+    }
+    searchHp([...fineHp]);
+  } else {
+    searchHp([...new Set([priorEvs.hp || 0, 0, 248, 252])].filter((h) => h <= EV_MAX));
   }
   const changed = totalDeviation(best.evs, priorEvs) > 1e-9 || best.nature !== priorNature;
   const improvement = priorV - best.v;

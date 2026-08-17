@@ -60,6 +60,10 @@ export interface DexSet {
   evs?: Partial<StatsTable>;
   ivs?: Partial<StatsTable>;
   level?: number;
+  /** True for a manually-pinned, human-verified build (see `scout pin`) — the
+   *  moveset/Tera guessing thresholds that guard probabilistic dex/usage/
+   *  history candidates don't apply, since this isn't a guess. */
+  verified?: boolean;
 }
 
 /** The tool's best guess of a full set for one Pokemon. */

@@ -135,6 +135,22 @@ describe('move-filling is gated on 3+ revealed moves matching a dex set', () => 
     const ms = matchSet(gen, mon({ moves: ['Ice Beam'], tera: 'Ghost' }), [bigSet]);
     expect(ms.tera).toBe('Ghost');
   });
+
+  it('a verified (pinned) set skips the 3-revealed-move threshold entirely', () => {
+    const verifiedSet: DexSet = { ...bigSet, verified: true };
+    // Only 1 revealed move — would normally stay unfilled — but this candidate
+    // is a human-verified pin, not a probabilistic guess.
+    const ms = matchSet(gen, mon({ moves: ['Ice Beam'] }), [verifiedSet]);
+    expect(ms.moves.length).toBe(4);
+    expect(ms.tera).toBe('Water');
+  });
+
+  it('a verified set still refuses to complete when a revealed move contradicts it', () => {
+    const verifiedSet: DexSet = { ...bigSet, verified: true };
+    const ms = matchSet(gen, mon({ moves: ['Surf'] }), [verifiedSet]); // Surf isn't in this set's pool
+    expect(ms.moves).toEqual(['Surf']);
+    expect(ms.tera).toBeUndefined();
+  });
 });
 
 describe('Heavy-Duty Boots is never guessed for a mon observed taking hazard damage', () => {

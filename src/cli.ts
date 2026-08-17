@@ -4,13 +4,30 @@
 //   scout user <name> [--max N]   scout all of a user's public replays
 //   scout paste <url|id>          print both team pastes (no storing)
 //   scout sheet                   rebuild xlsx / Google Sheet from the store
+//   scout pin <player> <formatid> pin a verified build (paste via --file/stdin)
+//   scout unpin <player> <formatid> <species>   remove a pin
+//   scout pins [player]           list pinned builds
 //   scout serve [--port N]        start the local web UI
+import { readFileSync } from 'node:fs';
 import { getConfig } from './config.js';
 import { Datastore } from './store/datastore.js';
 import { ingestReplays, previewReplay, writeOutputs, scoutUserReplays } from './ingest.js';
 import { startServer } from './web/server.js';
 import { authorizeGoogleOAuth } from './sheet/google-sheets.js';
+import { parsePasteToMatchedSet } from './build/import-set.js';
+import { exportSet } from './build/pokemon-set.js';
+import { getGen, genFromFormatId } from './data/dex.js';
 import type { ScoutedReplay } from './types.js';
+
+function readStdin(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (chunk) => (data += chunk));
+    process.stdin.on('end', () => resolve(data));
+    process.stdin.on('error', reject);
+  });
+}
 
 function parseFlags(args: string[]): { positionals: string[]; flags: Record<string, string> } {
   const positionals: string[] = [];
@@ -90,6 +107,51 @@ async function main() {
       await emitOutputs(store, config.xlsxPath);
       break;
     }
+    case 'pin': {
+      const player = positionals[0];
+      const formatid = positionals[1];
+      if (!player || !formatid) {
+        return fail('Usage: scout pin <player> <formatid> [--file <path>] [--note "..."]  (paste text via --file or piped stdin)');
+      }
+      const pasteText = flags.file ? readFileSync(flags.file, 'utf8') : await readStdin();
+      if (!pasteText.trim()) return fail('No paste text provided (use --file <path> or pipe paste text via stdin).');
+      try {
+        const gen = getGen(genFromFormatId(formatid));
+        const set = parsePasteToMatchedSet(gen, pasteText);
+        const store = new Datastore(config.storePath);
+        store.addPin(player, formatid, set, flags.note);
+        store.save();
+        console.log(`✓ Pinned ${set.species} for ${player} in ${formatid}:\n`);
+        console.log(exportSet(set));
+      } catch (e) {
+        return fail(e instanceof Error ? e.message : String(e));
+      }
+      break;
+    }
+    case 'unpin': {
+      const player = positionals[0];
+      const formatid = positionals[1];
+      const species = positionals[2];
+      if (!player || !formatid || !species) return fail('Usage: scout unpin <player> <formatid> <species>');
+      const store = new Datastore(config.storePath);
+      const removed = store.removePin(player, formatid, species);
+      store.save();
+      console.log(removed ? `✓ Removed pin for ${species} (${player}, ${formatid}).` : 'No matching pin found.');
+      break;
+    }
+    case 'pins': {
+      const store = new Datastore(config.storePath);
+      const pins = store.listPins(positionals[0]);
+      if (pins.length === 0) {
+        console.log(positionals[0] ? `No pins for ${positionals[0]}.` : 'No pins stored.');
+        break;
+      }
+      for (const p of pins) {
+        console.log(`\n${p.player} | ${p.formatid} | pinned ${new Date(p.pinnedAt).toISOString().slice(0, 10)}${p.note ? ` | ${p.note}` : ''}`);
+        console.log(exportSet(p.set));
+      }
+      break;
+    }
     case 'auth': {
       if (positionals[0] !== 'google') return fail('Usage: scout auth google');
       try {
@@ -117,6 +179,9 @@ async function main() {
           '  scout user <name> [--max N]   scout a user\'s replays\n' +
           '  scout paste <url|id>          print team pastes (no store)\n' +
           '  scout sheet                   rebuild xlsx / Google Sheet\n' +
+          '  scout pin <player> <fmt>      pin a verified build (paste via --file or stdin)\n' +
+          '  scout unpin <player> <fmt> <species>   remove a pin\n' +
+          '  scout pins [player]           list pinned builds\n' +
           '  scout auth google             authorize Google Sheets (OAuth, no key file)\n' +
           '  scout serve [--port N]        start the web UI',
       );

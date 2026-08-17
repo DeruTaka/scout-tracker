@@ -133,9 +133,13 @@ export function buildMatched(gen: Generation, mon: RevealedMon, best: DexSet | u
   const notes: string[] = [];
   // Only complete the moveset from a dex set when we have 3+ revealed moves that
   // actually line up with that set — otherwise dex-filling invents nonsensical
-  // move combinations. EVs / item / ability are still inferred either way.
+  // move combinations. EVs / item / ability are still inferred either way. A
+  // manually-pinned, human-verified set (see `scout pin`) isn't a probabilistic
+  // guess, so it skips the reveal-count threshold — but still must actually
+  // line up with what WAS revealed, or a genuine contradiction gets flagged
+  // rather than silently trusted.
   const revealedDistinct = new Set(mon.moves.map(toID)).size;
-  const fillMoves = revealedDistinct >= 3 && revealedLinesUp(mon, best);
+  const fillMoves = (best?.verified || revealedDistinct >= 3) && revealedLinesUp(mon, best);
   const moves = fillMoves ? buildMoves(mon, best) : dedupeRevealed(mon.moves);
   if (!fillMoves && best) {
     notes.push('Moves shown are only those revealed in game (need 3+ revealed moves matching a dex set to complete the moveset).');

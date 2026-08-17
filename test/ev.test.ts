@@ -272,7 +272,7 @@ describe('a derived-down offense stat frees EVs into HP instead of leaving them 
     expect(zac.notes.some((n) => n.includes('Filled') && n.includes('HP'))).toBe(true);
   });
 
-  it('does NOT auto-fill HP for a mon whose HP/Def was already weighed against damage taken', () => {
+  it('does NOT re-touch HP/Def once evidenced, but DOES fill the untested SpD (only physical hits observed)', () => {
     const zac = zacian();
     const kora: MatchedSet = {
       species: 'Koraidon', baseSpecies: 'Koraidon', level: 100, shiny: false,
@@ -291,7 +291,16 @@ describe('a derived-down offense stat frees EVs into HP instead of leaving them 
     });
     const teams: SideSets[] = [{ side: 'p1', sets: [zac] }, { side: 'p2', sets: [kora] }];
     deriveEvs(9, teams, [hitOnKoraidon(), hitOnKoraidon()]);
-    expect(kora.notes.some((n) => n.includes('Filled'))).toBe(false);
+    // HP/Def came straight out of the defense-evidence search (0/36 for this
+    // exact scenario) — Pass C must not perturb them, even though it's free
+    // to top up the untested SpD.
+    expect(kora.notes.some((n) => n.includes('Derived HP/DEF'))).toBe(true);
+    const total = (['hp', 'atk', 'def', 'spa', 'spd', 'spe'] as const).reduce((s, k) => s + (kora.evs[k] ?? 0), 0);
+    expect(total).toBe(508);
+    expect(kora.evs.hp).toBe(0);
+    expect(kora.evs.def).toBe(36);
+    expect(kora.evs.spd).toBeGreaterThan(0);
+    expect(kora.notes.some((n) => n.includes('Filled') && n.includes('SpD'))).toBe(true);
   });
 });
 

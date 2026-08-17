@@ -38,10 +38,28 @@ export interface UniqueSet {
   lastSeen: number;
 }
 
+/**
+ * A manually-verified build for a (player, formatid, species) — e.g. a spread
+ * confirmed outside what any single replay's damage evidence can pin down.
+ * Lives separately from `uniqueSets` (which `rebuildUniqueSets` fully replaces
+ * from replay data on every rebuild) so a pin survives that and persists until
+ * explicitly removed. Consulted by `getPriorSets` ahead of scouted history.
+ */
+export interface PinnedSet {
+  player: string;
+  playerId: string;
+  formatid: string;
+  baseSpecies: string;
+  set: MatchedSet;
+  note?: string;
+  pinnedAt: number;
+}
+
 interface StoreShape {
   version: 1;
   replays: Record<string, StoredReplay>;
   uniqueSets: UniqueSet[];
+  pins: PinnedSet[];
 }
 
 export interface PlayerSpeciesUsage {
@@ -84,7 +102,7 @@ export function setHash(formatid: string, ms: MatchedSet): string {
   ].join('|');
 }
 
-function matchedToDexSet(ms: MatchedSet, role: string): DexSet {
+function matchedToDexSet(ms: MatchedSet, role: string, verified = false): DexSet {
   return {
     role,
     moves: ms.moves.map((m) => m), // fixed slots
@@ -96,6 +114,7 @@ function matchedToDexSet(ms: MatchedSet, role: string): DexSet {
     evs: ms.evs,
     ivs: ms.ivs,
     level: ms.level,
+    verified,
   };
 }
 
@@ -104,9 +123,10 @@ export class Datastore {
   constructor(private path: string) {
     this.data = existsSync(path)
       ? (JSON.parse(readFileSync(path, 'utf8')) as StoreShape)
-      : { version: 1, replays: {}, uniqueSets: [] };
+      : { version: 1, replays: {}, uniqueSets: [], pins: [] };
     if (!this.data.uniqueSets) this.data.uniqueSets = [];
     if (!this.data.replays) this.data.replays = {};
+    if (!this.data.pins) this.data.pins = [];
   }
 
   hasReplay(id: string): boolean {
@@ -121,14 +141,55 @@ export class Datastore {
     return this.data.uniqueSets;
   }
 
+  get pins(): PinnedSet[] {
+    return this.data.pins;
+  }
+
+  /** Pin a manually-verified build, replacing any existing pin for the same
+   *  (player, formatid, baseSpecies). Does not survive rebuildUniqueSets by
+   *  design — it lives outside that replay-derived table. */
+  addPin(player: string, formatid: string, set: MatchedSet, note?: string): PinnedSet {
+    const playerId = toID(player);
+    const baseSpecies = set.baseSpecies;
+    this.data.pins = this.data.pins.filter(
+      (p) => !(p.playerId === playerId && p.formatid === formatid && toID(p.baseSpecies) === toID(baseSpecies)),
+    );
+    const pin: PinnedSet = { player, playerId, formatid, baseSpecies, set, note, pinnedAt: Date.now() };
+    this.data.pins.push(pin);
+    return pin;
+  }
+
+  /** Remove a pin. Returns true if one was found and removed. */
+  removePin(player: string, formatid: string, baseSpecies: string): boolean {
+    const playerId = toID(player);
+    const spId = toID(baseSpecies);
+    const before = this.data.pins.length;
+    this.data.pins = this.data.pins.filter(
+      (p) => !(p.playerId === playerId && p.formatid === formatid && toID(p.baseSpecies) === spId),
+    );
+    return this.data.pins.length < before;
+  }
+
+  /** List pins, optionally narrowed to one player. */
+  listPins(player?: string): PinnedSet[] {
+    const pid = player ? toID(player) : undefined;
+    return this.data.pins.filter((p) => !pid || p.playerId === pid);
+  }
+
   /**
-   * Candidate priors for a mon: this trainer's historical sets first, then the
-   * most common sets for the species across all trainers in the format.
+   * Candidate priors for a mon: a manually pinned build first (if any), then
+   * this trainer's historical sets, then the most common sets for the species
+   * across all trainers in the format.
    */
   getPriorSets = (player: string, formatid: string, baseSpecies: string): DexSet[] => {
     const pid = toID(player);
     const spId = toID(baseSpecies);
     const out: DexSet[] = [];
+
+    const pin = this.data.pins.find(
+      (p) => p.playerId === pid && p.formatid === formatid && toID(p.baseSpecies) === spId,
+    );
+    if (pin) out.push(matchedToDexSet(pin.set, `Pinned: ${pin.player}${pin.note ? ` (${pin.note})` : ''}`, true));
 
     const own = this.data.uniqueSets
       .filter((u) => u.playerId === pid && u.formatid === formatid && toID(u.set.species) === spId)
