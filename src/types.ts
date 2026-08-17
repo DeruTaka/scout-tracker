@@ -35,6 +35,10 @@ export interface RevealedMon {
   fainted: boolean;
   appeared: boolean; // switched into battle at least once (vs team-preview only)
   usedMultipleMoves: boolean; // used 2+ distinct moves in one stay-in -> not Choice-locked
+  /** Observed Stealth Rock / Spikes damage, or a Toxic Spikes poison, at least
+   *  once -> proves this mon can NOT be holding Heavy-Duty Boots (it blocks all
+   *  three). A hard veto against ever guessing Boots for this mon. */
+  tookHazardDamage: boolean;
 }
 
 /** One player's revealed team from a replay. */

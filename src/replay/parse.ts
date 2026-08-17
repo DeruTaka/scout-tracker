@@ -149,6 +149,7 @@ export function parseReplay(replay: Replay): RevealedTeam[] {
         fainted: false,
         appeared: false,
         usedMultipleMoves: false,
+        tookHazardDamage: false,
       };
       rosters[side].set(fam, mon);
     }
@@ -319,8 +320,8 @@ export function parseReplay(replay: Replay): RevealedTeam[] {
         // Entry-hazard damage → this mon did NOT dodge it (rules out Boots).
         if (cmd === '-damage' && mon) {
           const eff = toID((findFromAny(f) || '').replace(/^(?:move|item|ability):\s*/i, ''));
-          if (eff === 'stealthrock') getHz(mon).tookSR = true;
-          else if (eff === 'spikes') getHz(mon).tookSpikes = true;
+          if (eff === 'stealthrock') { getHz(mon).tookSR = true; mon.tookHazardDamage = true; }
+          else if (eff === 'spikes') { getHz(mon).tookSpikes = true; mon.tookHazardDamage = true; }
         }
         // "[from] item: X": an item that PROCS on another mon (Rocky Helmet,
         // Jaboca/Rowap Berry) carries an "[of]" holder — the item belongs to the
@@ -346,7 +347,7 @@ export function parseReplay(replay: Replay): RevealedTeam[] {
         const st = f[2];
         if (mon && sid && (st === 'psn' || st === 'tox')) {
           const side = active[sid]?.side;
-          if (side && hazards[side].tspikes > 0) getHz(mon).tookTSpikes = true;
+          if (side && hazards[side].tspikes > 0) { getHz(mon).tookTSpikes = true; mon.tookHazardDamage = true; }
         }
         break;
       }

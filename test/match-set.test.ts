@@ -19,6 +19,7 @@ function mon(overrides: Partial<RevealedMon> = {}): RevealedMon {
     fainted: false,
     appeared: true,
     usedMultipleMoves: false,
+    tookHazardDamage: false,
     ...overrides,
   };
 }
@@ -133,6 +134,26 @@ describe('move-filling is gated on 3+ revealed moves matching a dex set', () => 
   it('always keeps a directly-revealed tera regardless of how confident the rest of the set is', () => {
     const ms = matchSet(gen, mon({ moves: ['Ice Beam'], tera: 'Ghost' }), [bigSet]);
     expect(ms.tera).toBe('Ghost');
+  });
+});
+
+describe('Heavy-Duty Boots is never guessed for a mon observed taking hazard damage', () => {
+  it('drops a Heavy-Duty Boots prior when the mon took hazard damage', () => {
+    const ms = matchSet(gen, mon({ tookHazardDamage: true }), [dexSet('Heavy-Duty Boots')]);
+    expect(ms.item).toBeUndefined();
+    expect(ms.notes.some((n) => n.includes('Heavy-Duty Boots') && n.includes('hazard'))).toBe(true);
+  });
+
+  it('keeps a Heavy-Duty Boots prior when no hazard damage was observed', () => {
+    const ms = matchSet(gen, mon({ tookHazardDamage: false }), [dexSet('Heavy-Duty Boots')]);
+    expect(ms.item).toBe('Heavy-Duty Boots');
+  });
+
+  it('never overrides a directly-revealed Heavy-Duty Boots even with hazard damage', () => {
+    // (edge case: e.g. Trick swapped it in mid-battle after hazards already hit)
+    const ms = matchSet(gen, mon({ item: 'Heavy-Duty Boots', tookHazardDamage: true }), [dexSet('Choice Specs')]);
+    expect(ms.item).toBe('Heavy-Duty Boots');
+    expect(ms.itemRevealed).toBe(true);
   });
 });
 

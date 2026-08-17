@@ -26,11 +26,17 @@ export function itemWouldReveal(item: string | undefined, ability: string | unde
   return false;
 }
 
-/** Pick a prior item to fill an unrevealed slot, skipping self-revealing ones. */
-function fillItem(item: string | string[] | undefined, ability: string | undefined): string | undefined {
+/**
+ * Pick a prior item to fill an unrevealed slot: skip self-revealing ones, and
+ * skip Heavy-Duty Boots outright if we directly observed this mon taking
+ * hazard damage — Boots blocks Stealth Rock / Spikes / Toxic Spikes entirely,
+ * so any hazard damage is proof it can't be holding one, no matter how common
+ * Boots is on the matched dex/usage set.
+ */
+function fillItem(item: string | string[] | undefined, ability: string | undefined, tookHazardDamage: boolean): string | undefined {
   if (item === undefined) return undefined;
   const options = Array.isArray(item) ? item : [item];
-  return options.find((o) => !itemWouldReveal(o, ability));
+  return options.find((o) => !itemWouldReveal(o, ability) && !(tookHazardDamage && toID(o) === 'heavydutyboots'));
 }
 
 function idSet(names: string[]): Set<string> {
@@ -137,9 +143,12 @@ export function buildMatched(gen: Generation, mon: RevealedMon, best: DexSet | u
 
   const ability = mon.ability ?? pickFirst(best?.ability);
   const itemRevealed = !!mon.item;
-  let item = mon.item ?? fillItem(best?.item, ability);
+  let item = mon.item ?? fillItem(best?.item, ability, mon.tookHazardDamage);
   if (!itemRevealed && best?.item && item === undefined) {
-    notes.push('Prior item was self-revealing (e.g. Air Balloon / Life Orb) but never shown — left blank.');
+    const why = mon.tookHazardDamage && toID(pickFirst(best.item) || '') === 'heavydutyboots'
+      ? 'Prior item was Heavy-Duty Boots, but this mon was observed taking hazard damage — ruled out.'
+      : 'Prior item was self-revealing (e.g. Air Balloon / Life Orb) but never shown — left blank.';
+    notes.push(why);
   }
   // A Choice item is impossible if the mon used 2+ moves without switching.
   if (!itemRevealed && item && mon.usedMultipleMoves && toID(item).startsWith('choice')) {
