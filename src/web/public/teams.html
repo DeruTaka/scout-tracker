@@ -79,7 +79,19 @@
   .field.grow input { width:100%; }
   .count { margin-left:auto; align-self:flex-end; color:var(--muted); font-size:12.5px; padding-bottom:9px; white-space:nowrap; }
 
-  .grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(340px, 1fr)); gap:16px; }
+  /* Player usage panel */
+  #playerUsage:empty { display:none; }
+  .usage-card { padding:18px; margin-bottom:20px; }
+  .usage-head { display:flex; align-items:baseline; gap:10px; margin-bottom:14px; flex-wrap:wrap; }
+  .usage-head h2 { margin:0; font-size:16px; font-weight:700; }
+  .usage-head .muted { color:var(--muted); font-size:12.5px; }
+  .usage-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(230px, 1fr)); gap:10px; }
+  .usage-mon { background:var(--surface-2); border:1px solid var(--line); border-radius:var(--radius-sm); padding:11px 13px; }
+  .usage-mon-head { display:flex; align-items:center; gap:8px; margin-bottom:4px; }
+  .usage-mon-head .name { font-weight:650; font-size:13.5px; }
+  .usage-mon-head .pct { margin-left:auto; font-weight:700; font-size:13px; color:var(--accent); }
+  .usage-mon .breakdown { color:var(--muted); font-size:12px; line-height:1.6; }
+  .usage-mon .breakdown b { color:var(--text); font-weight:600; }
   .team-card { padding:18px; display:flex; flex-direction:column; gap:12px; animation:rise .3s ease both; }
   @keyframes rise { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:none; } }
   .tc-head { display:flex; align-items:center; gap:9px; flex-wrap:wrap; }
@@ -155,8 +167,8 @@
 
     <div class="content">
       <div class="card toolbar">
-        <div class="field grow"><label>Trainer</label><input type="text" id="qUser" placeholder="Search username…" /></div>
-        <div class="field grow"><label>Pokémon</label><input type="text" id="qMon" placeholder="e.g. Kyogre…" /></div>
+        <div class="field grow"><label>Trainer(s)</label><input type="text" id="qUser" placeholder="e.g. crying, Fc ❤ …" /></div>
+        <div class="field grow"><label>Pokémon (any of)</label><input type="text" id="qMon" placeholder="e.g. Kyogre, Koraidon…" /></div>
         <div class="field"><label>Metagame</label><select id="qMeta"><option value="">All</option></select></div>
         <div class="field"><label>Sort by</label><select id="qSort">
           <option value="date-desc">Date (newest)</option>
@@ -167,6 +179,7 @@
         </select></div>
         <div class="count" id="count"></div>
       </div>
+      <div id="playerUsage"></div>
       <div id="list"><div class="loading">loading teams…</div></div>
     </div>
   </div>
@@ -211,16 +224,20 @@ function teamCard(t){
   </div>`;
 }
 
+// Comma-separated -> lowercase term list, e.g. "crying, Fc" -> ['crying','fc']
+function parseTerms(v){ return v.split(',').map((s)=>s.trim().toLowerCase()).filter(Boolean); }
+
 function render(){
-  const qUser = $('qUser').value.trim().toLowerCase();
-  const qMon = $('qMon').value.trim().toLowerCase();
+  const qUsers = parseTerms($('qUser').value);
+  const qMons = parseTerms($('qMon').value);
   const qMeta = $('qMeta').value;
   const sort = $('qSort').value;
 
+  // Trainer / Pokémon: match ANY of the comma-separated terms (OR).
   let rows = ALL.filter((t)=>{
-    if (qUser && !t.player.toLowerCase().includes(qUser)) return false;
+    if (qUsers.length && !qUsers.some((u)=> t.player.toLowerCase().includes(u))) return false;
     if (qMeta && t.formatid !== qMeta) return false;
-    if (qMon && !t.mons.some((m)=> m.species.toLowerCase().includes(qMon))) return false;
+    if (qMons.length && !qMons.some((mq)=> t.mons.some((m)=> m.species.toLowerCase().includes(mq)))) return false;
     return true;
   });
 
@@ -255,6 +272,43 @@ function render(){
     c.onclick = () => { $('qMon').value = c.dataset.mon; render(); };
   });
   wireCopy(list);
+  updatePlayerUsage(qUsers, qMeta);
+}
+
+function evStr(evs){ const L={hp:'HP',atk:'Atk',def:'Def',spa:'SpA',spd:'SpD',spe:'Spe'};
+  return Object.keys(L).filter((k)=>evs&&evs[k]).map((k)=>evs[k]+' '+L[k]).join(' / ')||'(none)'; }
+
+function breakdown(list){
+  if (!list.length) return '—';
+  return list.slice(0,3).map((x)=> `<b>${esc(x.name)}</b> ${Math.round(x.percent)}%`).join(', ');
+}
+
+function usageMonCard(s){
+  return `<div class="usage-mon">
+    <div class="usage-mon-head"><span class="name">${esc(s.species)}</span><span class="pct">${Math.round(s.usagePercent)}%</span></div>
+    <div class="breakdown">${esc(s.topSet.nature||'')} ${esc(evStr(s.topSet.evs))}</div>
+    <div class="breakdown">Item: ${breakdown(s.items)}</div>
+    <div class="breakdown">Ability: ${breakdown(s.abilities)}</div>
+    ${s.teras.length ? `<div class="breakdown">Tera: ${breakdown(s.teras)}</div>` : ''}
+  </div>`;
+}
+
+let usageRequestId = 0;
+async function updatePlayerUsage(qUsers, qMeta){
+  const panel = $('playerUsage');
+  if (qUsers.length !== 1) { panel.innerHTML = ''; return; }
+  const myId = ++usageRequestId;
+  try {
+    const url = '/api/player-usage?player=' + encodeURIComponent(qUsers[0]) + (qMeta ? '&formatid=' + encodeURIComponent(qMeta) : '');
+    const r = await (await fetch(url)).json();
+    if (myId !== usageRequestId) return; // a newer search superseded this one
+    if (!r.usage) { panel.innerHTML = ''; return; }
+    const u = r.usage;
+    panel.innerHTML = `<div class="card usage-card">
+      <div class="usage-head"><h2>${esc(u.player)}'s usage</h2><span class="muted">across ${u.totalTeams} scouted team${u.totalTeams===1?'':'s'}${u.formatid?' · '+esc(u.formatid):''}</span></div>
+      <div class="usage-grid">${u.species.map(usageMonCard).join('')}</div>
+    </div>`;
+  } catch { if (myId === usageRequestId) panel.innerHTML = ''; }
 }
 
 async function load(){

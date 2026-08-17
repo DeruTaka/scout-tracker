@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import type { Datastore } from '../store/datastore.js';
 import type { Config } from '../config.js';
 import type { ScoutedReplay } from '../types.js';
-import { ingestReplays, previewReplay, writeOutputs } from '../ingest.js';
+import { ingestReplays, previewReplay, writeOutputs, scoutUserReplays } from '../ingest.js';
 import { googleConfigFromEnv, googleAuthConfigured } from '../sheet/google-sheets.js';
 
 function splitInputs(text: string): string[] {
@@ -85,6 +85,39 @@ export function startServer(store: Datastore, config: Config, port: number): voi
     } catch (e) {
       res.status(400).json({ error: e instanceof Error ? e.message : String(e) });
     }
+  });
+
+  app.post('/api/scout-user', async (req, res) => {
+    try {
+      const user = String(req.body?.user || '').trim();
+      if (!user) { res.status(400).json({ error: 'user is required' }); return; }
+      const max = Math.max(1, Math.min(200, Number(req.body?.max) || 50));
+      const { found, results } = await scoutUserReplays(user, store, { max, force: !!req.body?.force });
+      store.save();
+      const output = await writeOutputs(store, config.xlsxPath);
+      res.json({
+        user,
+        found,
+        results: results.map((r) => ({
+          id: r.id,
+          skipped: r.skipped,
+          error: r.error,
+          stats: r.stats,
+          scouted: r.scouted ? serialize(r.scouted) : undefined,
+        })),
+        output,
+      });
+    } catch (e) {
+      res.status(400).json({ error: e instanceof Error ? e.message : String(e) });
+    }
+  });
+
+  app.get('/api/player-usage', (req, res) => {
+    const player = String(req.query.player || '').trim();
+    if (!player) { res.status(400).json({ error: 'player is required' }); return; }
+    const formatid = req.query.formatid ? String(req.query.formatid) : undefined;
+    const usage = store.getPlayerUsage(player, formatid);
+    res.json({ usage });
   });
 
   app.get('/api/teams', (_req, res) => {

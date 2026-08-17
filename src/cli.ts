@@ -7,8 +7,7 @@
 //   scout serve [--port N]        start the local web UI
 import { getConfig } from './config.js';
 import { Datastore } from './store/datastore.js';
-import { ingestReplays, previewReplay, writeOutputs } from './ingest.js';
-import { listUserReplays } from './replay/fetch.js';
+import { ingestReplays, previewReplay, writeOutputs, scoutUserReplays } from './ingest.js';
 import { startServer } from './web/server.js';
 import { authorizeGoogleOAuth } from './sheet/google-sheets.js';
 import type { ScoutedReplay } from './types.js';
@@ -54,7 +53,8 @@ async function main() {
         if (r.error) console.log(`✗ ${r.id}: ${r.error}`);
         else if (r.skipped) console.log(`• ${r.id}: already stored (use "sheet" to rebuild)`);
         else {
-          console.log(`✓ ${r.id}: +${r.stats?.newSets ?? 0} new sets, ${r.stats?.updatedSets ?? 0} repeats`);
+          const agg = r.stats?.teamsAggregated ? `, pooled across ${r.stats.teamsAggregated} same-team group(s)` : '';
+          console.log(`✓ ${r.id}: +${r.stats?.newSets ?? 0} new sets, ${r.stats?.updatedSets ?? 0} repeats${agg}`);
           if (r.scouted) printScouted(r.scouted);
         }
       }
@@ -66,10 +66,9 @@ async function main() {
       if (!user) return fail('Usage: scout user <name> [--max N]');
       const max = Number(flags.max) || 50;
       console.log(`Fetching up to ${max} replays for "${user}"...`);
-      const ids = await listUserReplays(user, max);
-      console.log(`Found ${ids.length} replays.`);
       const store = new Datastore(config.storePath);
-      const results = await ingestReplays(ids, store);
+      const { found, results } = await scoutUserReplays(user, store, { max });
+      console.log(`Found ${found} replays.`);
       store.save();
       const added = results.filter((r) => !r.skipped && !r.error).length;
       const skipped = results.filter((r) => r.skipped).length;

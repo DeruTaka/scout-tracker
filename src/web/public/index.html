@@ -237,6 +237,18 @@
             <span id="busy"></span>
           </div>
         </div>
+
+        <div class="card pad composer">
+          <p class="hint">Or pull every public replay for a trainer straight from Showdown and scout each one.</p>
+          <div class="toolbar">
+            <input type="text" id="scoutUserName" placeholder="Trainer name…" />
+            <input type="text" id="scoutUserMax" placeholder="max (50)" style="width:100px" />
+            <button class="btn-ghost" id="scoutUserBtn">Pull &amp; scout their replays</button>
+            <label class="switch"><input type="checkbox" id="scoutUserForce" /><span class="track"></span> re-scout if stored</label>
+            <span id="userBusy"></span>
+          </div>
+        </div>
+
         <div id="results"></div>
       </section>
     </div>
@@ -375,11 +387,31 @@ async function run(endpoint) {
   finally { $('busy').textContent=''; $('ingestBtn').disabled=$('previewBtn').disabled=false; }
 }
 
+async function runUser() {
+  const user = $('scoutUserName').value.trim();
+  if (!user) return;
+  const max = Number($('scoutUserMax').value) || 50;
+  $('userBusy').innerHTML = '<span class="busy"><span class="spin"></span> pulling replays…</span>';
+  $('scoutUserBtn').disabled = true;
+  try {
+    const body = { user, max, force: $('scoutUserForce').checked };
+    const r = await (await fetch('/api/scout-user', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) })).json();
+    if (r.error) { $('results').innerHTML = `<div class="err">${esc(r.error)}</div>`; return; }
+    const list = r.results.map((x)=> x.error ? `<div class="err">✗ ${esc(x.id)}: ${esc(x.error)}</div>` : x.skipped ? `<div class="card pad note-line">• ${esc(x.id)} already stored</div>` : renderReplay(x.scouted)).join('');
+    const banner = `<div class="card pad note-line">Found ${r.found} replay(s) for ${esc(r.user)}.${r.output?.sheetUrl?` · <a href="${esc(r.output.sheetUrl)}" target="_blank">open Google Sheet</a>`:''}</div>`;
+    $('results').innerHTML = banner + (list || emptyResults());
+    wireCopy($('results'));
+    loadStatus();
+  } catch (e) { $('results').innerHTML = `<div class="err">${esc(e.message||e)}</div>`; }
+  finally { $('userBusy').textContent=''; $('scoutUserBtn').disabled=false; }
+}
+
 /* ---- Wiring ---- */
 $('themeBtn').onclick = toggleTheme;
 document.querySelectorAll('.nav-item[data-view]').forEach((a)=> a.onclick = () => showView(a.dataset.view));
 $('ingestBtn').onclick = () => run('/api/ingest');
 $('previewBtn').onclick = () => run('/api/preview');
+$('scoutUserBtn').onclick = runUser;
 
 paintThemeBtn();
 $('results').innerHTML = emptyResults();

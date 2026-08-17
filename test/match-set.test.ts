@@ -105,12 +105,14 @@ describe('move-filling is gated on 3+ revealed moves matching a dex set', () => 
     item: 'Choice Specs',
     nature: 'Modest',
     evs: { spa: 252, spe: 252 },
+    teratypes: 'Water',
   };
 
   it('completes the moveset when 3 revealed moves line up', () => {
     const ms = matchSet(gen, mon({ moves: ['Ice Beam', 'Thunder', 'Origin Pulse'] }), [bigSet]);
     expect(ms.moves.length).toBe(4);
     expect(ms.moves).toContain('Water Spout'); // filled 4th slot
+    expect(ms.tera).toBe('Water'); // full set is confident -> tera guessed too
   });
 
   it('shows only revealed moves when fewer than 3 revealed — but keeps EV/item prediction', () => {
@@ -118,11 +120,19 @@ describe('move-filling is gated on 3+ revealed moves matching a dex set', () => 
     expect(ms.moves).toEqual(['Ice Beam', 'Thunder']);
     expect(ms.item).toBe('Choice Specs');
     expect(ms.evs.spa).toBe(252);
+    expect(ms.tera).toBeUndefined(); // set isn't confident -> don't guess tera either
+    expect(ms.notes.some((n) => n.includes('Tera type left blank'))).toBe(true);
   });
 
   it('does not complete the set when a revealed move is outside the dex set', () => {
     const ms = matchSet(gen, mon({ moves: ['Ice Beam', 'Thunder', 'Surf'] }), [bigSet]);
     expect(ms.moves).toEqual(['Ice Beam', 'Thunder', 'Surf']); // no bogus 4th move
+    expect(ms.tera).toBeUndefined();
+  });
+
+  it('always keeps a directly-revealed tera regardless of how confident the rest of the set is', () => {
+    const ms = matchSet(gen, mon({ moves: ['Ice Beam'], tera: 'Ghost' }), [bigSet]);
+    expect(ms.tera).toBe('Ghost');
   });
 });
 

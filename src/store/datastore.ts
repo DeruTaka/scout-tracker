@@ -7,7 +7,7 @@ import { dirname } from 'node:path';
 import type { DexSet, MatchedSet, ScoutedReplay, StatsTable } from '../types.js';
 import { toID } from '../data/dex.js';
 
-interface StoredReplay {
+export interface StoredReplay {
   id: string;
   url: string;
   format: string;
@@ -18,6 +18,9 @@ interface StoredReplay {
   winner?: string;
   scoutedAt: number;
   teams: { player: string; side: 'p1' | 'p2'; sets: MatchedSet[]; paste: string }[];
+  /** Full battle log, kept so damage evidence can be re-derived later (e.g. to
+   *  pool it across replays of the same team) without re-fetching. */
+  log: string;
 }
 
 export interface UniqueSet {
@@ -39,6 +42,26 @@ interface StoreShape {
   version: 1;
   replays: Record<string, StoredReplay>;
   uniqueSets: UniqueSet[];
+}
+
+export interface PlayerSpeciesUsage {
+  species: string;
+  baseSpecies: string;
+  count: number; // times this species appeared across their scouted teams
+  usagePercent: number; // % of their scouted teams (in scope) that included it
+  topSet: MatchedSet; // their single most-common exact build for it
+  items: { name: string; percent: number }[];
+  abilities: { name: string; percent: number }[];
+  natures: { name: string; percent: number }[];
+  teras: { name: string; percent: number }[];
+}
+
+export interface PlayerUsage {
+  player: string;
+  playerId: string;
+  formatid?: string;
+  totalTeams: number;
+  species: PlayerSpeciesUsage[];
 }
 
 function evString(evs: Partial<StatsTable> = {}): string {
@@ -125,8 +148,66 @@ export class Datastore {
     return out;
   };
 
-  /** Store a scouted replay + fold its sets into the unique-set library. */
-  ingest(scouted: ScoutedReplay): { replayNew: boolean; newSets: number; updatedSets: number } {
+  /**
+   * This trainer's own usage stats, computed purely from what we've scouted of
+   * them — same shape as Smogon's usage stats (species usage%, item/ability/
+   * nature/tera breakdowns) but scoped to one player. `formatid` optionally
+   * narrows to one metagame; omitted, it spans everything stored for them.
+   */
+  getPlayerUsage(player: string, formatid?: string): PlayerUsage | null {
+    const pid = toID(player);
+    const sets = this.data.uniqueSets.filter((u) => u.playerId === pid && (!formatid || u.formatid === formatid));
+    if (sets.length === 0) return null;
+
+    const teamIds = new Set<string>();
+    for (const r of Object.values(this.data.replays)) {
+      if (formatid && r.formatid !== formatid) continue;
+      if (r.teams.some((t) => toID(t.player) === pid)) teamIds.add(r.id);
+    }
+    const totalTeams = teamIds.size;
+
+    const bySpecies = new Map<string, UniqueSet[]>();
+    for (const u of sets) {
+      const k = toID(u.baseSpecies);
+      (bySpecies.get(k) ?? bySpecies.set(k, []).get(k)!).push(u);
+    }
+
+    const tally = (group: UniqueSet[], totalUses: number, pick: (u: UniqueSet) => string | undefined) => {
+      const m = new Map<string, number>();
+      for (const u of group) {
+        const v = pick(u);
+        if (!v) continue;
+        m.set(v, (m.get(v) || 0) + u.count);
+      }
+      return [...m.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .map(([name, n]) => ({ name, percent: (n / totalUses) * 100 }));
+    };
+
+    const species: PlayerSpeciesUsage[] = [];
+    for (const group of bySpecies.values()) {
+      const totalUses = group.reduce((s, u) => s + u.count, 0);
+      const top = [...group].sort((a, b) => b.count - a.count)[0]!;
+      species.push({
+        species: top.species,
+        baseSpecies: top.baseSpecies,
+        count: totalUses,
+        usagePercent: totalTeams ? (totalUses / totalTeams) * 100 : 0,
+        topSet: top.set,
+        items: tally(group, totalUses, (u) => u.set.item),
+        abilities: tally(group, totalUses, (u) => u.set.ability),
+        natures: tally(group, totalUses, (u) => u.set.nature),
+        teras: tally(group, totalUses, (u) => u.set.tera),
+      });
+    }
+    species.sort((a, b) => b.usagePercent - a.usagePercent);
+
+    return { player: sets[0]!.player, playerId: pid, formatid, totalTeams, species };
+  }
+
+  /** Store a scouted replay. Does NOT fold the unique-set library — call
+   *  rebuildUniqueSets() after (aggregation may still revise these sets). */
+  ingest(scouted: ScoutedReplay): { replayNew: boolean } {
     const r = scouted.replay;
     const replayNew = !this.data.replays[r.id];
     this.data.replays[r.id] = {
@@ -140,45 +221,53 @@ export class Datastore {
       winner: r.winner,
       scoutedAt: scouted.scoutedAt,
       teams: scouted.teams.map((t) => ({ player: t.player, side: t.side, sets: t.sets, paste: t.paste })),
+      log: r.log,
     };
+    return { replayNew };
+  }
 
-    let newSets = 0;
-    let updatedSets = 0;
-    for (const team of scouted.teams) {
-      for (const ms of team.sets) {
-        if (ms.unrevealed) continue; // don't pollute the library with empty sets
-        const hash = setHash(r.formatid, ms);
-        const existing = this.data.uniqueSets.find(
-          (u) => u.hash === hash && u.playerId === toID(team.player),
-        );
-        if (existing) {
-          if (!existing.sources.includes(r.id)) {
-            existing.sources.push(r.id);
-            existing.count++;
-            existing.lastSeen = Math.max(existing.lastSeen, r.uploadtime);
-            existing.firstSeen = Math.min(existing.firstSeen, r.uploadtime);
-            updatedSets++;
+  /**
+   * Rebuild the unique-set library from scratch from currently-stored replays.
+   * Full rebuild (rather than incremental merge) keeps it consistent even after
+   * cross-replay aggregation revises a set's EVs/item on existing replays.
+   */
+  rebuildUniqueSets(): void {
+    const byKey = new Map<string, UniqueSet>();
+    for (const r of Object.values(this.data.replays)) {
+      for (const team of r.teams) {
+        const playerId = toID(team.player);
+        for (const ms of team.sets) {
+          if (ms.unrevealed) continue; // don't pollute the library with empty sets
+          const hash = setHash(r.formatid, ms);
+          const mapKey = `${hash}|${playerId}`;
+          const existing = byKey.get(mapKey);
+          if (existing) {
+            if (!existing.sources.includes(r.id)) {
+              existing.sources.push(r.id);
+              existing.count++;
+              existing.lastSeen = Math.max(existing.lastSeen, r.uploadtime);
+              existing.firstSeen = Math.min(existing.firstSeen, r.uploadtime);
+            }
+          } else {
+            byKey.set(mapKey, {
+              hash,
+              player: team.player,
+              playerId,
+              formatid: r.formatid,
+              format: r.format,
+              baseSpecies: ms.baseSpecies,
+              species: ms.species,
+              set: ms,
+              count: 1,
+              sources: [r.id],
+              firstSeen: r.uploadtime,
+              lastSeen: r.uploadtime,
+            });
           }
-        } else {
-          this.data.uniqueSets.push({
-            hash,
-            player: team.player,
-            playerId: toID(team.player),
-            formatid: r.formatid,
-            format: r.format,
-            baseSpecies: ms.baseSpecies,
-            species: ms.species,
-            set: ms,
-            count: 1,
-            sources: [r.id],
-            firstSeen: r.uploadtime,
-            lastSeen: r.uploadtime,
-          });
-          newSets++;
         }
       }
     }
-    return { replayNew, newSets, updatedSets };
+    this.data.uniqueSets = [...byKey.values()];
   }
 
   save(): void {

@@ -146,7 +146,13 @@ export function buildMatched(gen: Generation, mon: RevealedMon, best: DexSet | u
     notes.push(`Ruled out ${item} — used 2+ moves without switching, so it can't be Choice-locked.`);
     item = undefined;
   }
-  const tera = mon.tera ?? (gen.num >= 9 ? pickFirst(best?.teratypes) : undefined);
+  // Only guess a Tera type when the rest of the set is confident enough to be
+  // dex-filled too (same 3-moves-lining-up gate) — otherwise leave it blank
+  // rather than bolt a guessed Tera onto an otherwise-uncertain read.
+  const tera = mon.tera ?? (gen.num >= 9 && fillMoves ? pickFirst(best?.teratypes) : undefined);
+  if (!mon.tera && !fillMoves && gen.num >= 9 && best?.teratypes) {
+    notes.push('Tera type left blank — not revealed, and the set is not confident enough to guess it.');
+  }
 
   let nature: string;
   let evs: MatchedSet['evs'];
