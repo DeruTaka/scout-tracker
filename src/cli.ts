@@ -4,6 +4,7 @@
 //   scout user <name> [--max N]   scout all of a user's public replays
 //   scout paste <url|id>          print both team pastes (no storing)
 //   scout sheet                   rebuild xlsx / Google Sheet from the store
+//   scout refresh                 re-derive every stored replay with the current engine (no re-fetching)
 //   scout pin <player> <formatid> pin a verified build (paste via --file/stdin)
 //   scout unpin <player> <formatid> <species>   remove a pin
 //   scout pins [player]           list pinned builds
@@ -11,7 +12,7 @@
 import { readFileSync } from 'node:fs';
 import { getConfig } from './config.js';
 import { Datastore } from './store/datastore.js';
-import { ingestReplays, previewReplay, writeOutputs, scoutUserReplays } from './ingest.js';
+import { ingestReplays, previewReplay, writeOutputs, scoutUserReplays, refreshStore } from './ingest.js';
 import { startServer } from './web/server.js';
 import { authorizeGoogleOAuth } from './sheet/google-sheets.js';
 import { parsePasteToMatchedSet } from './build/import-set.js';
@@ -107,6 +108,19 @@ async function main() {
       await emitOutputs(store, config.xlsxPath);
       break;
     }
+    case 'refresh': {
+      const store = new Datastore(config.storePath);
+      const total = store.replays.length;
+      console.log(`Refreshing ${total} stored replays with the current engine (no network fetches)...`);
+      const { errors } = await refreshStore(store, (done, tot, id) => {
+        if (done % 25 === 0 || done === tot) console.log(`  ${done}/${tot} (${id})`);
+      });
+      store.save();
+      console.log(`\nDone. ${total - errors.length}/${total} succeeded.`);
+      for (const e of errors) console.log(`  ✗ ${e.id}: ${e.error}`);
+      await emitOutputs(store, config.xlsxPath);
+      break;
+    }
     case 'pin': {
       const player = positionals[0];
       const formatid = positionals[1];
@@ -179,6 +193,7 @@ async function main() {
           '  scout user <name> [--max N]   scout a user\'s replays\n' +
           '  scout paste <url|id>          print team pastes (no store)\n' +
           '  scout sheet                   rebuild xlsx / Google Sheet\n' +
+          '  scout refresh                 re-derive every stored replay with the current engine (no re-fetching)\n' +
           '  scout pin <player> <fmt>      pin a verified build (paste via --file or stdin)\n' +
           '  scout unpin <player> <fmt> <species>   remove a pin\n' +
           '  scout pins [player]           list pinned builds\n' +

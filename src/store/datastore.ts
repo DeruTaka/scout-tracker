@@ -267,8 +267,10 @@ export class Datastore {
   }
 
   /** Store a scouted replay. Does NOT fold the unique-set library — call
-   *  rebuildUniqueSets() after (aggregation may still revise these sets). */
-  ingest(scouted: ScoutedReplay): { replayNew: boolean } {
+   *  rebuildUniqueSets() after (aggregation may still revise these sets).
+   *  `scoutedAtOverride` lets a refresh re-derive a replay without losing its
+   *  original scouting timestamp (which the History-matching order depends on). */
+  ingest(scouted: ScoutedReplay, scoutedAtOverride?: number): { replayNew: boolean } {
     const r = scouted.replay;
     const replayNew = !this.data.replays[r.id];
     this.data.replays[r.id] = {
@@ -280,11 +282,27 @@ export class Datastore {
       players: r.players,
       uploadtime: r.uploadtime,
       winner: r.winner,
-      scoutedAt: scouted.scoutedAt,
+      scoutedAt: scoutedAtOverride ?? scouted.scoutedAt,
       teams: scouted.teams.map((t) => ({ player: t.player, side: t.side, sets: t.sets, paste: t.paste })),
       log: r.log,
     };
     return { replayNew };
+  }
+
+  /**
+   * Snapshot of every stored replay in the order they were originally
+   * scouted (oldest first) — the order a full re-derivation needs to replay
+   * the incremental trainer-History/aggregation pipeline faithfully.
+   */
+  snapshotForRefresh(): StoredReplay[] {
+    return Object.values(this.data.replays).sort((a, b) => a.scoutedAt - b.scoutedAt);
+  }
+
+  /** Wipe all derived data (replays + the unique-set library) so a refresh can
+   *  rebuild it from scratch. Pins are manually-verified and survive this. */
+  clearDerived(): void {
+    this.data.replays = {};
+    this.data.uniqueSets = [];
   }
 
   /**

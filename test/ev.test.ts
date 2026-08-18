@@ -308,16 +308,57 @@ describe('a derived-down offense stat frees EVs into HP instead of leaving them 
     });
     const teams: SideSets[] = [{ side: 'p1', sets: [zac] }, { side: 'p2', sets: [kora] }];
     deriveEvs(9, teams, [hitOnKoraidon(), hitOnKoraidon()]);
-    // HP/Def came straight out of the defense-evidence search (0/36 for this
+    // HP/Def came straight out of the defense-evidence search (0/0 for this
     // exact scenario) — Pass C must not perturb them, even though it's free
     // to top up the untested SpD.
     expect(kora.notes.some((n) => n.includes('Derived HP/DEF'))).toBe(true);
     const total = (['hp', 'atk', 'def', 'spa', 'spd', 'spe'] as const).reduce((s, k) => s + (kora.evs[k] ?? 0), 0);
     expect(total).toBe(508);
     expect(kora.evs.hp).toBe(0);
-    expect(kora.evs.def).toBe(36);
+    expect(kora.evs.def).toBe(0);
     expect(kora.evs.spd).toBeGreaterThan(0);
     expect(kora.notes.some((n) => n.includes('Filled') && n.includes('SpD'))).toBe(true);
+  });
+});
+
+describe('Intrepid Sword / Dauntless Shield do not double-count their own +1 stage', () => {
+  // @smogon/calc unconditionally re-applies Intrepid Sword's +1 Atk inside
+  // calculate() itself, as if the Pokemon had just freshly switched in — but
+  // Gen 9 patched the ability to trigger only on a Pokemon's very first
+  // entry, not on every re-entry. A re-entered Zacian-Crowned's ACTUAL boosts
+  // (tracked from -boost/-unboost log lines, empty here) can legitimately
+  // have no +1 active. If the engine didn't compensate, it would predict a
+  // boosted 70.7-83.6% range for this exact hit and misread the ~13pp
+  // shortfall as defender bulk that was never really there.
+  it('a hit that only fits the unboosted range is not misread as defender bulk', () => {
+    const zac: MatchedSet = {
+      species: 'Zacian-Crowned', baseSpecies: 'Zacian-Crowned', level: 100, shiny: false,
+      moves: ['Behemoth Blade'], revealedMoves: ['Behemoth Blade'],
+      item: 'Rusted Sword', itemRevealed: true, ability: 'Intrepid Sword',
+      nature: 'Jolly', evs: { atk: 252, spd: 4, spe: 252 },
+      confidence: 0.7, notes: [], evSource: 'dex-set', choicePossible: true,
+    };
+    const kora: MatchedSet = {
+      species: 'Koraidon', baseSpecies: 'Koraidon', level: 100, shiny: false,
+      moves: ['Flame Charge'], revealedMoves: ['Flame Charge'],
+      item: undefined, itemRevealed: false, ability: 'Orichalcum Pulse',
+      nature: 'Jolly', evs: { atk: 252, def: 4, spe: 252 },
+      confidence: 0.6, notes: [], evSource: 'dex-set', choicePossible: true,
+    };
+    // Real observed % from smogtours-gen9ubers-962535 turn 23 — a re-entered
+    // Zacian-Crowned's Behemoth Blade vs. a plain 0 HP/4 Def Koraidon.
+    const hit = (): DamageObservation => ({
+      turn: 23, attackerSide: 'p1', attackerSpecies: 'Zacian-Crowned', defenderSide: 'p2',
+      defenderSpecies: 'Koraidon', move: 'Behemoth Blade', observedPercent: 50,
+      koCapped: false, field: {
+        attackerBoosts: {}, defenderBoosts: {}, reflect: false, lightScreen: false,
+        auroraVeil: false, attackerHpPercent: 100, defenderHpPercent: 100,
+      }, crit: false, usable: true,
+    });
+    const teams: SideSets[] = [{ side: 'p1', sets: [zac] }, { side: 'p2', sets: [kora] }];
+    deriveEvs(9, teams, [hit(), hit()]);
+    expect(kora.evs.def).toBe(4);
+    expect(kora.evs.hp ?? 0).toBe(0);
   });
 });
 

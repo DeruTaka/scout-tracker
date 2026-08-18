@@ -95,6 +95,44 @@ export async function scoutUserReplays(
   return { user, found: ids.length, results };
 }
 
+export interface RefreshResult {
+  total: number;
+  errors: { id: string; error: string }[];
+}
+
+/**
+ * Fully re-derive the store from its already-stored replay logs, using
+ * whatever EV/set-matching engine is running now — no network fetches, and
+ * nothing about which replays are stored changes. Replays are reprocessed in
+ * their original scouting order (by `scoutedAt`) so the incremental
+ * trainer-History and same-roster-aggregation pipeline rebuilds exactly as
+ * it originally did, just with today's logic instead of whichever version
+ * ran at the time each replay was first scouted. Use this after an engine
+ * fix to bring old derivations up to date. Pins are untouched.
+ */
+export async function refreshStore(
+  store: Datastore,
+  onProgress?: (done: number, total: number, id: string) => void,
+): Promise<RefreshResult> {
+  const originalReplays = store.snapshotForRefresh();
+  store.clearDerived();
+  const errors: { id: string; error: string }[] = [];
+  let done = 0;
+  for (const stored of originalReplays) {
+    try {
+      const scouted = await scoutReplay(stored, { getPriorSets: store.getPriorSets });
+      store.ingest(scouted, stored.scoutedAt);
+      aggregateAffectedGroups(store, stored.formatid, stored.players);
+      store.rebuildUniqueSets();
+    } catch (e) {
+      errors.push({ id: stored.id, error: e instanceof Error ? e.message : String(e) });
+    }
+    done++;
+    onProgress?.(done, originalReplays.length, stored.id);
+  }
+  return { total: originalReplays.length, errors };
+}
+
 export interface OutputResult {
   xlsxPath: string;
   sheetUrl?: string;

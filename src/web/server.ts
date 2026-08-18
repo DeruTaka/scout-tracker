@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import type { Datastore } from '../store/datastore.js';
 import type { Config } from '../config.js';
 import type { ScoutedReplay } from '../types.js';
-import { ingestReplays, previewReplay, writeOutputs, scoutUserReplays } from '../ingest.js';
+import { ingestReplays, previewReplay, writeOutputs, scoutUserReplays, refreshStore } from '../ingest.js';
 import { googleConfigFromEnv, googleAuthConfigured } from '../sheet/google-sheets.js';
 import { getGen, spriteSlug } from '../data/dex.js';
 
@@ -112,6 +112,34 @@ export function startServer(store: Datastore, config: Config, port: number): voi
     } catch (e) {
       res.status(400).json({ error: e instanceof Error ? e.message : String(e) });
     }
+  });
+
+  // Full re-derivation from stored replay logs (no network fetches) can take
+  // a while for a large store, well past a typical HTTP proxy timeout — so
+  // this runs as a background job the client polls, rather than one blocking
+  // request/response like the other endpoints here.
+  let refreshJob: { running: boolean; done: number; total: number; currentId: string; errors: { id: string; error: string }[]; finishedAt?: number } | null = null;
+
+  app.post('/api/refresh', (_req, res) => {
+    if (refreshJob?.running) { res.status(409).json({ error: 'A refresh is already running.' }); return; }
+    const total = store.replays.length;
+    refreshJob = { running: true, done: 0, total, currentId: '', errors: [] };
+    refreshStore(store, (done, tot, id) => {
+      if (refreshJob) { refreshJob.done = done; refreshJob.total = tot; refreshJob.currentId = id; }
+    })
+      .then(async ({ errors }) => {
+        store.save();
+        await writeOutputs(store, config.xlsxPath);
+        if (refreshJob) { refreshJob.running = false; refreshJob.errors = errors; refreshJob.finishedAt = Date.now(); }
+      })
+      .catch((e) => {
+        if (refreshJob) { refreshJob.running = false; refreshJob.errors = [{ id: refreshJob.currentId, error: e instanceof Error ? e.message : String(e) }]; refreshJob.finishedAt = Date.now(); }
+      });
+    res.json({ started: true, total });
+  });
+
+  app.get('/api/refresh', (_req, res) => {
+    res.json(refreshJob ?? { running: false, done: 0, total: 0, currentId: '' });
   });
 
   app.get('/api/player-usage', (req, res) => {

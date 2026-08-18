@@ -137,6 +137,21 @@ function buildPokemon(
   // Some species/formes aren't resolvable in calc's dataset for a given gen
   // (e.g. Aegislash's base forme in gen 8). Those simply skip EV derivation.
   try {
+    // @smogon/calc's own gen7+ mechanics unconditionally re-apply Intrepid
+    // Sword's/Dauntless Shield's +1 stage INSIDE calculate() itself
+    // (checkIntrepidSword/checkDauntlessShield in its mechanics/util.js),
+    // treating the ability as if it had just freshly triggered — there's no
+    // way to opt out via the ability field. Our own boosts come from actually
+    // tracking -boost/-unboost lines in the log (reset on switch-out like any
+    // other stage), so they're already correct for whether the boost is
+    // currently active. Pre-subtract 1 from whichever stat the ability
+    // targets so the library's forced re-add nets out to what we observed,
+    // instead of silently stacking an extra +1 on top of it.
+    let boosts = opts.boosts;
+    if (gen.num > 7 && (ms.ability === 'Intrepid Sword' || ms.ability === 'Dauntless Shield')) {
+      const stat = ms.ability === 'Intrepid Sword' ? 'atk' : 'def';
+      boosts = { ...boosts, [stat]: (boosts?.[stat] ?? 0) - 1 };
+    }
     const p = new calc.Pokemon(gen, ms.baseSpecies, {
       level: ms.level,
       item: (opts.item !== undefined ? opts.item : ms.item) || undefined,
@@ -144,7 +159,7 @@ function buildPokemon(
       nature: opts.nature ?? ms.nature,
       evs: opts.evs ?? ms.evs,
       ivs: ms.ivs,
-      boosts: opts.boosts,
+      boosts,
       status: mapStatus(opts.status),
       teraType: gen.num >= 9 && opts.tera ? (opts.tera as any) : undefined,
     });

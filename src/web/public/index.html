@@ -250,6 +250,14 @@
           </div>
         </div>
 
+        <div class="card pad composer">
+          <p class="hint">Re-derive every stored replay from its saved log with today's engine — no re-fetching from Showdown. Use this after a derivation fix to bring old spreads up to date.</p>
+          <div class="toolbar">
+            <button class="btn-ghost" id="refreshBtn">Refresh entire store</button>
+            <span id="refreshStatus"></span>
+          </div>
+        </div>
+
         <div id="results"></div>
       </section>
     </div>
@@ -408,17 +416,48 @@ async function runUser() {
   finally { $('userBusy').textContent=''; $('scoutUserBtn').disabled=false; }
 }
 
+async function pollRefresh() {
+  const s = await (await fetch('/api/refresh')).json();
+  if (s.running) {
+    $('refreshStatus').innerHTML = `<span class="busy"><span class="spin"></span> ${s.done}/${s.total} — ${esc(s.currentId||'')}</span>`;
+    $('refreshBtn').disabled = true;
+    setTimeout(pollRefresh, 1000);
+  } else {
+    $('refreshBtn').disabled = false;
+    if (s.finishedAt) {
+      const errCount = (s.errors||[]).length;
+      $('refreshStatus').innerHTML = errCount
+        ? `<span class="err">Done. ${s.total-errCount}/${s.total} succeeded, ${errCount} failed.</span>`
+        : `<span class="note-line">Done — ${s.total} replay(s) re-derived.</span>`;
+      loadStatus();
+    }
+  }
+}
+
+async function runRefresh() {
+  if (!confirm(`Re-derive all ${$('statReplays').textContent} stored replays from their saved logs? This rebuilds every EV spread and the whole unique-set library from scratch — it does not touch which replays are stored.`)) return;
+  $('refreshBtn').disabled = true;
+  $('refreshStatus').innerHTML = '<span class="busy"><span class="spin"></span> starting…</span>';
+  try {
+    const r = await (await fetch('/api/refresh', { method: 'POST' })).json();
+    if (r.error) { $('refreshStatus').innerHTML = `<span class="err">${esc(r.error)}</span>`; $('refreshBtn').disabled = false; return; }
+    pollRefresh();
+  } catch (e) { $('refreshStatus').innerHTML = `<span class="err">${esc(e.message||e)}</span>`; $('refreshBtn').disabled = false; }
+}
+
 /* ---- Wiring ---- */
 $('themeBtn').onclick = toggleTheme;
 document.querySelectorAll('.nav-item[data-view]').forEach((a)=> a.onclick = () => showView(a.dataset.view));
 $('ingestBtn').onclick = () => run('/api/ingest');
 $('previewBtn').onclick = () => run('/api/preview');
 $('scoutUserBtn').onclick = runUser;
+$('refreshBtn').onclick = runRefresh;
 
 paintThemeBtn();
 $('results').innerHTML = emptyResults();
 showView(location.hash.slice(1) || 'scout');
 loadStatus();
+pollRefresh();
 </script>
 </body>
 </html>
