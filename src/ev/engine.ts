@@ -132,6 +132,7 @@ function buildPokemon(
     status?: string;
     tera?: string;
     item?: string; // explicit override ('' = no item); undefined = use ms.item
+    hpPercent?: number; // observation's actual HP% at the moment of the hit
   },
 ): calc.Pokemon | null {
   // Some species/formes aren't resolvable in calc's dataset for a given gen
@@ -164,6 +165,14 @@ function buildPokemon(
       teraType: gen.num >= 9 && opts.tera ? (opts.tera as any) : undefined,
     });
     if (!p.species || !(p.species as any).baseStats) return null;
+    // @smogon/calc defaults to full HP when curHP isn't given, which silently
+    // activates Multiscale/Shadow Shield's 50% reduction for any defender that
+    // was actually already damaged — the observation's real HP% must be told
+    // to the library explicitly, or a perfectly normal hit on a pre-damaged
+    // wall gets misread as needing an unrevealed boosting item.
+    if (opts.hpPercent !== undefined) {
+      p.originalCurHP = Math.max(1, Math.round((opts.hpPercent / 100) * p.maxHP()));
+    }
     return p;
   } catch {
     return null;
@@ -563,11 +572,13 @@ function totalViolationOffense(
       boosts: o.field.attackerBoosts,
       status: o.field.attackerStatus,
       tera: o.field.attackerTera,
+      hpPercent: o.field.attackerHpPercent,
     });
     const defender = buildPokemon(gen, def, {
       boosts: o.field.defenderBoosts,
       status: o.field.defenderStatus,
       tera: o.field.defenderTera,
+      hpPercent: o.field.defenderHpPercent,
     });
     if (!attacker || !defender) continue;
     const range = predictPct(gen, attacker, defender, o.move, buildField(gen, o.field));
@@ -694,6 +705,7 @@ function totalViolationDefense(
       boosts: o.field.attackerBoosts,
       status: o.field.attackerStatus,
       tera: o.field.attackerTera,
+      hpPercent: o.field.attackerHpPercent,
     });
     const defender = buildPokemon(gen, ms, {
       evs,
@@ -701,6 +713,7 @@ function totalViolationDefense(
       boosts: o.field.defenderBoosts,
       status: o.field.defenderStatus,
       tera: o.field.defenderTera,
+      hpPercent: o.field.defenderHpPercent,
     });
     if (!attacker || !defender) continue;
     const range = predictPct(gen, attacker, defender, o.move, buildField(gen, o.field));
@@ -733,6 +746,7 @@ function totalFitDefense(
       boosts: o.field.attackerBoosts,
       status: o.field.attackerStatus,
       tera: o.field.attackerTera,
+      hpPercent: o.field.attackerHpPercent,
     });
     const defender = buildPokemon(gen, ms, {
       evs,
@@ -740,6 +754,7 @@ function totalFitDefense(
       boosts: o.field.defenderBoosts,
       status: o.field.defenderStatus,
       tera: o.field.defenderTera,
+      hpPercent: o.field.defenderHpPercent,
     });
     if (!attacker || !defender) continue;
     const range = predictPct(gen, attacker, defender, o.move, buildField(gen, o.field));
@@ -1214,11 +1229,13 @@ function residualForMon(
       boosts: o.field.attackerBoosts,
       status: o.field.attackerStatus,
       tera: o.field.attackerTera,
+      hpPercent: o.field.attackerHpPercent,
     });
     const defender = buildPokemon(gen, defenderSet, {
       boosts: o.field.defenderBoosts,
       status: o.field.defenderStatus,
       tera: o.field.defenderTera,
+      hpPercent: o.field.defenderHpPercent,
     });
     if (!attacker || !defender) continue;
     const range = predictPct(gen, attacker, defender, o.move, buildField(gen, o.field));

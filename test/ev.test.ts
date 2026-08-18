@@ -321,6 +321,48 @@ describe('a derived-down offense stat frees EVs into HP instead of leaving them 
   });
 });
 
+describe('Multiscale / Shadow Shield only apply when the defender is actually at full HP', () => {
+  // @smogon/calc gates Multiscale/Shadow Shield's 50% reduction on
+  // defender.curHP() === defender.maxHP() — correctly conditional, but it
+  // defaults curHP to max whenever the caller never says otherwise. Real
+  // observations from smogtours-gen9ubers-955171: a 0-Atk Ho-Oh's Sacred
+  // Fire (Sun) vs. a Shadow Shield Lunala already at 87% HP dealt 55% —
+  // right in the plain (ability-inactive) 54.1-63.7% range. Without passing
+  // the observation's actual HP%, the engine assumes Lunala is untouched,
+  // halves the prediction to ~27-32%, and misreads the "shortfall" as Ho-Oh
+  // needing an unrevealed Choice Band.
+  it('a hit on an already-damaged Shadow Shield mon is not misread as attacker needing a boost item', () => {
+    const hooh: MatchedSet = {
+      species: 'Ho-Oh', baseSpecies: 'Ho-Oh', level: 100, shiny: false,
+      moves: ['Sacred Fire'], revealedMoves: ['Sacred Fire'],
+      item: 'Heavy-Duty Boots', itemRevealed: false, ability: 'Regenerator',
+      nature: 'Impish', evs: { hp: 252, def: 252, spd: 4 },
+      confidence: 0.7, notes: [], evSource: 'dex-set', choicePossible: true,
+    };
+    const lunala: MatchedSet = {
+      species: 'Lunala', baseSpecies: 'Lunala', level: 100, shiny: false,
+      moves: ['Moongeist Beam'], revealedMoves: ['Moongeist Beam'],
+      item: 'Heavy-Duty Boots', itemRevealed: true, ability: 'Shadow Shield',
+      nature: 'Timid', evs: { hp: 4, spa: 252, spe: 252 },
+      confidence: 0.7, notes: [], evSource: 'dex-set', choicePossible: true,
+    };
+    const hit = (): DamageObservation => ({
+      turn: 2, attackerSide: 'p1', attackerSpecies: 'Ho-Oh', defenderSide: 'p2',
+      defenderSpecies: 'Lunala', move: 'Sacred Fire', observedPercent: 55,
+      koCapped: false, field: {
+        weather: 'SunnyDay', attackerBoosts: {}, defenderBoosts: { spa: 1, spd: 1 },
+        reflect: false, lightScreen: false, auroraVeil: false,
+        attackerHpPercent: 69, defenderHpPercent: 87,
+      }, crit: false, usable: true,
+    });
+    const teams: SideSets[] = [{ side: 'p1', sets: [hooh] }, { side: 'p2', sets: [lunala] }];
+    deriveEvs(9, teams, [hit(), hit()]);
+    expect(hooh.item).toBe('Heavy-Duty Boots');
+    expect(hooh.evs.atk ?? 0).toBe(0);
+    expect(hooh.notes.some((n) => n.includes('Inferred') && n.includes('from damage output'))).toBe(false);
+  });
+});
+
 describe('Intrepid Sword / Dauntless Shield do not double-count their own +1 stage', () => {
   // @smogon/calc unconditionally re-applies Intrepid Sword's +1 Atk inside
   // calculate() itself, as if the Pokemon had just freshly switched in — but

@@ -27,16 +27,29 @@ export function itemWouldReveal(item: string | undefined, ability: string | unde
 }
 
 /**
- * Pick a prior item to fill an unrevealed slot: skip self-revealing ones, and
+ * Pick a prior item to fill an unrevealed slot: skip self-revealing ones,
  * skip Heavy-Duty Boots outright if we directly observed this mon taking
- * hazard damage — Boots blocks Stealth Rock / Spikes / Toxic Spikes entirely,
+ * hazard damage (Boots blocks Stealth Rock / Spikes / Toxic Spikes entirely,
  * so any hazard damage is proof it can't be holding one, no matter how common
- * Boots is on the matched dex/usage set.
+ * Boots is on the matched dex/usage set), and skip Loaded Dice unless a
+ * random-hit-count move (Scale Shot, Bullet Seed, ...) is actually in the
+ * final moveset — it only does anything for those, so assuming it from usage
+ * share alone with no supporting move is a guess with no real basis.
  */
-function fillItem(item: string | string[] | undefined, ability: string | undefined, tookHazardDamage: boolean): string | undefined {
+function fillItem(
+  item: string | string[] | undefined,
+  ability: string | undefined,
+  tookHazardDamage: boolean,
+  hasMultiHitMove: boolean,
+): string | undefined {
   if (item === undefined) return undefined;
   const options = Array.isArray(item) ? item : [item];
-  return options.find((o) => !itemWouldReveal(o, ability) && !(tookHazardDamage && toID(o) === 'heavydutyboots'));
+  return options.find(
+    (o) =>
+      !itemWouldReveal(o, ability) &&
+      !(tookHazardDamage && toID(o) === 'heavydutyboots') &&
+      !(!hasMultiHitMove && toID(o) === 'loadeddice'),
+  );
 }
 
 function idSet(names: string[]): Set<string> {
@@ -146,12 +159,16 @@ export function buildMatched(gen: Generation, mon: RevealedMon, best: DexSet | u
   }
 
   const ability = mon.ability ?? pickFirst(best?.ability);
+  const hasMultiHitMove = moves.some((m) => Array.isArray(gen.moves.get(m)?.multihit));
   const itemRevealed = !!mon.item;
-  let item = mon.item ?? fillItem(best?.item, ability, mon.tookHazardDamage);
+  let item = mon.item ?? fillItem(best?.item, ability, mon.tookHazardDamage, hasMultiHitMove);
   if (!itemRevealed && best?.item && item === undefined) {
-    const why = mon.tookHazardDamage && toID(pickFirst(best.item) || '') === 'heavydutyboots'
+    const bestId = toID(pickFirst(best.item) || '');
+    const why = mon.tookHazardDamage && bestId === 'heavydutyboots'
       ? 'Prior item was Heavy-Duty Boots, but this mon was observed taking hazard damage — ruled out.'
-      : 'Prior item was self-revealing (e.g. Air Balloon / Life Orb) but never shown — left blank.';
+      : !hasMultiHitMove && bestId === 'loadeddice'
+        ? 'Prior item was Loaded Dice, but no random-multi-hit move is in this moveset to make it matter — left blank.'
+        : 'Prior item was self-revealing (e.g. Air Balloon / Life Orb) but never shown — left blank.';
     notes.push(why);
   }
   // A Choice item is impossible if the mon used 2+ moves without switching.

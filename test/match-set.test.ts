@@ -173,6 +173,27 @@ describe('Heavy-Duty Boots is never guessed for a mon observed taking hazard dam
   });
 });
 
+describe('Loaded Dice is never guessed without a random-multi-hit move in the moveset', () => {
+  function loadedDiceSet(movepool: string[]): DexSet {
+    return { role: 'Test', moves: movepool, movepool, item: 'Loaded Dice', nature: 'Jolly', evs: { atk: 252, spe: 252, hp: 4 } };
+  }
+
+  it('drops a Loaded Dice prior when no multi-hit move was revealed', () => {
+    const ms = matchSet(gen, mon({ species: 'Koraidon', baseSpecies: 'Koraidon', moves: ['Low Kick'] }), [
+      loadedDiceSet(['Low Kick', 'U-turn']),
+    ]);
+    expect(ms.item).toBeUndefined();
+    expect(ms.notes.some((n) => n.includes('Loaded Dice') && n.includes('multi-hit'))).toBe(true);
+  });
+
+  it('keeps a Loaded Dice prior once a random-multi-hit move is revealed', () => {
+    const ms = matchSet(gen, mon({ species: 'Koraidon', baseSpecies: 'Koraidon', moves: ['Scale Shot'] }), [
+      loadedDiceSet(['Scale Shot', 'Low Kick']),
+    ]);
+    expect(ms.item).toBe('Loaded Dice');
+  });
+});
+
 describe('Choice items are ruled out when the mon used 2+ moves in one stay-in', () => {
   it('drops a Choice prior item for a multi-move mon', () => {
     const ms = matchSet(gen, mon({ usedMultipleMoves: true }), [dexSet('Choice Specs')]);
