@@ -193,6 +193,21 @@ function violation(observed: number, lo: number, hi: number, koCapped: boolean, 
   return 0;
 }
 
+/**
+ * Distance from the AVERAGE roll, rather than "inside the roll range at
+ * all". `violation()` is 0 for every EV value whose predicted range merely
+ * CONTAINS the observed %, which leaves a wide plateau of equally-"valid"
+ * candidates with no signal for which one is actually the best-supported
+ * explanation. Damage rolls are 16 evenly-spaced values (85%-100% of base),
+ * so the range's midpoint IS the expected roll — scoring against it gives
+ * the search a real gradient toward "solve for the EV that makes this hit
+ * an average roll", not just "any EV that doesn't contradict it".
+ */
+function defenseFitDistance(observed: number, lo: number, hi: number, koCapped: boolean): number {
+  if (koCapped) return observed > hi ? observed - hi : 0; // still only a lower bound
+  return Math.abs(observed - (lo + hi) / 2);
+}
+
 const ALL_STATS: (keyof StatsTable)[] = ['hp', 'atk', 'def', 'spa', 'spd', 'spe'];
 const STAT_LABEL: Record<keyof StatsTable, string> = { hp: 'HP', atk: 'Atk', def: 'Def', spa: 'SpA', spd: 'SpD', spe: 'Spe' };
 
@@ -249,6 +264,25 @@ function allocateDonors(
 function totalDeviation(evs: Partial<StatsTable>, priorEvs: Partial<StatsTable>): number {
   let dev = 0;
   for (const s of ALL_STATS) dev += Math.abs((evs[s] || 0) - (priorEvs[s] || 0));
+  return dev / EV_MAX;
+}
+
+// HP is the most efficient defensive investment — it helps against BOTH
+// physical and special hits at once, where Def/SpD only cover one — so a
+// real mixed wall leans on HP first and only reaches for a single defense
+// stat to cover what HP alone can't. Weighting HP's movement below its true
+// EV cost in the joint defense search encodes that preference directly,
+// rather than leaving it to be a last-resort leftover-budget fallback.
+const HP_DEV_WEIGHT = 0.35;
+
+/** Same as totalDeviation, but HP movement counts for less — used only by
+ *  the joint Def+SpD search, where we WANT the regularizer to prefer HP. */
+function weightedDeviation(evs: Partial<StatsTable>, priorEvs: Partial<StatsTable>): number {
+  let dev = 0;
+  for (const s of ALL_STATS) {
+    const raw = Math.abs((evs[s] || 0) - (priorEvs[s] || 0));
+    dev += s === 'hp' ? raw * HP_DEV_WEIGHT : raw;
+  }
   return dev / EV_MAX;
 }
 
@@ -345,15 +379,20 @@ export function deriveEvs(
   for (const [k, obs] of defenseByDefender) {
     const ms = byKey.get(k);
     if (!ms) continue;
+    const byCat: Record<'def' | 'spd', DamageObservation[]> = { def: [], spd: [] };
     for (const stat of ['def', 'spd'] as const) {
-      const catObs = obs.filter((o) => {
+      byCat[stat] = obs.filter((o) => {
         const c = gen.moves.get(toID(o.move) as any)?.category;
         return (stat === 'def' && c === 'Physical') || (stat === 'spd' && c === 'Special');
       });
-      if (catObs.length === 0) continue;
-      (defenseTested.get(k) ?? defenseTested.set(k, new Set()).get(k)!).add(stat);
-      refineDefense(gen, ms, byKey, stat, catObs);
+      if (byCat[stat].length > 0) {
+        (defenseTested.get(k) ?? defenseTested.set(k, new Set()).get(k)!).add(stat);
+      }
     }
+    // Refine both together when both have evidence — see refineDefensePair's
+    // doc comment for why running them independently silently discards a
+    // genuinely mixed wall's split investment.
+    refineDefensePair(gen, ms, byKey, byCat.def, byCat.spd);
   }
 
   // ---- Pass C: a lower-than-prior Atk/SpA/Def/SpD read frees EVs that a real
@@ -398,16 +437,14 @@ export function deriveEvs(
       }
     }
     // Blind fallback for whatever's still unaccounted for: HP first if it's
-    // not blocked, then whichever untested defense stat has room. Speed is a
-    // true last resort — it's excluded from the normal preference order (an
-    // unfounded speed claim is worse than an unfounded HP one), but when a
-    // mon took BOTH a physical and special hit that already fit the prior
-    // (blocking hp/def/spd) on top of a reduced Atk/SpA, nothing else is left
-    // and the spread would otherwise stay silently incomplete. More Speed
-    // never contradicts turn-order evidence — proven "faster than" facts are
-    // lower bounds, not exact pins — so padding it here is safe.
+    // not blocked, then whichever untested defense stat has room. Speed is
+    // DELIBERATELY excluded here (and from the two tiers below, until they've
+    // both failed) — an unfounded Speed claim is a worse default than an
+    // unfounded HP/bulk one for the common case (a mon that's clearly built
+    // defensively has no business getting leftover EVs dumped into Speed just
+    // because HP/Def/SpD each happened to have SOME evidence attached).
     const blindFilled: string[] = [];
-    for (const stat of ['hp', 'def', 'spd', 'spe'] as const) {
+    for (const stat of ['hp', 'def', 'spd'] as const) {
       if (remaining <= 0) break;
       if (blocked.has(stat)) continue;
       const cur = evs[stat] || 0;
@@ -418,18 +455,18 @@ export function deriveEvs(
       filled.push(`${add} ${STAT_LABEL[stat]}`);
       blindFilled.push(`${add} ${STAT_LABEL[stat]}`);
     }
-    // Emergency last resort: hp/def/spd/spe are all still blocked or capped
-    // (e.g. a mon that took both a physical AND special hit, each already
-    // fitting the prior — "confirmed", not searched — while a separate
-    // offense read pulled Atk/SpA down hard). A real spread is ALWAYS exactly
-    // 508 EVs; leaving it visibly incomplete is a worse failure than nudging
-    // a stat that was only ever passively confirmed (never actually
-    // fit-searched against alternatives), so relax the block here — but
-    // Atk/SpA remain untouchable even now, since inventing offense a mon
-    // never showed is worse than a slightly-off bulk number.
+    // Emergency tier: hp/def/spd are all still blocked (e.g. a mon that took
+    // both a physical AND special hit, each genuinely fit-searched against
+    // the prior — not just passively confirmed — while a separate offense
+    // read pulled Atk/SpA down hard). A real spread is ALWAYS exactly 508
+    // EVs; leaving it visibly incomplete is worse than nudging a stat that
+    // WAS searched, so relax that block here — but Atk/SpA remain
+    // untouchable even now, and Speed is STILL not tried yet: HP/Def/SpD
+    // have 3×252 EVs of headroom between them, so this tier alone covers
+    // every case a real spread's remaining budget could plausibly need.
     let emergency = false;
     if (remaining > 0) {
-      for (const stat of ['hp', 'def', 'spd', 'spe'] as const) {
+      for (const stat of ['hp', 'def', 'spd'] as const) {
         if (remaining <= 0) break;
         const cur = evs[stat] || 0;
         const add = Math.min(EV_MAX - cur, Math.floor(remaining / EV_STEP) * EV_STEP);
@@ -437,6 +474,23 @@ export function deriveEvs(
         evs[stat] = cur + add;
         remaining -= add;
         filled.push(`${add} ${STAT_LABEL[stat]}`);
+        emergency = true;
+      }
+    }
+    // Absolute last resort: HP/Def/SpD are all already maxed at 252 (rare —
+    // means 756+ EVs of bulk were already justified) and there's STILL
+    // budget left over. Speed is safe here in the sense that it never
+    // contradicts turn-order evidence (a proven "faster than" is a lower
+    // bound, not an exact pin) — it's just the worst DEFAULT guess for a
+    // mon we have no positive reason to think invests in it, which is why
+    // every bulk-focused tier above gets first refusal.
+    if (remaining > 0) {
+      const cur = evs.spe || 0;
+      const add = Math.min(EV_MAX - cur, Math.floor(remaining / EV_STEP) * EV_STEP);
+      if (add > 0) {
+        evs.spe = cur + add;
+        remaining -= add;
+        filled.push(`${add} Spe`);
         emergency = true;
       }
     }
@@ -625,6 +679,45 @@ function totalViolationDefense(
   return { v: n ? v / n : 0, n }; // average per-observation
 }
 
+/** Like totalViolationDefense, but scored against the roll's midpoint
+ *  (defenseFitDistance) — used only to SELECT the best-fitting EV value
+ *  within the joint Def+SpD search; adoption/reporting still use the coarser
+ *  totalViolationDefense so "did this actually clear the roll" stays the bar
+ *  for whether a change is real. */
+function totalFitDefense(
+  gen: CalcGen,
+  ms: MatchedSet,
+  byKey: Map<string, MatchedSet>,
+  evs: Partial<StatsTable>,
+  obs: DamageObservation[],
+  nature?: string,
+): number {
+  let d = 0;
+  let n = 0;
+  for (const o of obs) {
+    const atk = byKey.get(key(o.attackerSide, o.attackerSpecies));
+    if (!atk) continue;
+    const attacker = buildPokemon(gen, atk, {
+      boosts: o.field.attackerBoosts,
+      status: o.field.attackerStatus,
+      tera: o.field.attackerTera,
+    });
+    const defender = buildPokemon(gen, ms, {
+      evs,
+      nature,
+      boosts: o.field.defenderBoosts,
+      status: o.field.defenderStatus,
+      tera: o.field.defenderTera,
+    });
+    if (!attacker || !defender) continue;
+    const range = predictPct(gen, attacker, defender, o.move, buildField(gen, o.field));
+    if (!range) continue;
+    d += defenseFitDistance(o.observedPercent, range[0], range[1], o.koCapped);
+    n++;
+  }
+  return n ? d / n : 0;
+}
+
 // Bulk natures to try per defensive stat — both polarities, since we can't
 // always be sure whether the mon leans physical or special offensively.
 const DEFENSE_NATURE_CANDIDATES: Record<'def' | 'spd', string[]> = {
@@ -734,6 +827,135 @@ function refineDefense(
   ms.confidence = Math.max(
     0.3,
     Math.min(ms.confidence, best.v <= KEEP_THRESHOLD ? 0.7 : best.v <= RESIDUAL_ACCEPT ? 0.55 : 0.45),
+  );
+}
+
+/**
+ * When a mon has evidence for BOTH Def and SpD, refine them TOGETHER instead
+ * of as two independent passes. Running them separately lets whichever runs
+ * second silently re-pick HP with no memory of what the first pass's fit
+ * depended on — a mon that's genuinely a mixed wall (moderate Def AND SpD,
+ * high HP) can end up maxed on one defense stat with the other at zero,
+ * because each category only ever asked "what's the best HP/stat pair for
+ * MY evidence alone", never "what HP works for both". This searches Def and
+ * SpD's best value at each candidate HP jointly, so a mon whose evidence
+ * points to real investment in both actually ends up with real investment
+ * in both, instead of one figure overwriting the other's compromise.
+ */
+function refineDefensePair(
+  gen: CalcGen,
+  ms: MatchedSet,
+  byKey: Map<string, MatchedSet>,
+  defObs: DamageObservation[],
+  spdObs: DamageObservation[],
+): void {
+  if (defObs.length > 0 && spdObs.length === 0) return refineDefense(gen, ms, byKey, 'def', defObs);
+  if (spdObs.length > 0 && defObs.length === 0) return refineDefense(gen, ms, byKey, 'spd', spdObs);
+  if (defObs.length === 0 && spdObs.length === 0) return;
+
+  const priorEvs = { ...ms.evs };
+  const priorNature = ms.nature;
+  // Gate on the coarse "does this fall inside the roll range at all" check —
+  // if the current spread isn't actually CONTRADICTED by either category,
+  // there's nothing to fix (matches "if a shared dex set already covers
+  // every calc, just use it").
+  const { v: priorDefV, n: defN } = totalViolationDefense(gen, ms, byKey, priorEvs, defObs, priorNature);
+  const { v: priorSpdV, n: spdN } = totalViolationDefense(gen, ms, byKey, priorEvs, spdObs, priorNature);
+  if (priorDefV <= KEEP_THRESHOLD && priorSpdV <= KEEP_THRESHOLD) {
+    ms.confidence = Math.min(0.98, ms.confidence + 0.03);
+    return;
+  }
+
+  const defScale = evidenceScale(defN);
+  const spdScale = evidenceScale(spdN);
+  const jointScale = Math.max(defScale, spdScale);
+  // Both Def and SpD are fixed together for the joint search — donors can't
+  // include either, same principle as the single-stat search excluding hp+stat.
+  const donors = donorOrder(priorEvs, ['hp', 'def', 'spd']);
+  const floors: Partial<Record<keyof StatsTable, number>> = { spe: ms.speedFloor ?? 0 };
+  const natures = [...new Set([priorNature, ...DEFENSE_NATURE_CANDIDATES.def, ...DEFENSE_NATURE_CANDIDATES.spd])];
+  const priorDefFit = totalFitDefense(gen, ms, byKey, priorEvs, defObs, priorNature);
+  const priorSpdFit = totalFitDefense(gen, ms, byKey, priorEvs, spdObs, priorNature);
+
+  // Best Def (or SpD) value AT a fixed hp. Selection uses the AVERAGE-ROLL
+  // distance (defenseFitDistance/totalFitDefense) rather than the coarse
+  // in-range check — "any value that doesn't contradict the roll" leaves a
+  // wide plateau of equally-"valid" EV values with no way to prefer the
+  // statistically likely one; scoring against the roll's midpoint gives the
+  // search an actual gradient toward the best-supported number, mirroring
+  // "solve for the EV where this hit is an average roll".
+  const bestAt = (hp: number, statKey: 'def' | 'spd', catObs: DamageObservation[], nature: string, priorFit: number, scale: number) => {
+    const priorStat = priorEvs[statKey] || 0;
+    let best = { ev: priorStat, fit: priorFit, score: priorFit };
+    for (let ev = 0; ev <= EV_MAX; ev += EV_STEP) {
+      const evs = allocateDonors(priorEvs, { hp, [statKey]: ev }, donors, floors);
+      if (!evs) continue;
+      const fit = totalFitDefense(gen, ms, byKey, evs, catObs, nature);
+      const dev = Math.abs(ev - priorStat) / EV_MAX;
+      const score = fit + LAMBDA * scale * dev;
+      if (score < best.score - 1e-6) best = { ev, fit, score };
+    }
+    // Report the coarse in-range violation for the WINNING ev — adoption,
+    // confidence, and note text stay grounded in "does this clear the roll",
+    // not the finer average-roll distance used only to pick the ev itself.
+    const winEvs = allocateDonors(priorEvs, { hp, [statKey]: best.ev }, donors, floors)!;
+    const { v } = totalViolationDefense(gen, ms, byKey, winEvs, catObs, nature);
+    return { ev: best.ev, v };
+  };
+
+  const priorCombinedV = priorDefV * defScale + priorSpdV * spdScale;
+  let best = {
+    evs: priorEvs, nature: priorNature,
+    defV: priorDefV, spdV: priorSpdV, combinedV: priorCombinedV,
+    score: priorCombinedV,
+  };
+
+  const minObs = Math.min(defN, spdN);
+  const hpCandidateSet = new Set<number>([priorEvs.hp || 0, 0, 248, 252].filter((h) => h <= EV_MAX));
+  if (minObs >= 3) for (let h = 0; h <= EV_MAX; h += 24) hpCandidateSet.add(h);
+  const hpCandidates = [...hpCandidateSet];
+
+  for (const nature of natures) {
+    const natCost = (nature === priorNature ? 0 : NATURE_PENALTY) * jointScale;
+    for (const hp of hpCandidates) {
+      const bestDef = bestAt(hp, 'def', defObs, nature, priorDefFit, defScale);
+      const bestSpd = bestAt(hp, 'spd', spdObs, nature, priorSpdFit, spdScale);
+      const evs = allocateDonors(priorEvs, { hp, def: bestDef.ev, spd: bestSpd.ev }, donors, floors);
+      if (!evs) continue;
+      const combinedV = bestDef.v * defScale + bestSpd.v * spdScale;
+      // HP costs less than Def/SpD to move away from prior — a mixed wall's
+      // most efficient lever is HP (it helps against both attack types at
+      // once), so when multiple hp/def/spd combinations fit similarly well,
+      // this biases the search toward the one that leans on HP first and
+      // only reaches for Def/SpD to cover what HP alone couldn't.
+      const dev = weightedDeviation(evs, priorEvs);
+      const score = combinedV + LAMBDA * jointScale * dev + natCost;
+      if (score < best.score - 1e-6) best = { evs, nature, defV: bestDef.v, spdV: bestSpd.v, combinedV, score };
+    }
+  }
+
+  const changed = totalDeviation(best.evs, priorEvs) > 1e-9 || best.nature !== priorNature;
+  const improvement = priorCombinedV - best.combinedV;
+  if (!changed || improvement < KEEP_THRESHOLD) {
+    if (priorDefV > RESIDUAL_ACCEPT || priorSpdV > RESIDUAL_ACCEPT) {
+      ms.notes.push(
+        `Damage taken doesn't cleanly fit any HP/Def/SpD split (residual ${priorDefV.toFixed(1)}% Def, ${priorSpdV.toFixed(1)}% SpD); keeping the dex spread.`,
+      );
+      ms.confidence = Math.max(0.3, ms.confidence - 0.1);
+    }
+    return;
+  }
+  const donorNote = donorNoteList(best.evs, priorEvs, donors);
+  ms.evs = best.evs;
+  if (best.nature !== priorNature) ms.nature = best.nature;
+  if (donorNote) ms.notes.push(`Traded ${donorNote} for bulk — the maxed prior spread left no other room.`);
+  ms.evSource = 'derived';
+  ms.notes.push(
+    `Derived HP/Def/SpD = ${best.evs.hp || 0}/${best.evs.def || 0}/${best.evs.spd || 0}${best.nature !== priorNature ? ` (${best.nature})` : ''} EVs jointly from damage taken (residual ${best.defV.toFixed(1)}% Def, ${best.spdV.toFixed(1)}% SpD).`,
+  );
+  ms.confidence = Math.max(
+    0.3,
+    Math.min(ms.confidence, best.combinedV <= KEEP_THRESHOLD ? 0.7 : best.combinedV <= RESIDUAL_ACCEPT ? 0.55 : 0.45),
   );
 }
 

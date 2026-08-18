@@ -1,13 +1,14 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import * as calc from '@smogon/calc';
 import { parseReplay } from '../src/replay/parse.js';
 import { extractObservations } from '../src/ev/field-tracker.js';
 import { deriveEvs, deriveSpeed, type SideSets } from '../src/ev/engine.js';
 import { matchSet } from '../src/match/match-set.js';
 import { getSetsForSpecies } from '../src/data/sets-provider.js';
 import { genFromFormatId, getGen } from '../src/data/dex.js';
-import type { DamageObservation, MatchedSet, Replay, SpeedObservation } from '../src/types.js';
+import type { DamageObservation, MatchedSet, Replay, SpeedObservation, StatsTable } from '../src/types.js';
 
 function loadFixture(name: string): Replay {
   const path = fileURLToPath(new URL(`./fixtures/${name}.json`, import.meta.url));
@@ -466,5 +467,86 @@ describe('leftover-EV fill has an emergency last resort when every other stat is
     const total = (['hp', 'atk', 'def', 'spa', 'spd', 'spe'] as const).reduce((s, k) => s + (zac.evs[k] ?? 0), 0);
     expect(total).toBe(508);
     expect(zac.notes.some((n) => n.includes('Filled') && n.includes("didn't add up"))).toBe(true);
+    // HP alone has plenty of room to absorb the leftover — Speed should
+    // never even be touched here, let alone be the FIRST place it lands.
+    expect(zac.evs.spe).toBe(252);
+    expect(zac.evs.hp).toBeGreaterThan(0);
+  });
+});
+
+describe('Def and SpD are refined jointly, not as two independent passes that overwrite each other', () => {
+  // Reproduces the Ho-Oh bug: a mon takes both a physical AND a special hit.
+  // Processed independently, 'def' alone would want HP high; 'spd' alone,
+  // run second, could freely zero HP back out to fit ITS OWN evidence,
+  // silently invalidating the 'def' fit that was never re-checked. A real
+  // mixed wall's HP has to work for BOTH categories at once.
+  const gen9 = calc.Generations.get(9);
+  function pct(defenderEvs: Partial<StatsTable>, move: string, attackerEvs: Partial<StatsTable>, attackerSpecies: string, attackerNature: string) {
+    const result = calc.calculate(
+      gen9,
+      new calc.Pokemon(gen9, attackerSpecies, { level: 100, nature: attackerNature, evs: attackerEvs }),
+      new calc.Pokemon(gen9, 'Ho-Oh', { level: 100, item: 'Heavy-Duty Boots', ability: 'Regenerator', nature: 'Careful', evs: defenderEvs }),
+      new calc.Move(gen9, move),
+    );
+    const dmg = (Array.isArray(result.damage) ? result.damage : [result.damage]) as number[];
+    const avg = dmg.reduce((a, b) => a + b, 0) / dmg.length;
+    return (avg / result.defender.maxHP()) * 100;
+  }
+  // A genuinely mixed-bulk target: real investment in both HP and SpD, and
+  // some (not maxed) Def — the same shape as a real bulky Ho-Oh.
+  const targetEvs = { hp: 248, def: 148, spd: 112 };
+  const physPct = pct(targetEvs, 'Brave Bird', { atk: 252 }, 'Arceus', 'Adamant');
+  const specPct = pct(targetEvs, 'Judgment', { spa: 252 }, 'Arceus', 'Modest');
+
+  function hoOh(): MatchedSet {
+    return {
+      species: 'Ho-Oh', baseSpecies: 'Ho-Oh', level: 100, shiny: false,
+      moves: ['Sacred Fire', 'Brave Bird'], revealedMoves: ['Sacred Fire', 'Brave Bird'],
+      item: 'Heavy-Duty Boots', itemRevealed: true, ability: 'Regenerator',
+      nature: 'Impish', evs: { hp: 252, def: 252, spd: 4 },
+      confidence: 0.6, notes: [], evSource: 'dex-set', choicePossible: true,
+    };
+  }
+  function attacker(species: string): MatchedSet {
+    return {
+      species, baseSpecies: species, level: 100, shiny: false,
+      moves: [], revealedMoves: [],
+      item: undefined, itemRevealed: false, ability: 'Multitype',
+      nature: 'Serious', evs: {},
+      confidence: 0.5, notes: [], evSource: 'dex-set', choicePossible: true,
+    };
+  }
+  const fieldBase = {
+    attackerBoosts: {}, defenderBoosts: {}, reflect: false, lightScreen: false,
+    auroraVeil: false, attackerHpPercent: 100, defenderHpPercent: 100,
+  };
+  function physHit(): DamageObservation {
+    return {
+      turn: 3, attackerSide: 'p1', attackerSpecies: 'Arceus', defenderSide: 'p2',
+      defenderSpecies: 'Ho-Oh', move: 'Brave Bird', observedPercent: physPct,
+      koCapped: false, field: fieldBase, crit: false, usable: true,
+    };
+  }
+  function specHit(): DamageObservation {
+    return {
+      turn: 5, attackerSide: 'p1', attackerSpecies: 'Arceus', defenderSide: 'p2',
+      defenderSpecies: 'Ho-Oh', move: 'Judgment', observedPercent: specPct,
+      koCapped: false, field: fieldBase, crit: false, usable: true,
+    };
+  }
+
+  it('never lands on the self-contradictory HP-zeroed / one-stat-maxed pattern', () => {
+    const hooh = hoOh();
+    const teams: SideSets[] = [{ side: 'p1', sets: [attacker('Arceus')] }, { side: 'p2', sets: [hooh] }];
+    deriveEvs(9, teams, [physHit(), physHit(), specHit(), specHit()]);
+    const total = (['hp', 'atk', 'def', 'spa', 'spd', 'spe'] as const).reduce((s, k) => s + (hooh.evs[k] ?? 0), 0);
+    expect(total).toBe(508);
+    // The old bug: 'spd' running second would zero HP back out even though
+    // 'def' evidence needed it. Whatever this lands on, it must not be the
+    // degenerate "HP gutted AND a defense stat gutted" combination.
+    const hp = hooh.evs.hp ?? 0;
+    const def = hooh.evs.def ?? 0;
+    const spd = hooh.evs.spd ?? 0;
+    expect(hp === 0 && (def === 0 || spd === 0)).toBe(false);
   });
 });
