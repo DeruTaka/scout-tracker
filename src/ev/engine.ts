@@ -203,9 +203,26 @@ function violation(observed: number, lo: number, hi: number, koCapped: boolean, 
  * the search a real gradient toward "solve for the EV that makes this hit
  * an average roll", not just "any EV that doesn't contradict it".
  */
+// A damage roll is 16 EQUALLY-likely values (85%-100% of base, evenly
+// spaced) — so given a candidate EV value whose predicted range merely
+// CONTAINS the observed %, that candidate is exactly as statistically
+// consistent with the hit as any other candidate whose range also contains
+// it, REGARDLESS of whether the observed % lands near the range's edge or
+// its middle. There's no likelihood argument for preferring the midpoint.
+// What DOES matter: a candidate that only explains the hit by landing near
+// the very edge of its range is fragile — it stops working under the
+// slightest error in our own assumptions (an unmodeled item, a slightly
+// wrong nature guess, rounding). Preferring a candidate whose range covers
+// the hit with more margin on both sides is a robustness preference, not a
+// likelihood one — so it's weighted as a mild tie-break UNDER the
+// deviation-from-prior cost, never enough to override it outright.
+const EDGE_ROBUSTNESS_WEIGHT = 0.6;
+
 function defenseFitDistance(observed: number, lo: number, hi: number, koCapped: boolean): number {
-  if (koCapped) return observed > hi ? observed - hi : 0; // still only a lower bound
-  return Math.abs(observed - (lo + hi) / 2);
+  const coarse = violation(observed, lo, hi, koCapped);
+  if (koCapped || hi <= lo) return coarse;
+  const edgeness = Math.min(1, Math.abs(observed - (lo + hi) / 2) / ((hi - lo) / 2));
+  return coarse + edgeness * EDGE_ROBUSTNESS_WEIGHT;
 }
 
 const ALL_STATS: (keyof StatsTable)[] = ['hp', 'atk', 'def', 'spa', 'spd', 'spe'];
@@ -886,6 +903,16 @@ function refineDefensePair(
   // "solve for the EV where this hit is an average roll".
   const bestAt = (hp: number, statKey: 'def' | 'spd', catObs: DamageObservation[], nature: string, priorFit: number, scale: number) => {
     const priorStat = priorEvs[statKey] || 0;
+    // If the PRIOR stat value doesn't actually violate at this hp, leave it
+    // alone — don't go hunting for a "more centered" replacement when
+    // there's no contradiction to resolve. Otherwise a category that
+    // already fit fine could still drift toward a marginally-more-robust
+    // number purely because HP moved to satisfy the OTHER category.
+    const priorEvsHere = allocateDonors(priorEvs, { hp, [statKey]: priorStat }, donors, floors);
+    if (priorEvsHere) {
+      const { v: priorVHere } = totalViolationDefense(gen, ms, byKey, priorEvsHere, catObs, nature);
+      if (priorVHere <= KEEP_THRESHOLD) return { ev: priorStat, v: priorVHere };
+    }
     let best = { ev: priorStat, fit: priorFit, score: priorFit };
     for (let ev = 0; ev <= EV_MAX; ev += EV_STEP) {
       const evs = allocateDonors(priorEvs, { hp, [statKey]: ev }, donors, floors);

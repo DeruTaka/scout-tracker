@@ -550,3 +550,81 @@ describe('Def and SpD are refined jointly, not as two independent passes that ov
     expect(hp === 0 && (def === 0 || spd === 0)).toBe(false);
   });
 });
+
+describe('joint defense search stays robust and does not perturb an already-fine category', () => {
+  // Reproduces smogtours-gen9ubers-956423: a single physical hit that's
+  // impossible under 0 Def (52% vs a 55.3-65.2% floor) alongside two special
+  // hits that already fit the 0-SpD prior fine. Two regressions this guards
+  // against: (1) an earlier version chased the exact roll MIDPOINT and
+  // landed on an extreme, edge-case Def value (156) instead of a robust one
+  // — but a uniform 16-roll distribution gives no likelihood reason to
+  // prefer the midpoint over any other in-range point, so that's the wrong
+  // criterion; (2) SpD drifted away from its already-fitting prior (4) to
+  // 12 purely chasing marginal robustness, despite zero actual violation.
+  function zacian(): MatchedSet {
+    return {
+      species: 'Zacian-Crowned', baseSpecies: 'Zacian-Crowned', level: 100, shiny: false,
+      moves: ['Behemoth Blade'], revealedMoves: ['Behemoth Blade'],
+      item: 'Rusted Sword', itemRevealed: true, ability: 'Intrepid Sword',
+      nature: 'Jolly', evs: { atk: 252, spd: 4, spe: 252 },
+      confidence: 0.7, notes: [], evSource: 'dex-set', choicePossible: true,
+    };
+  }
+  function koraidon(): MatchedSet {
+    return {
+      species: 'Koraidon', baseSpecies: 'Koraidon', level: 100, shiny: false,
+      moves: ['Flame Charge'], revealedMoves: ['Flame Charge'],
+      item: undefined, itemRevealed: false, ability: 'Orichalcum Pulse',
+      nature: 'Jolly', evs: { atk: 252, def: 4, spe: 252 },
+      confidence: 0.6, notes: [], evSource: 'dex-set', choicePossible: true, tera: 'Fire',
+    };
+  }
+  function kyogre(): MatchedSet {
+    return {
+      species: 'Kyogre', baseSpecies: 'Kyogre', level: 100, shiny: false,
+      moves: ['Ice Beam', 'Thunder'], revealedMoves: ['Ice Beam', 'Thunder'],
+      item: undefined, itemRevealed: false, ability: 'Drizzle',
+      nature: 'Modest', evs: { spa: 252, spe: 4 },
+      confidence: 0.6, notes: [], evSource: 'dex-set', choicePossible: true,
+    };
+  }
+  const fieldBase = {
+    attackerBoosts: {}, defenderBoosts: {}, reflect: false, lightScreen: false,
+    auroraVeil: false, attackerHpPercent: 76, defenderHpPercent: 94,
+  };
+  function physHit(): DamageObservation {
+    return {
+      turn: 14, attackerSide: 'p1', attackerSpecies: 'Koraidon', defenderSide: 'p2',
+      defenderSpecies: 'Zacian-Crowned', move: 'Flame Charge', observedPercent: 52,
+      koCapped: false, field: { ...fieldBase, attackerTera: 'Fire' }, crit: false, usable: true,
+    };
+  }
+  function specHitIceBeam(): DamageObservation {
+    return {
+      turn: 20, attackerSide: 'p1', attackerSpecies: 'Kyogre', defenderSide: 'p2',
+      defenderSpecies: 'Zacian-Crowned', move: 'Ice Beam', observedPercent: 13,
+      koCapped: false, field: fieldBase, crit: false, usable: true,
+    };
+  }
+  function specHitThunder(): DamageObservation {
+    return {
+      turn: 22, attackerSide: 'p1', attackerSpecies: 'Kyogre', defenderSide: 'p2',
+      defenderSpecies: 'Zacian-Crowned', move: 'Thunder', observedPercent: 23,
+      koCapped: true, field: fieldBase, crit: false, usable: true,
+    };
+  }
+
+  it('derives a robust Def value and leaves the already-fitting SpD untouched', () => {
+    const zac = zacian();
+    const teams: SideSets[] = [
+      { side: 'p1', sets: [koraidon(), kyogre()] },
+      { side: 'p2', sets: [zac] },
+    ];
+    deriveEvs(9, teams, [physHit(), specHitIceBeam(), specHitThunder()]);
+    expect(zac.evs.def).toBeGreaterThan(0);
+    expect(zac.evs.def).toBeLessThan(100); // NOT the edge-case extreme (156)
+    expect(zac.evs.spd).toBe(4); // untouched — was already fine, never violated
+    const total = (['hp', 'atk', 'def', 'spa', 'spd', 'spe'] as const).reduce((s, k) => s + (zac.evs[k] ?? 0), 0);
+    expect(total).toBe(508);
+  });
+});
