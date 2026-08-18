@@ -101,6 +101,22 @@ export function isForme(gen: Generation, setKey: string): boolean {
   return !!(sp && sp.baseSpecies && sp.baseSpecies !== sp.name);
 }
 
+/**
+ * Filename slug for play.pokemonshowdown.com/sprites/gen5/<slug>.png. NOT
+ * simply toID(displayName) — Showdown IDs the base species and forme
+ * SEPARATELY then joins with one hyphen, which only matters when a name has
+ * an internal hyphen that isn't a forme separator (Ho-Oh -> "hooh", not
+ * "ho-oh") or a forme whose own name has a hyphen (Necrozma-Dusk-Mane ->
+ * "necrozma-duskmane", not "necrozma-dusk-mane" or "necrozmaduskmane").
+ */
+export function spriteSlug(gen: Generation, name: string): string {
+  const sp = gen.species.get(name.replace(/-\*$/, ''));
+  if (!sp) return toID(name);
+  const base = toID(sp.baseSpecies || sp.name);
+  const forme = sp.baseSpecies && sp.baseSpecies !== sp.name && sp.forme ? toID(sp.forme) : '';
+  return forme ? `${base}-${forme}` : base;
+}
+
 /** Human-readable move name from any id/name. */
 export function moveName(gen: Generation, nameOrId: string): string {
   const m = gen.moves.get(nameOrId);

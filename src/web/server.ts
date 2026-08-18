@@ -7,6 +7,7 @@ import type { Config } from '../config.js';
 import type { ScoutedReplay } from '../types.js';
 import { ingestReplays, previewReplay, writeOutputs, scoutUserReplays } from '../ingest.js';
 import { googleConfigFromEnv, googleAuthConfigured } from '../sheet/google-sheets.js';
+import { getGen, spriteSlug } from '../data/dex.js';
 
 function splitInputs(text: string): string[] {
   return String(text || '')
@@ -118,12 +119,17 @@ export function startServer(store: Datastore, config: Config, port: number): voi
     if (!player) { res.status(400).json({ error: 'player is required' }); return; }
     const formatid = req.query.formatid ? String(req.query.formatid) : undefined;
     const usage = store.getPlayerUsage(player, formatid);
+    if (usage) {
+      const gen = getGen(9); // sprite/forme data is stable across modern gens
+      for (const s of usage.species) (s as any).sprite = spriteSlug(gen, s.species);
+    }
     res.json({ usage });
   });
 
   app.get('/api/teams', (_req, res) => {
     const teams = [];
     for (const r of store.replays) {
+      const gen = getGen(r.gen);
       for (const t of r.teams) {
         teams.push({
           replayId: r.id,
@@ -137,7 +143,7 @@ export function startServer(store: Datastore, config: Config, port: number): voi
           winner: r.winner,
           result: r.winner ? (r.winner === t.player ? 'W' : 'L') : '',
           paste: t.paste,
-          mons: t.sets.map((s) => ({ species: s.species, unrevealed: !!s.unrevealed })),
+          mons: t.sets.map((s) => ({ species: s.species, sprite: spriteSlug(gen, s.species), unrevealed: !!s.unrevealed })),
         });
       }
     }

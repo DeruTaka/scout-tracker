@@ -77,7 +77,34 @@
   input:focus, select:focus { outline:none; border-color:var(--accent); box-shadow:0 0 0 4px var(--accent-soft); }
   .field.grow { flex:1 1 200px; }
   .field.grow input { width:100%; }
-  .count { margin-left:auto; align-self:flex-end; color:var(--muted); font-size:12.5px; padding-bottom:9px; white-space:nowrap; }
+  .count { align-self:flex-end; color:var(--muted); font-size:12.5px; padding-bottom:9px; white-space:nowrap; }
+  .toolbar-actions { margin-left:auto; align-self:flex-end; display:flex; gap:8px; }
+  .btn-ghost { font-family:inherit; font-size:12.5px; font-weight:600; border-radius:9px; padding:8px 13px; cursor:pointer;
+    border:1px solid var(--line); background:var(--surface); color:var(--text); transition:all .14s; white-space:nowrap; }
+  .btn-ghost:hover { border-color:var(--accent); color:var(--accent); }
+  .btn-ghost:disabled { opacity:.5; cursor:default; }
+  .btn-ghost:disabled:hover { border-color:var(--line); color:var(--text); }
+
+  /* Sprites */
+  .sprite { width:24px; height:24px; object-fit:contain; vertical-align:middle; flex:none; image-rendering:pixelated; }
+  .sprite.sm { width:20px; height:20px; }
+
+  /* Export modal */
+  .modal-backdrop { position:fixed; inset:0; background:rgba(10,12,20,.55); backdrop-filter:blur(2px); z-index:50;
+    display:none; align-items:flex-start; justify-content:center; padding:8vh 20px 40px; overflow-y:auto; }
+  .modal-backdrop.open { display:flex; }
+  .modal { background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); box-shadow:var(--shadow);
+    width:100%; max-width:720px; padding:20px; animation:rise .2s ease both; }
+  .modal-head { display:flex; align-items:center; gap:10px; margin-bottom:12px; }
+  .modal-head h2 { margin:0; font-size:16px; font-weight:700; flex:1; }
+  .modal-close { width:30px; height:30px; display:grid; place-items:center; border-radius:9px; border:1px solid var(--line);
+    background:var(--surface-2); color:var(--muted); cursor:pointer; }
+  .modal-close:hover { color:var(--text); border-color:var(--accent); }
+  .modal textarea { width:100%; height:340px; resize:vertical; background:var(--surface-2); color:var(--text);
+    border:1px solid var(--line); border-radius:10px; padding:12px; font:12px/1.5 var(--mono); }
+  .modal .modal-actions { display:flex; gap:10px; margin-top:12px; }
+  .modal .modal-actions button { flex:none; }
+  .modal .hint { color:var(--muted); font-size:12px; margin:0 0 10px; }
 
   /* Player usage panel */
   #playerUsage:empty { display:none; }
@@ -178,12 +205,34 @@
           <option value="mon">Pokémon (A–Z)</option>
         </select></div>
         <div class="count" id="count"></div>
+        <div class="toolbar-actions">
+          <button class="btn-ghost" id="exportBtn">Export shown teams</button>
+        </div>
       </div>
       <div id="playerUsage"></div>
       <div id="list"><div class="loading">loading teams…</div></div>
     </div>
   </div>
 </div>
+
+<div class="modal-backdrop" id="exportModal">
+  <div class="modal">
+    <div class="modal-head">
+      <h2 id="exportTitle">Export teams</h2>
+      <button class="modal-close" id="exportClose" title="Close" aria-label="Close">✕</button>
+    </div>
+    <p class="hint">Multi-team PokePaste format — paste directly into <a href="https://pokepast.es" target="_blank">pokepast.es</a>, or open it there in one click.</p>
+    <textarea id="exportText" readonly></textarea>
+    <div class="modal-actions">
+      <button id="exportCopy">Copy all</button>
+      <button id="exportPokepaste">Open in PokePaste ↗</button>
+    </div>
+  </div>
+</div>
+<form id="pokepasteForm" method="post" action="https://pokepast.es/create" target="_blank" style="display:none">
+  <input type="hidden" name="paste" id="pokepasteInput" />
+  <input type="hidden" name="title" id="pokepasteTitle" />
+</form>
 
 <script>
 const $ = (id) => document.getElementById(id);
@@ -200,6 +249,7 @@ $('themeBtn').onclick = toggleTheme;
 paintThemeBtn();
 
 let ALL = [];
+let CURRENT_ROWS = [];
 
 function wireCopy(scope){
   scope.querySelectorAll('button[data-paste]').forEach((b)=>{
@@ -207,21 +257,64 @@ function wireCopy(scope){
   });
 }
 
+// `slug` comes from the server (spriteSlug in src/data/dex.ts), which uses
+// real dex forme data — a client-side guess from the display name alone
+// gets formes wrong (e.g. "Ho-Oh" vs "Necrozma-Dusk-Mane" hyphenate
+// differently in Showdown's actual sprite filenames than either naive rule).
+function spriteImg(slug, cls){ return `<img class="sprite ${cls||''}" src="https://play.pokemonshowdown.com/sprites/gen5/${esc(slug)}.png" alt="" loading="lazy" onerror="this.style.visibility='hidden'" />`; }
+
 function teamCard(t){
   const badge = t.result ? `<span class="badge ${t.result==='W'?'badge-win':'badge-loss'}" title="${t.result==='W'?'Won':'Lost'}">${t.result}</span>` : '';
   const mons = t.mons.map((m)=> m.unrevealed
     ? `<span class="mon-chip unrevealed" title="Never appeared in the replay">${esc(m.species)}</span>`
-    : `<span class="mon-chip" data-mon="${esc(m.species)}">${esc(m.species)}</span>`).join('');
+    : `<span class="mon-chip" data-mon="${esc(m.species)}">${spriteImg(m.sprite,'sm')}${esc(m.species)}</span>`).join('');
   return `<div class="team-card card">
     <div class="tc-head"><span class="player">${esc(t.player)}</span>${badge}<span class="chip">${esc(t.format)}</span></div>
     <div class="tc-meta">${esc(t.date||'—')} · <a href="${esc(t.url)}" target="_blank">${esc(t.replayId)}</a>${t.winner?(' · winner: '+esc(t.winner)):''}</div>
     <div class="mons">${mons}</div>
     <div class="tc-foot">
       <button data-paste="${encodeURIComponent(t.paste)}">Copy paste</button>
+      <button class="pp-btn" data-paste="${encodeURIComponent(t.paste)}" data-title="${esc(`${t.player} - ${t.format}${t.date ? ' - '+t.date : ''}`)}">PokePaste ↗</button>
       <details class="paste-toggle"><summary>Show paste</summary><div class="paste-holder"></div></details>
     </div>
   </div>`;
 }
+
+function wirePokepaste(scope){
+  scope.querySelectorAll('button.pp-btn[data-paste]').forEach((b)=>{
+    b.onclick = () => {
+      $('pokepasteInput').value = decodeURIComponent(b.dataset.paste);
+      $('pokepasteTitle').value = b.dataset.title || '';
+      $('pokepasteForm').submit();
+    };
+  });
+}
+
+// PokePaste's own multi-team format: "=== [Title] ===" section headers,
+// each followed by a normal team paste — this is what pokepast.es itself
+// splits on, so a doc built this way imports there as separate teams.
+function buildMassExport(rows){
+  return rows.map((t)=> `=== [${t.player} - ${t.format}${t.date ? ' - '+t.date : ''}] ===\n\n${t.paste.trimEnd()}`).join('\n\n');
+}
+
+function openExportModal(rows, title){
+  const text = buildMassExport(rows);
+  $('exportTitle').textContent = title;
+  $('exportText').value = text;
+  $('exportModal').classList.add('open');
+}
+$('exportBtn').onclick = () => openExportModal(CURRENT_ROWS, `Export ${CURRENT_ROWS.length} team${CURRENT_ROWS.length===1?'':'s'}`);
+$('exportClose').onclick = () => $('exportModal').classList.remove('open');
+$('exportModal').addEventListener('click', (e)=>{ if (e.target.id === 'exportModal') $('exportModal').classList.remove('open'); });
+$('exportCopy').onclick = () => {
+  navigator.clipboard.writeText($('exportText').value);
+  const b = $('exportCopy'); const t = b.textContent; b.textContent = 'Copied!'; setTimeout(()=>b.textContent=t, 1200);
+};
+$('exportPokepaste').onclick = () => {
+  $('pokepasteInput').value = $('exportText').value;
+  $('pokepasteTitle').value = $('exportTitle').textContent;
+  $('pokepasteForm').submit();
+};
 
 // Comma-separated -> lowercase term list, e.g. "crying, Fc" -> ['crying','fc']
 function parseTerms(v){ return v.split(',').map((s)=>s.trim().toLowerCase()).filter(Boolean); }
@@ -251,7 +344,10 @@ function render(){
     }
   });
 
+  CURRENT_ROWS = rows;
   $('count').textContent = `${rows.length} of ${ALL.length} team${ALL.length===1?'':'s'}`;
+  $('exportBtn').textContent = `Export shown teams (${rows.length})`;
+  $('exportBtn').disabled = !rows.length;
   const list = $('list');
   if (!rows.length) { list.innerHTML = `<div class="card empty"><h3>No teams match</h3><div>Try clearing the filters, or scout a replay first.</div></div>`; return; }
   list.innerHTML = `<div class="grid">${rows.map(teamCard).join('')}</div>`;
@@ -271,6 +367,7 @@ function render(){
     c.onclick = () => { $('qMon').value = c.dataset.mon; render(); };
   });
   wireCopy(list);
+  wirePokepaste(list);
   updatePlayerUsage(qUsers, qMeta);
 }
 
@@ -284,12 +381,31 @@ function breakdown(list){
 
 function usageMonCard(s){
   return `<div class="usage-mon">
-    <div class="usage-mon-head"><span class="name">${esc(s.species)}</span><span class="pct">${Math.round(s.usagePercent)}%</span></div>
+    <div class="usage-mon-head">${spriteImg(s.sprite,'sm')}<span class="name">${esc(s.species)}</span><span class="pct">${Math.round(s.usagePercent)}%</span></div>
     <div class="breakdown">${esc(s.topSet.nature||'')} ${esc(evStr(s.topSet.evs))}</div>
     <div class="breakdown">Item: ${breakdown(s.items)}</div>
     <div class="breakdown">Ability: ${breakdown(s.abilities)}</div>
     ${s.teras.length ? `<div class="breakdown">Tera: ${breakdown(s.teras)}</div>` : ''}
   </div>`;
+}
+
+function plainBreakdown(list){
+  if (!list.length) return '—';
+  return list.slice(0,3).map((x)=> `${x.name} ${Math.round(x.percent)}%`).join(', ');
+}
+
+// Plain-text summary, same spirit as a team paste — meant to be copy/pasted
+// into a chat or notes doc, not re-imported anywhere.
+function buildUsageExport(u){
+  const head = `${u.player}'s usage — across ${u.totalTeams} scouted team${u.totalTeams===1?'':'s'}${u.formatid?' ('+u.formatid+')':''}`;
+  const body = u.species.map((s)=>
+    `${s.species} — ${Math.round(s.usagePercent)}%\n` +
+    `  Spread: ${s.topSet.nature||''} ${evStr(s.topSet.evs)}\n` +
+    `  Item: ${plainBreakdown(s.items)}\n` +
+    `  Ability: ${plainBreakdown(s.abilities)}` +
+    (s.teras.length ? `\n  Tera: ${plainBreakdown(s.teras)}` : '')
+  ).join('\n\n');
+  return `${head}\n\n${body}`;
 }
 
 let usageRequestId = 0;
@@ -304,9 +420,12 @@ async function updatePlayerUsage(qUsers, qMeta){
     if (!r.usage) { panel.innerHTML = ''; return; }
     const u = r.usage;
     panel.innerHTML = `<div class="card usage-card">
-      <div class="usage-head"><h2>${esc(u.player)}'s usage</h2><span class="muted">across ${u.totalTeams} scouted team${u.totalTeams===1?'':'s'}${u.formatid?' · '+esc(u.formatid):''}</span></div>
+      <div class="usage-head"><h2>${esc(u.player)}'s usage</h2><span class="muted">across ${u.totalTeams} scouted team${u.totalTeams===1?'':'s'}${u.formatid?' · '+esc(u.formatid):''}</span>
+        <button data-paste="${encodeURIComponent(buildUsageExport(u))}" style="margin-left:auto">Copy usage</button>
+      </div>
       <div class="usage-grid">${u.species.map(usageMonCard).join('')}</div>
     </div>`;
+    wireCopy(panel);
   } catch { if (myId === usageRequestId) panel.innerHTML = ''; }
 }
 
