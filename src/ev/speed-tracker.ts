@@ -4,6 +4,7 @@
 // equal move priority, with nothing else deciding the order (Trick Room noted
 // separately; Quick Claw/Custap Berry/Quick Draw excluded outright), proves
 // one had strictly higher effective Speed at that moment.
+import type { Generation } from '@pkmn/data';
 import type { Replay, SpeedObservation, StatsTable } from '../types.js';
 import { getGen, resolveSpecies, toID } from '../data/dex.js';
 
@@ -38,6 +39,39 @@ function sideOf(slot: string): Side {
 }
 function fields(line: string): string[] {
   return line.slice(1).split('|');
+}
+/** A switch/drag's HP field carries the mon's current status too (e.g.
+ *  "100/100 par") when re-entering already afflicted — Showdown doesn't
+ *  re-emit |-status| for a condition the mon already had, so a paralyzed mon
+ *  switching back out and in would otherwise silently look un-paralyzed,
+ *  hiding its 0.5x Speed penalty from every observation after that switch. */
+function parseStatusSuffix(field: string | undefined): string | undefined {
+  if (!field) return undefined;
+  const m = /\b(par|psn|tox|brn|slp|frz)\b/.exec(field);
+  return m ? m[1] : undefined;
+}
+
+/**
+ * Abilities that bump a move into a different effective priority bracket (or,
+ * for Mycelium Might, make it act as if last within its own bracket) without
+ * changing the move's own dex priority value at all — so comparing raw
+ * `move.priority` between two actions misses them entirely. We can't always
+ * be sure WHICH ability a mon actually has, so this checks every ability the
+ * species COULD have; if any of them would apply here, the turn order isn't
+ * proof of relative Speed and gets excluded, same as a Quick Claw proc.
+ */
+function abilityMayAlterPriority(gen: Generation, setKey: string, move: { category: string; type: string; flags?: { heal?: number } }): boolean {
+  const species = gen.species.get(setKey);
+  if (!species) return false;
+  const abilities = (Object.values(species.abilities) as string[]).map(toID);
+  const isStatus = move.category === 'Status';
+  return abilities.some((a) => {
+    if (a === 'prankster' && isStatus) return true;
+    if (a === 'myceliummight' && isStatus) return true;
+    if (a === 'galewings' && move.type === 'Flying') return true;
+    if (a === 'triage' && !!move.flags?.heal) return true;
+    return false;
+  });
 }
 
 export function extractSpeedObservations(replay: Replay): SpeedObservation[] {
@@ -88,7 +122,7 @@ export function extractSpeedObservations(replay: Replay): SpeedObservation[] {
         if (!slot) break;
         const speciesSeen = (f[2] || '').split(',')[0]!.trim();
         const { setKey } = resolveSpecies(gen, speciesSeen);
-        slots[slot] = { side: sideOf(slot), setKey, boosts: {} };
+        slots[slot] = { side: sideOf(slot), setKey, boosts: {}, status: parseStatusSuffix(f[3]) };
         break;
       }
       case '-boost':
@@ -145,6 +179,9 @@ export function extractSpeedObservations(replay: Replay): SpeedObservation[] {
         const move = gen.moves.get(toID(f[2] || '') as any);
         if (!move) break;
         const s = slots[slot];
+        if (abilityMayAlterPriority(gen, s.setKey, move as unknown as { category: string; type: string; flags?: { heal?: number } })) {
+          procTainted = true;
+        }
         actions.push({
           slot, side: s.side, setKey: s.setKey, priority: move.priority,
           boosts: { ...s.boosts }, status: s.status, tera: s.tera,

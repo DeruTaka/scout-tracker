@@ -657,6 +657,15 @@ function refineDefense(
   const floors: Partial<Record<keyof StatsTable, number>> = { spe: ms.speedFloor ?? 0 };
   const natures = [...new Set([priorNature, ...DEFENSE_NATURE_CANDIDATES[stat]])];
   let best = { evs: priorEvs, nature: priorNature, v: priorV, score: priorV };
+  // Track the lowest-violation candidate seen too, separately from the min-
+  // score one: @smogon/calc's damage rolls are discrete, so violation often
+  // sits on a flat plateau (a range of EV values that all barely move it) and
+  // only drops sharply once a candidate crosses the roll's rounding boundary.
+  // A cheap point ON that plateau can out-score the point that actually
+  // clears it, purely because the real fix costs a bit more deviation — which
+  // would silently discard a candidate that genuinely explains the hit in
+  // favor of one that doesn't explain it at all.
+  let bestByFit = best;
   const searchHp = (hpCandidates: number[]) => {
     for (const nature of natures) {
       const natCost = (nature === priorNature ? 0 : NATURE_PENALTY) * scale;
@@ -668,6 +677,7 @@ function refineDefense(
           const dev = totalDeviation(evs, priorEvs);
           const score = v + LAMBDA * scale * dev + natCost;
           if (score < best.score - 1e-6) best = { evs, nature, v, score };
+          if (v < bestByFit.v - 1e-9) bestByFit = { evs, nature, v, score };
         }
       }
     }
@@ -697,6 +707,11 @@ function refineDefense(
   } else {
     searchHp([...new Set([priorEvs.hp || 0, 0, 248, 252])].filter((h) => h <= EV_MAX));
   }
+  // If the min-score candidate doesn't clear the adoption bar on its own, but
+  // a costlier candidate elsewhere in the search resolves the violation
+  // enough to clear that bar by itself, prefer it — a real explanation for
+  // the hit beats a cheap non-explanation that only wins on paper.
+  if (priorV - best.v < KEEP_THRESHOLD && priorV - bestByFit.v >= KEEP_THRESHOLD) best = bestByFit;
   const changed = totalDeviation(best.evs, priorEvs) > 1e-9 || best.nature !== priorNature;
   const improvement = priorV - best.v;
   if (!changed || improvement < KEEP_THRESHOLD) {

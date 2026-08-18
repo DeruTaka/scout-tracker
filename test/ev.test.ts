@@ -116,10 +116,26 @@ describe('defense EV search trades Speed for bulk when the prior is already maxe
     };
   }
 
-  it('stays conservative on a single ambiguous hit (avoids overfitting one data point)', () => {
+  it('derives bulk from a SINGLE hit when it is impossible under the prior, not just marginally low', () => {
+    // 52% is below even the worst possible roll (55.3%) for a 0 HP / 0 Def
+    // Zacian — that's not "one noisy data point", it's a mathematical
+    // certainty that some bulk exists, even from n=1.
     const zac = zacian();
     const teams: SideSets[] = [{ side: 'p1', sets: [koraidon()] }, { side: 'p2', sets: [zac] }];
     deriveEvs(9, teams, [hit()]);
+    expect(zac.evs).not.toEqual({ atk: 252, spd: 4, spe: 252 });
+    expect((zac.evs.hp ?? 0) + (zac.evs.def ?? 0)).toBeGreaterThan(0);
+    const total = (['hp', 'atk', 'def', 'spa', 'spd', 'spe'] as const).reduce((s, k) => s + (zac.evs[k] ?? 0), 0);
+    expect(total).toBe(508);
+    expect(zac.notes.some((n) => n.includes('Derived HP/DEF'))).toBe(true);
+  });
+
+  it('stays fully conservative on a single hit that is only marginally low (within rounding tolerance)', () => {
+    // 54% is only 1.3 points under the 55.3% floor — inside TOL, i.e.
+    // genuinely indistinguishable from HP%-rounding noise on the 0/0 prior.
+    const zac = zacian();
+    const teams: SideSets[] = [{ side: 'p1', sets: [koraidon()] }, { side: 'p2', sets: [zac] }];
+    deriveEvs(9, teams, [{ ...hit(), observedPercent: 54 }]);
     expect(zac.evs).toEqual({ atk: 252, spd: 4, spe: 252 });
   });
 

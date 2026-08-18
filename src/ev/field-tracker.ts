@@ -43,6 +43,18 @@ function slotKey(token: string): string | null {
 function sideOf(slot: string): Side {
   return slot.slice(0, 2) as Side;
 }
+/**
+ * A switch/drag's HP field carries the mon's CURRENT status too (e.g.
+ * "100/100 par") when it's switching in already afflicted — Showdown doesn't
+ * re-emit a fresh |-status| for a condition the mon already had before it
+ * left the field, so this is the only signal that it's still paralyzed/
+ * burned/poisoned/etc. on re-entry.
+ */
+function parseStatusSuffix(field: string | undefined): string | undefined {
+  if (!field) return undefined;
+  const m = /\b(par|psn|tox|brn|slp|frz)\b/.exec(field);
+  return m ? m[1] : undefined;
+}
 function parseHp(field: string | undefined): number | null {
   if (!field) return null;
   if (/\bfnt\b/.test(field) || field.startsWith('0 ')) return 0;
@@ -79,7 +91,7 @@ export function extractObservations(replay: Replay): DamageObservation[] {
   let turn = 0;
   let pending: Pending | null = null;
 
-  const setActive = (slot: string, speciesSeen: string, hp: number | null) => {
+  const setActive = (slot: string, speciesSeen: string, hp: number | null, status: string | undefined) => {
     const { setKey } = resolveSpecies(gen, speciesSeen);
     slots[slot] = {
       side: sideOf(slot),
@@ -87,6 +99,7 @@ export function extractObservations(replay: Replay): DamageObservation[] {
       hp: hp ?? 100,
       boosts: {},
       subActive: false,
+      status,
     };
   };
 
@@ -128,7 +141,7 @@ export function extractObservations(replay: Replay): DamageObservation[] {
       case 'drag':
       case 'replace': {
         const slot = slotKey(f[1] || '');
-        if (slot) setActive(slot, (f[2] || '').split(',')[0]!.trim(), parseHp(f[3]));
+        if (slot) setActive(slot, (f[2] || '').split(',')[0]!.trim(), parseHp(f[3]), parseStatusSuffix(f[3]));
         finishPending();
         break;
       }
