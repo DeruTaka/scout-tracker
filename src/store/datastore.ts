@@ -72,6 +72,9 @@ export interface PlayerSpeciesUsage {
   abilities: { name: string; percent: number }[];
   natures: { name: string; percent: number }[];
   teras: { name: string; percent: number }[];
+  wins: number; // replays with this species where the player won (winner recorded)
+  losses: number; // replays with this species where the player lost (winner recorded)
+  winPercent: number; // wins / (wins + losses) * 100; 0 if no decided replays
 }
 
 export interface PlayerUsage {
@@ -233,6 +236,25 @@ export class Datastore {
       (bySpecies.get(k) ?? bySpecies.set(k, []).get(k)!).push(u);
     }
 
+    // Win/loss per species: dedupe source replay ids ACROSS a species' distinct
+    // uniqueSet hashes first (the same replay must only count once even if the
+    // trainer's build for this species happened to hash differently elsewhere),
+    // then check each resolved replay's recorded winner against the trainer's
+    // own name — same equality pattern as sheet/rows.ts's result().
+    const winLoss = (group: UniqueSet[]) => {
+      const replayIds = new Set<string>();
+      for (const u of group) for (const id of u.sources) replayIds.add(id);
+      let wins = 0;
+      let losses = 0;
+      for (const id of replayIds) {
+        const r = this.data.replays[id];
+        if (!r || !r.winner) continue;
+        if (r.winner === group[0]!.player) wins++;
+        else losses++;
+      }
+      return { wins, losses, winPercent: wins + losses ? (wins / (wins + losses)) * 100 : 0 };
+    };
+
     const tally = (group: UniqueSet[], totalUses: number, pick: (u: UniqueSet) => string | undefined) => {
       const m = new Map<string, number>();
       for (const u of group) {
@@ -249,6 +271,7 @@ export class Datastore {
     for (const group of bySpecies.values()) {
       const totalUses = group.reduce((s, u) => s + u.count, 0);
       const top = [...group].sort((a, b) => b.count - a.count)[0]!;
+      const { wins, losses, winPercent } = winLoss(group);
       species.push({
         species: top.species,
         baseSpecies: top.baseSpecies,
@@ -259,6 +282,9 @@ export class Datastore {
         abilities: tally(group, totalUses, (u) => u.set.ability),
         natures: tally(group, totalUses, (u) => u.set.nature),
         teras: tally(group, totalUses, (u) => u.set.tera),
+        wins,
+        losses,
+        winPercent,
       });
     }
     species.sort((a, b) => b.usagePercent - a.usagePercent);

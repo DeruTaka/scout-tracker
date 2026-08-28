@@ -176,6 +176,10 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8"/></svg>
         Teams
       </a>
+      <a class="nav-item" href="/counter">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4l6 6-6 6M4 20l6-6-6-6"/></svg>
+        Counter-team
+      </a>
       <a class="nav-item" href="/sheet">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M3 15h18M9 3v18M15 3v18"/></svg>
         Sheet
@@ -380,12 +384,14 @@ function breakdown(list){
 }
 
 function usageMonCard(s){
+  const record = (s.wins || s.losses) ? `<div class="breakdown">Record: ${s.wins}-${s.losses} (${Math.round(s.winPercent)}% win)</div>` : '';
   return `<div class="usage-mon">
     <div class="usage-mon-head">${spriteImg(s.sprite,'sm')}<span class="name">${esc(s.species)}</span><span class="pct">${Math.round(s.usagePercent)}%</span></div>
     <div class="breakdown">${esc(s.topSet.nature||'')} ${esc(evStr(s.topSet.evs))}</div>
     <div class="breakdown">Item: ${breakdown(s.items)}</div>
     <div class="breakdown">Ability: ${breakdown(s.abilities)}</div>
     ${s.teras.length ? `<div class="breakdown">Tera: ${breakdown(s.teras)}</div>` : ''}
+    ${record}
   </div>`;
 }
 
@@ -408,6 +414,33 @@ function buildUsageExport(u){
   return `${head}\n\n${body}`;
 }
 
+// Rank/Pokemon/Use/Usage%/Win% box table, matching the format tournament
+// stats pages typically export in — padded pipe columns with a "+----+"
+// separator row, sized to the actual content rather than fixed widths.
+function buildUsageTable(u){
+  const rows = u.species.map((s, i) => ({
+    rank: String(i + 1),
+    name: s.species,
+    use: String(s.count),
+    usage: s.usagePercent.toFixed(2) + '%',
+    win: s.winPercent.toFixed(2) + '%',
+  }));
+  const cols = [
+    { key: 'rank', label: 'Rank', align: 'left' },
+    { key: 'name', label: 'Pokemon', align: 'left' },
+    { key: 'use', label: 'Use', align: 'right' },
+    { key: 'usage', label: 'Usage %', align: 'right' },
+    { key: 'win', label: 'Win %', align: 'right' },
+  ];
+  const widths = cols.map((c) => Math.max(c.label.length, ...rows.map((r) => r[c.key].length)));
+  const pad = (s, w, align) => (align === 'left' ? s.padEnd(w) : s.padStart(w));
+  const line = (cells) => '| ' + cells.map((c, i) => pad(c, widths[i], cols[i].align)).join(' | ') + ' |';
+  const sep = '+ ' + widths.map((w) => '-'.repeat(w)).join(' + ') + ' +';
+  const header = line(cols.map((c) => c.label));
+  const body = rows.map((r) => line(cols.map((c) => r[c.key])));
+  return [header, sep, ...body].join('\n');
+}
+
 let usageRequestId = 0;
 async function updatePlayerUsage(qUsers, qMeta){
   const panel = $('playerUsage');
@@ -422,6 +455,7 @@ async function updatePlayerUsage(qUsers, qMeta){
     panel.innerHTML = `<div class="card usage-card">
       <div class="usage-head"><h2>${esc(u.player)}'s usage</h2><span class="muted">across ${u.totalTeams} scouted team${u.totalTeams===1?'':'s'}${u.formatid?' · '+esc(u.formatid):''}</span>
         <button data-paste="${encodeURIComponent(buildUsageExport(u))}" style="margin-left:auto">Copy usage</button>
+        <button data-paste="${encodeURIComponent(buildUsageTable(u))}">Copy usage (table)</button>
       </div>
       <div class="usage-grid">${u.species.map(usageMonCard).join('')}</div>
     </div>`;

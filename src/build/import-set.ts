@@ -3,16 +3,20 @@
 // known-correct build (see `scout pin`): unlike a scouted set, everything
 // here is taken as verified ground truth, not inferred from replay evidence.
 import { Sets } from '@pkmn/sets';
+import type { PokemonSet } from '@pkmn/sets';
 import type { Generation } from '@pkmn/data';
 import type { MatchedSet } from '../types.js';
 import { resolveSpecies } from '../data/dex.js';
 
-export function parsePasteToMatchedSet(gen: Generation, pasteText: string): MatchedSet {
-  const parsed = Sets.importSet(pasteText.trim());
+/** Map one `@pkmn/sets`-parsed set into a MatchedSet, treating it as fully
+ *  verified (no inference — every field came straight from the paste text).
+ *  Shared by `parsePasteToMatchedSet` (one mon) and `import-team.ts` (a
+ *  full multi-mon team paste). */
+export function matchedSetFromImported(gen: Generation, parsed: Partial<PokemonSet>, notes: string[]): MatchedSet {
   if (!parsed.species) throw new Error('Could not parse a species from the paste text.');
   const { display, setKey } = resolveSpecies(gen, parsed.species);
   const moves = (parsed.moves || []).filter((m): m is string => !!m);
-  if (moves.length === 0) throw new Error('Paste has no moves.');
+  if (moves.length === 0) throw new Error(`${parsed.species} has no moves in the paste.`);
 
   return {
     species: display,
@@ -31,8 +35,13 @@ export function parsePasteToMatchedSet(gen: Generation, pasteText: string): Matc
     ivs: parsed.ivs,
     tera: parsed.teraType || undefined,
     confidence: 1,
-    notes: ['Manually pinned as a verified build.'],
+    notes,
     evSource: 'derived',
     choicePossible: true,
   };
+}
+
+export function parsePasteToMatchedSet(gen: Generation, pasteText: string): MatchedSet {
+  const parsed = Sets.importSet(pasteText.trim());
+  return matchedSetFromImported(gen, parsed, ['Manually pinned as a verified build.']);
 }

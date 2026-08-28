@@ -7,7 +7,10 @@ import type { Config } from '../config.js';
 import type { ScoutedReplay } from '../types.js';
 import { ingestReplays, previewReplay, writeOutputs, scoutUserReplays, refreshStore } from '../ingest.js';
 import { googleConfigFromEnv, googleAuthConfigured } from '../sheet/google-sheets.js';
-import { getGen, spriteSlug } from '../data/dex.js';
+import { getGen, spriteSlug, genFromFormatId } from '../data/dex.js';
+import { buildThreatProfile } from '../matchup/threat-profile.js';
+import { buildCounterTeam } from '../matchup/team-builder.js';
+import { exportSet } from '../build/pokemon-set.js';
 
 function splitInputs(text: string): string[] {
   return String(text || '')
@@ -46,6 +49,7 @@ export function startServer(store: Datastore, config: Config, port: number): voi
   // Clean URLs for the extra pages.
   app.get('/sheet', (_req, res) => res.sendFile(fileURLToPath(new URL('./public/sheet.html', import.meta.url))));
   app.get('/teams', (_req, res) => res.sendFile(fileURLToPath(new URL('./public/teams.html', import.meta.url))));
+  app.get('/counter', (_req, res) => res.sendFile(fileURLToPath(new URL('./public/counter.html', import.meta.url))));
 
   app.get('/api/status', (_req, res) => {
     res.json({
@@ -140,6 +144,29 @@ export function startServer(store: Datastore, config: Config, port: number): voi
 
   app.get('/api/refresh', (_req, res) => {
     res.json(refreshJob ?? { running: false, done: 0, total: 0, currentId: '' });
+  });
+
+  app.post('/api/counter-team', async (req, res) => {
+    try {
+      const input = String(req.body?.input || '').trim();
+      if (!input) { res.status(400).json({ error: 'input is required (a usage table or a PokePaste URL)' }); return; }
+      const formatid = String(req.body?.formatid || 'gen9ubers').trim();
+      const gen = getGen(genFromFormatId(formatid));
+
+      const threats = await buildThreatProfile(gen, input);
+      const result = await buildCounterTeam(store, gen, formatid, threats);
+
+      for (const t of result.resolvedThreats) (t as any).sprite = spriteSlug(gen, t.set.species);
+      const team = result.team.map((pick) => ({
+        ...pick,
+        sprite: spriteSlug(gen, pick.set.species),
+        paste: exportSet(pick.set),
+      }));
+
+      res.json({ threats: result.threats, resolvedThreats: result.resolvedThreats, team });
+    } catch (e) {
+      res.status(400).json({ error: e instanceof Error ? e.message : String(e) });
+    }
   });
 
   app.get('/api/player-usage', (req, res) => {

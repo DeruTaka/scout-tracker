@@ -175,6 +175,14 @@ export async function getUsageSets(gen: Generation, formatid: string, speciesNam
   return out;
 }
 
+/** Every species Smogon tracked usage for in this format (one cached fetch,
+ *  not a per-species call) — a broad candidate pool for the counter-team
+ *  builder, supplementing whatever the app has locally scouted. */
+export async function getAllUsageSpecies(formatid: string): Promise<string[]> {
+  const chaos = await loadUsage(formatid);
+  return chaos ? Object.keys(chaos.data) : [];
+}
+
 /** A short human-readable usage summary for reference (attached as a note). */
 export async function getUsageSummary(gen: Generation, formatid: string, speciesName: string): Promise<string | null> {
   const chaos = await loadUsage(formatid);
