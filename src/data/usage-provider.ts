@@ -22,6 +22,8 @@ interface MonUsage {
   Abilities: Record<string, number>;
   Spreads: Record<string, number>;
   'Tera Types'?: Record<string, number>;
+  Teammates?: Record<string, number>;
+  'Raw count'?: number;
   usage: number;
 }
 interface Chaos {
@@ -181,6 +183,39 @@ export async function getUsageSets(gen: Generation, formatid: string, speciesNam
 export async function getAllUsageSpecies(formatid: string): Promise<string[]> {
   const chaos = await loadUsage(formatid);
   return chaos ? Object.keys(chaos.data) : [];
+}
+
+/** Real-metagame viability: this species' raw usage weight (roughly "fraction
+ *  of teams that ran it"), 0 if untracked/unplayed. NOT a percent — Koraidon
+ *  in gen9ubers is ~0.78, a never-played mon is ~0.0003 — but the relative
+ *  gap between real staples and noise is exactly what a "high usage in the
+ *  tier" filter needs. */
+export async function getUsageWeight(formatid: string, speciesName: string): Promise<number> {
+  const chaos = await loadUsage(formatid);
+  if (!chaos) return 0;
+  const u = lookup(chaos, speciesName);
+  return u?.usage ?? 0;
+}
+
+/** How often real teams pair `speciesName` with `teammate`, as a fraction of
+ *  `speciesName`'s own appearances (0..1-ish) — actual teammate co-occurrence
+ *  from Smogon's stats, not a guess. 0 if either species is untracked or the
+ *  pairing never appeared. */
+export async function getTeammateAffinity(formatid: string, speciesName: string, teammate: string): Promise<number> {
+  const chaos = await loadUsage(formatid);
+  if (!chaos) return 0;
+  const u = lookup(chaos, speciesName);
+  const raw = u?.['Raw count'];
+  const pair = u?.Teammates?.[teammate] ?? (u?.Teammates ? lookupKey(u.Teammates, teammate) : undefined);
+  if (!u || !raw || pair === undefined) return 0;
+  return Math.min(1, pair / raw);
+}
+
+function lookupKey(dict: Record<string, number>, name: string): number | undefined {
+  if (dict[name] !== undefined) return dict[name];
+  const id = toID(name);
+  for (const [k, v] of Object.entries(dict)) if (toID(k) === id) return v;
+  return undefined;
 }
 
 /** A short human-readable usage summary for reference (attached as a note). */

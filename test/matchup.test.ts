@@ -224,4 +224,39 @@ describe('buildCounterTeam', () => {
       expect(pick.rationale.length).toBeGreaterThan(0);
     }
   }, 20000);
+
+  it('completes a full 6-mon team even with a large candidate pool (regression: heuristic over-estimate stalling the search short of depth 6)', async () => {
+    const store = new Datastore('/nonexistent/matchup-team-store2.json');
+    const formatid = 'gen9customtest';
+
+    const threatSets: MatchedSet[] = [
+      mon({ species: 'Zacian-Crowned', baseSpecies: 'Zacian-Crowned', ability: 'Intrepid Sword', nature: 'Jolly', evs: { atk: 252, spe: 252 }, moves: ['Behemoth Blade'] }),
+      mon({ species: 'Koraidon', baseSpecies: 'Koraidon', ability: 'Orichalcum Pulse', nature: 'Jolly', evs: { atk: 252, spe: 252 }, moves: ['Scale Shot'] }),
+    ];
+    // A wide, varied pool — large enough to reproduce the real-world stall
+    // (which only showed up with dozens of real candidates, not a handful).
+    const pool = [
+      'Ho-Oh', 'Lunala', 'Eternatus', 'Arceus-Fairy', 'Ting-Lu', 'Landorus-Therian', 'Kyogre',
+      'Kingambit', 'Necrozma-Dusk-Mane', 'Arceus-Ground', 'Arceus-Water', 'Glimmora', 'Hatterene',
+      'Ribombee', 'Deoxys-Speed', 'Terapagos-Terastal', 'Flutter Mane', 'Chien-Pao', 'Great Tusk',
+      'Iron Treads', 'Gholdengo', 'Skeledirge', 'Annihilape', 'Gliscor', 'Blissey', 'Dondozo',
+      'Rayquaza', 'Mewtwo', 'Giratina-Origin', 'Groudon',
+    ];
+    const candidateSets = pool.map((species) =>
+      mon({ species, baseSpecies: species, ability: 'Pressure', nature: 'Bold', evs: { hp: 252, def: 252 }, moves: ['Body Press'], confidence: 0.7, evSource: 'derived' }),
+    );
+    for (let i = 0; i < candidateSets.length; i += 2) {
+      store.ingest(replayWithWinner(`pool${i}`, 'Me', candidateSets.slice(i, i + 2), threatSets));
+    }
+    store.rebuildUniqueSets();
+
+    const threats = await buildThreatProfile(gen, `
+| Rank | Pokemon        | Use | Usage % | Win % |
+| 1    | Zacian-Crowned |   4 |  100.00% |  50.00% |
+| 2    | Koraidon       |   4 |  100.00% |  50.00% |
+`);
+    const result = await buildCounterTeam(store, gen, formatid, threats);
+    expect(result.team.length).toBe(6);
+    expect(new Set(result.team.map((t) => t.species)).size).toBe(6);
+  }, 30000);
 });
