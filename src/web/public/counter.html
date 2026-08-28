@@ -266,7 +266,11 @@ function render(data){
        <div class="team-grid">${team.map(pickCard).join('')}</div>`
     : `<div class="empty"><h3>No counter-team could be built</h3><p>No real or Smogon-backed sets were found for the resolved threats/candidates.</p></div>`;
 
-  $('results').innerHTML = threatsHtml + teamHtml;
+  const unmetHtml = (data.unmetRequirements || []).length
+    ? `<div class="err" style="margin-top:14px">Could not satisfy required coverage: ${data.unmetRequirements.map(esc).join(', ')} — no legal, Species-Clause-compatible option was available.</div>`
+    : '';
+
+  $('results').innerHTML = threatsHtml + teamHtml + unmetHtml;
   wireCopy($('results'));
   wirePokepaste($('results'));
 }

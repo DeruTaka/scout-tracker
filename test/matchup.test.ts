@@ -223,7 +223,7 @@ describe('buildCounterTeam', () => {
     const species = result.team.map((t) => t.species);
     expect(new Set(species).size).toBe(species.length); // no duplicates
     expect(species).not.toContain('Zacian-Crowned');
-    expect(species).not.toContain('Koraidon');
+    expect(species).toContain('Koraidon'); // mandatory even though it's also a threat — mirrors are normal in real Ubers
     for (const pick of result.team) {
       expect(pick.set.moves.length).toBeGreaterThan(0);
       expect(pick.rationale.length).toBeGreaterThan(0);
@@ -305,5 +305,81 @@ describe('buildCounterTeam', () => {
     const result = await buildCounterTeam(store, gen, formatid, threats);
     const arceusPicks = result.team.filter((t) => t.species.startsWith('Arceus'));
     expect(arceusPicks.length).toBeLessThanOrEqual(1);
+  }, 20000);
+
+  it('never recommends a tier-banned species, even with heavy local recurrence and a strong matchup', async () => {
+    const store = new Datastore('/nonexistent/matchup-banned-store.json');
+    const formatid = 'gen9customtest';
+
+    const threatSets: MatchedSet[] = [
+      mon({ species: 'Zacian-Crowned', baseSpecies: 'Zacian-Crowned', ability: 'Intrepid Sword', nature: 'Jolly', evs: { atk: 252, spe: 252 }, moves: ['Behemoth Blade'] }),
+      mon({ species: 'Kyogre', baseSpecies: 'Kyogre', ability: 'Drizzle', nature: 'Timid', evs: { spa: 252, spe: 252 }, moves: ['Water Spout'] }),
+    ];
+    // Miraidon is real dex tier 'AG' — banned even from Ubers. Given a
+    // devastating move and heavy local recurrence, it would win the search
+    // outright if the legality gate didn't exist.
+    const miraidon = mon({ species: 'Miraidon', baseSpecies: 'Miraidon', ability: 'Hadron Engine', nature: 'Timid', evs: { spa: 252, spe: 252 }, moves: ['Electro Drift'], evSource: 'derived' });
+    const filler = ['Ho-Oh', 'Lunala', 'Eternatus', 'Ting-Lu', 'Landorus-Therian', 'Kingambit', 'Hatterene'].map((species) =>
+      mon({ species, baseSpecies: species, ability: 'Pressure', nature: 'Bold', evs: { hp: 252, def: 252 }, moves: ['Body Press'], evSource: 'derived' }),
+    );
+
+    let n = 0;
+    for (const set of [miraidon, ...filler]) {
+      for (let rep = 0; rep < 5; rep++) {
+        store.ingest(replayWithWinner(`ban${n++}`, 'Me', [set], threatSets));
+      }
+    }
+    store.rebuildUniqueSets();
+
+    const threats = await buildThreatProfile(gen, `
+| Rank | Pokemon        | Use | Usage % | Win % |
+| 1    | Zacian-Crowned |   4 |  100.00% |  50.00% |
+| 2    | Kyogre         |   4 |  100.00% |  50.00% |
+`);
+    const result = await buildCounterTeam(store, gen, formatid, threats);
+    expect(result.team.map((t) => t.species)).not.toContain('Miraidon');
+  }, 20000);
+
+  it('always satisfies Steel / Dark-or-Tera / Fairy-or-Tera coverage when a legal candidate can provide it', async () => {
+    const store = new Datastore('/nonexistent/matchup-typereq-store.json');
+    const formatid = 'gen9customtest';
+
+    const threatSets: MatchedSet[] = [
+      mon({ species: 'Kyogre', baseSpecies: 'Kyogre', ability: 'Drizzle', nature: 'Timid', evs: { spa: 252, spe: 252 }, moves: ['Water Spout'] }),
+      mon({ species: 'Lunala', baseSpecies: 'Lunala', ability: 'Shadow Shield', nature: 'Timid', evs: { spa: 252, spe: 252 }, moves: ['Moongeist Beam'] }),
+    ];
+    // Strong-but-typeless-for-our-purposes filler (none are Steel/Dark/Fairy)
+    // — scored to look better than the type-requirement candidates below, so
+    // the search alone would fill the team with these and never touch
+    // Steel/Dark/Fairy without the repair pass.
+    const strongFiller = ['Ho-Oh', 'Necrozma-Dusk-Mane', 'Groudon', 'Terapagos-Terastal', 'Deoxys-Speed'].map((species) =>
+      mon({ species, baseSpecies: species, ability: 'Pressure', nature: 'Adamant', evs: { atk: 252, spe: 252 }, moves: ['Close Combat'], evSource: 'derived' }),
+    );
+    // Real type-requirement candidates, deliberately weak (status move only)
+    // so they'd lose to strongFiller on pure matchup score.
+    const kingambit = mon({ species: 'Kingambit', baseSpecies: 'Kingambit', ability: 'Supreme Overlord', nature: 'Adamant', evs: { hp: 252, atk: 4, spe: 252 }, moves: ['Swords Dance'], evSource: 'derived' });
+    const hatterene = mon({ species: 'Hatterene', baseSpecies: 'Hatterene', ability: 'Magic Bounce', nature: 'Calm', evs: { hp: 252, spd: 252 }, moves: ['Calm Mind'], evSource: 'derived' });
+
+    let n = 0;
+    for (const set of [...strongFiller, kingambit, hatterene]) {
+      for (let rep = 0; rep < 5; rep++) {
+        store.ingest(replayWithWinner(`treq${n++}`, 'Me', [set], threatSets));
+      }
+    }
+    store.rebuildUniqueSets();
+
+    const threats = await buildThreatProfile(gen, `
+| Rank | Pokemon | Use | Usage % | Win % |
+| 1    | Kyogre  |   4 |  100.00% |  50.00% |
+| 2    | Lunala  |   4 |  100.00% |  50.00% |
+`);
+    const result = await buildCounterTeam(store, gen, formatid, threats);
+    const hasSteel = result.team.some((p) => gen.species.get(p.set.baseSpecies)?.types.map((x) => x.toLowerCase()).includes('steel'));
+    const hasDark = result.team.some((p) => gen.species.get(p.set.baseSpecies)?.types.map((x) => x.toLowerCase()).includes('dark') || (p.set.tera ?? '').toLowerCase() === 'dark');
+    const hasFairy = result.team.some((p) => gen.species.get(p.set.baseSpecies)?.types.map((x) => x.toLowerCase()).includes('fairy') || (p.set.tera ?? '').toLowerCase() === 'fairy');
+    expect(hasSteel).toBe(true);
+    expect(hasDark).toBe(true);
+    expect(hasFairy).toBe(true);
+    expect(result.unmetRequirements).toEqual([]);
   }, 20000);
 });

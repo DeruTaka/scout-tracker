@@ -163,7 +163,7 @@ export function startServer(store: Datastore, config: Config, port: number): voi
         paste: exportSet(pick.set),
       }));
 
-      res.json({ threats: result.threats, resolvedThreats: result.resolvedThreats, team });
+      res.json({ threats: result.threats, resolvedThreats: result.resolvedThreats, team, unmetRequirements: result.unmetRequirements });
     } catch (e) {
       res.status(400).json({ error: e instanceof Error ? e.message : String(e) });
     }
