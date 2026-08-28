@@ -99,6 +99,11 @@ export function parseUsageTable(text: string): RawThreat[] | null {
 
 const HEADER_RE = /^(.+?)\s*\((\w[\w\d]*)\)\s*:$/;
 const URL_RE = /^https?:\/\//;
+// Replay ids are monotonically increasing with real upload time
+// (smogtours-gen9ubers-964153 is later than -962535) — no real per-game
+// timestamp is available in a digest, but this ordering is a reliable
+// recency proxy.
+const REPLAY_ID_RE = /-(\d+)\s*$/;
 
 interface Digest {
   player?: string;
@@ -106,11 +111,27 @@ interface Digest {
   threats: RawThreat[];
 }
 
+function extractReplayId(url: string): number | null {
+  const m = REPLAY_ID_RE.exec(url.trim());
+  return m ? parseInt(m[1]!, 10) : null;
+}
+
+// Recency lean: rank rosters newest-first and decay each older one's vote
+// geometrically, rather than an all-or-nothing recency cutoff. A trainer's
+// older games still say something real about their habits, just less than
+// what they're doing right now — 0.9 per rank keeps that gentle (the 10th-
+// oldest game in a typical digest still counts for ~35% of a fresh one)
+// rather than nearly erasing older history.
+const DIGEST_RECENCY_DECAY = 0.9;
+
 /** Parse a per-trainer scouting digest: an optional "Player (formatid):"
- *  header, then repeated paragraphs of exactly [roster line ending in ":",
- *  replay URL] — the per-mon detail paragraphs between them are informational
- *  and not yet used for weighting. Returns null if no roster/URL pairs are
- *  found (i.e. this isn't that shape of paste). */
+ *  header, then repeated paragraphs of [roster line ending in ":", one or
+ *  more replay URLs — the same roster can list several games] — the per-mon
+ *  detail paragraphs between them are informational and not yet used for
+ *  weighting. Returns null if no roster/URL pairs are found (i.e. this isn't
+ *  that shape of paste). Each roster's vote toward a species' weight is
+ *  decayed by how far back it ranks among the trainer's games here (see
+ *  DIGEST_RECENCY_DECAY), not counted equally regardless of age. */
 export function parseScoutingDigest(text: string): Digest | null {
   const paragraphs = text
     .split(/\n\s*\n+/)
@@ -120,7 +141,7 @@ export function parseScoutingDigest(text: string): Digest | null {
 
   let player: string | undefined;
   let formatid: string | undefined;
-  const rosters: string[][] = [];
+  const rosters: { species: string[]; replayId: number | null }[] = [];
 
   for (const para of paragraphs) {
     const lines = para.split('\n').map((l) => l.trim());
@@ -132,13 +153,17 @@ export function parseScoutingDigest(text: string): Digest | null {
       }
       continue;
     }
-    if (lines.length === 2 && URL_RE.test(lines[1]!) && lines[0]!.endsWith(':')) {
-      const roster = lines[0]!
+    const urlLines = lines.slice(1);
+    if (lines.length >= 2 && lines[0]!.endsWith(':') && urlLines.every((l) => URL_RE.test(l))) {
+      const species = lines[0]!
         .slice(0, -1)
         .split(',')
         .map((s) => s.trim())
         .filter(Boolean);
-      if (roster.length) rosters.push(roster);
+      // A roster can list several replays of the same team — take the most
+      // recent id among them as this roster's own recency.
+      const ids = urlLines.map(extractReplayId).filter((n): n is number => n !== null);
+      if (species.length) rosters.push({ species, replayId: ids.length ? Math.max(...ids) : null });
       continue;
     }
     // Per-mon detail paragraph (species + ability/item/moves) — not a
@@ -147,18 +172,30 @@ export function parseScoutingDigest(text: string): Digest | null {
 
   if (!rosters.length) return null;
 
-  const counts = new Map<string, { display: string; n: number }>();
+  // Rank newest-first (unknown-recency rosters sort last, treated as oldest)
+  // and assign each a geometrically decaying vote weight.
+  const ranked = [...rosters].sort((a, b) => (b.replayId ?? -Infinity) - (a.replayId ?? -Infinity));
+  const rosterWeight = new Map<(typeof rosters)[number], number>();
+  ranked.forEach((r, i) => rosterWeight.set(r, DIGEST_RECENCY_DECAY ** i));
+
+  const totalWeight = [...rosterWeight.values()].reduce((s, w) => s + w, 0);
+  const tally = new Map<string, { display: string; n: number; weight: number }>();
   for (const roster of rosters) {
-    for (const species of roster) {
+    const w = rosterWeight.get(roster)!;
+    for (const species of roster.species) {
       const key = species.toLowerCase();
-      const cur = counts.get(key);
-      if (cur) cur.n++;
-      else counts.set(key, { display: species, n: 1 });
+      const cur = tally.get(key);
+      if (cur) {
+        cur.n++;
+        cur.weight += w;
+      } else {
+        tally.set(key, { display: species, n: 1, weight: w });
+      }
     }
   }
-  const threats: RawThreat[] = [...counts.values()].map((c) => ({
+  const threats: RawThreat[] = [...tally.values()].map((c) => ({
     species: c.display,
-    weight: (c.n / rosters.length) * 100,
+    weight: (c.weight / totalWeight) * 100,
     count: c.n,
   }));
   return { player, formatid, threats };

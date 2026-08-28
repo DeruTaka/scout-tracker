@@ -80,9 +80,60 @@ Ability: Drizzle
     expect(digest!.player).toBe('tester');
     expect(digest!.formatid).toBe('gen9ubers');
     const koraidon = digest!.threats.find((t) => t.species === 'Koraidon')!;
-    expect(koraidon.weight).toBe(100); // in both rosters
+    expect(koraidon.weight).toBe(100); // in both rosters, regardless of recency
+    // Zacian-Crowned is only in the OLDER game (id 1 vs id 2) — recency decay
+    // means its share is less than a flat 50/50 count would give it.
     const zacian = digest!.threats.find((t) => t.species === 'Zacian-Crowned')!;
-    expect(zacian.weight).toBe(50); // in 1 of 2 rosters
+    expect(zacian.weight).toBeLessThan(50);
+    expect(zacian.weight).toBeGreaterThan(0);
+  });
+
+  it('weights a roster from a more recent replay id more heavily than an older one', () => {
+    const newer = `t (gen9ubers):
+
+Koraidon, Flutter Mane:
+https://replay.pokemonshowdown.com/smogtours-gen9ubers-200
+
+Koraidon
+- Scale Shot
+
+Flutter Mane
+- Moonblast
+
+
+Koraidon, Ho-Oh:
+https://replay.pokemonshowdown.com/smogtours-gen9ubers-100
+
+Koraidon
+- Scale Shot
+
+Ho-Oh
+- Sacred Fire
+`;
+    const digest = parseScoutingDigest(newer);
+    const flutterMane = digest!.threats.find((t) => t.species === 'Flutter Mane')!.weight; // newer game (id 200)
+    const hoOh = digest!.threats.find((t) => t.species === 'Ho-Oh')!.weight; // older game (id 100)
+    expect(flutterMane).toBeGreaterThan(hoOh);
+  });
+
+  it('does not silently drop a roster that lists multiple replay URLs', () => {
+    const text = `t (gen9ubers):
+
+Koraidon, Ting-Lu:
+https://replay.pokemonshowdown.com/smogtours-gen9ubers-1
+https://replay.pokemonshowdown.com/smogtours-gen9ubers-2
+
+Koraidon
+- Scale Shot
+
+Ting-Lu
+- Earthquake
+`;
+    const digest = parseScoutingDigest(text);
+    expect(digest).toBeTruthy();
+    const tingLu = digest!.threats.find((t) => t.species === 'Ting-Lu');
+    expect(tingLu).toBeTruthy();
+    expect(tingLu!.weight).toBe(100);
   });
 
   it('returns null when no roster/URL pairs are found', () => {
@@ -144,10 +195,10 @@ describe('scoreMatchup', () => {
   });
 });
 
-function replayWithWinner(id: string, winner: string, mine: MatchedSet[], theirs: MatchedSet[]): ScoutedReplay {
+function replayWithWinner(id: string, winner: string, mine: MatchedSet[], theirs: MatchedSet[], uploadtime = 1700000000): ScoutedReplay {
   const replay: Replay = {
     id, url: `https://replay.pokemonshowdown.com/${id}`, format: '[Gen 9] Ubers', formatid: 'gen9customtest',
-    gen: 9, players: ['Me', 'Them'], log: '', uploadtime: 1700000000, winner,
+    gen: 9, players: ['Me', 'Them'], log: '', uploadtime, winner,
   };
   return {
     replay, scoutedAt: Date.now(),
@@ -179,6 +230,27 @@ describe('getHistoricalWinRates', () => {
     const blissey = rates.get('blissey')!;
     expect(blissey.total).toBe(2);
     expect(blissey.wins).toBe(2);
+    expect(blissey.weightedWinPercent).toBe(100); // all wins, still 100% once weighted
+  });
+
+  it('weights recent games more heavily than old ones — a recent loss outweighs old wins', () => {
+    const store = new Datastore('/nonexistent/matchup-hist-recency-store.json');
+    const threats = new Set(['koraidon', 'zaciancrowned']);
+    const DAY = 86400;
+    const opp = [mon({ species: 'Koraidon', baseSpecies: 'Koraidon' }), mon({ species: 'Zacian-Crowned', baseSpecies: 'Zacian-Crowned' })];
+    const mine = [mon({ species: 'Blissey', baseSpecies: 'Blissey' })];
+    // Two wins 120 days ago (4 half-lives), one loss yesterday.
+    store.ingest(replayWithWinner('old1', 'Me', mine, opp, 1700000000 - 120 * DAY));
+    store.ingest(replayWithWinner('old2', 'Me', mine, opp, 1700000000 - 120 * DAY));
+    store.ingest(replayWithWinner('recent', 'Them', mine, opp, 1700000000 - DAY));
+
+    const rates = getHistoricalWinRates(store, 'gen9customtest', threats);
+    const blissey = rates.get('blissey')!;
+    expect(blissey.wins).toBe(2);
+    expect(blissey.total).toBe(3);
+    // Raw win rate is 67%, but the recent loss should pull the weighted
+    // figure well below 50 since it heavily outweighs two stale wins.
+    expect(blissey.weightedWinPercent).toBeLessThan(50);
   });
 });
 

@@ -17,7 +17,7 @@ import { toID } from '../data/dex.js';
 import type { ThreatProfile } from './threat-profile.js';
 import { getBestKnownSet, getKnownSetVariants, fillRealisticSet, allCandidateSpecies, type KnownSet, type KnownSetSource } from './candidate-pool.js';
 import { scoreMatchup, type MatchupResult } from './score.js';
-import { getHistoricalWinRates } from './historical.js';
+import { getHistoricalWinRates, type WinRate } from './historical.js';
 import { getUsageWeight, getUsageRankMap, getTeammateAffinity } from '../data/usage-provider.js';
 
 export interface TeamPick {
@@ -167,7 +167,10 @@ export async function buildCounterTeam(
     }
 
     const hr = historicalWinRates.get(toID(species));
-    const historyBonus = hr && hr.total ? HISTORY_WEIGHT * ((hr.wins / hr.total) * 100 - 50) * sampleConfidence(hr.total) : 0;
+    // weightedWinPercent already leans on more recent scouted games —
+    // sampleConfidence still scales by the raw game count, since that's a
+    // genuine sample-size signal independent of how recent those games were.
+    const historyBonus = hr && hr.total ? HISTORY_WEIGHT * (hr.weightedWinPercent - 50) * sampleConfidence(hr.total) : 0;
     const evidenceBonus = known.source === 'store' ? EVIDENCE_BONUS : 0;
     // Rank 1 scores MAX_VIABILITY_RANK points, the cutoff itself scores ~0 —
     // a steep, decisive gradient (see VIABILITY_WEIGHT). A locally-recurring
@@ -276,7 +279,7 @@ function pairAffinity(affinity: Map<string, number>, i: number, j: number): numb
 
 function buildRationale(
   perThreat: Map<string, { result: MatchupResult; weight: number; threatSpecies: string }>,
-  hr: { wins: number; total: number } | undefined,
+  hr: WinRate | undefined,
   source: KnownSetSource,
   viability: number,
   rank: number | undefined,
