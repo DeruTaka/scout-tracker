@@ -50,6 +50,10 @@ export type KnownSetSource = 'store' | 'usage' | 'dex';
 export interface KnownSet {
   set: MatchedSet;
   source: KnownSetSource;
+  /** Summed local sighting count across every distinct build stored for this
+   *  species (source 'store' only) — how many real scouted games actually
+   *  used it, as opposed to a single one-off sighting. */
+  localCount?: number;
 }
 
 /** The single best real build available for `baseSpecies` in `formatid`:
@@ -69,7 +73,10 @@ export async function getBestKnownSet(
       const evidenced = (u: typeof a) => (u.set.evSource !== 'default' ? 1 : 0);
       return evidenced(b) - evidenced(a) || b.count - a.count;
     });
-  if (local.length) return { set: local[0]!.set, source: 'store' };
+  if (local.length) {
+    const localCount = local.reduce((s, u) => s + u.count, 0);
+    return { set: local[0]!.set, source: 'store', localCount };
+  }
 
   const usageSets = await getUsageSets(gen, formatid, baseSpecies);
   if (usageSets.length) {

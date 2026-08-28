@@ -15,7 +15,7 @@ import type { ThreatProfile } from './threat-profile.js';
 import { getBestKnownSet, allCandidateSpecies, type KnownSetSource } from './candidate-pool.js';
 import { scoreMatchup, type MatchupResult } from './score.js';
 import { getHistoricalWinRates } from './historical.js';
-import { getUsageWeight, getTeammateAffinity } from '../data/usage-provider.js';
+import { getUsageWeight, getUsageRankMap, getTeammateAffinity } from '../data/usage-provider.js';
 
 export interface TeamPick {
   species: string;
@@ -33,16 +33,27 @@ export interface CounterTeamResult {
 const TEAM_SIZE = 6;
 const HISTORY_WEIGHT = 0.6; // points per (winRate% - 50), scaled by sample confidence
 const EVIDENCE_BONUS = 4; // small nudge for real store-derived sets over a Smogon fallback
-const VIABILITY_WEIGHT = 0.5; // points per "usage percent" point — keeps real staples ahead of matchup-only overfits
+// Rank-based, not raw-percent-based: usage% is heavily right-skewed (staples
+// sit at 20-90%, everything else falls off a cliff under ~10%), so a linear
+// weight on the raw percent barely separates rank 5 from rank 50. Scoring by
+// how far inside the viability cutoff a candidate sits gives a much steeper,
+// more decisive gradient — favoring genuine S/A-tier picks over a B--tier
+// one long before matchup differences could ever outweigh it.
+const VIABILITY_WEIGHT = 3;
 const TEAMMATE_WEIGHT = 40; // points per unit of real teammate co-occurrence (0..1-ish) with an already-picked mon
 const UNCOVERED_FLOOR = -100; // sentinel "this threat is entirely unaddressed" coverage level
-// Below this real-metagame usage weight, a Smogon-fallback candidate is
-// noise, not a real pick — this is what keeps a barely-played mon with a
-// lucky damage matchup (e.g. something sitting at 0.03% usage) out of the
-// team just because it happens to OHKO one threat. Locally-scouted (`store`)
-// candidates skip this floor entirely: something this app has actually seen
-// played in real games IS real, whatever the global Smogon number says.
-const MIN_SMOGON_VIABILITY = 0.01;
+// A stand-in for "B- rank and above" on a community Viability Rankings
+// thread, since there's no VR thread to parse — Smogon's own gen9ubers chaos
+// stats track ~200 species total, and Ubers is small/centralized enough that
+// the top ~45 by real usage is a solid proxy for "actually played," not
+// filler that happened to land a good calc.
+const MAX_VIABILITY_RANK = 45;
+// A candidate outside that rank cutoff (or untracked by Smogon at all) is
+// still allowed through if it's a RECURRING local trend — this many separate
+// real sightings in this app's own scouted games, not a single one-off
+// (that one-off is exactly how an obscure Arceus-Ice/Arceus-Steel sighting
+// slipped onto a team last time).
+const MIN_LOCAL_RECURRENCE = 3;
 const NODE_BUDGET = 8000; // hard cap on search expansions, so a huge candidate pool can't hang the request
 const BRANCH_CAP = 10; // per node, only the top-N unpicked candidates by immediate marginal gain are explored
 
@@ -55,6 +66,7 @@ interface ScoredCandidate {
   set: MatchedSet;
   source: KnownSetSource;
   viability: number; // raw Smogon usage weight, 0 if untracked
+  dexNum: number | undefined; // national dex number — Species Clause groups on this, not on forme name
   perThreat: Map<string, { result: MatchupResult; weight: number; threatSpecies: string }>;
   qualityScore: number; // viability + history + evidence — intrinsic to the mon, not threat-specific
   standaloneCeiling: number; // qualityScore + this mon's own best-case weighted matchup total — the A* heuristic's per-candidate upper bound
@@ -79,6 +91,7 @@ export async function buildCounterTeam(
 
   const candidateSpecies = await allCandidateSpecies(store, formatid);
   const genNum = gen.num as GenerationNum;
+  const usageRanks = await getUsageRankMap(formatid);
 
   const scored: ScoredCandidate[] = [];
   for (const species of candidateSpecies) {
@@ -86,8 +99,13 @@ export async function buildCounterTeam(
     const known = await getBestKnownSet(store, gen, formatid, species);
     if (!known) continue;
 
+    const rank = usageRanks.get(toID(species));
+    const viableByRank = rank !== undefined && rank <= MAX_VIABILITY_RANK;
+    const viableLocally = known.source === 'store' && (known.localCount ?? 0) >= MIN_LOCAL_RECURRENCE;
+    if (!viableByRank && !viableLocally) continue; // not actually played in this tier
+
     const viability = await getUsageWeight(formatid, species);
-    if (known.source !== 'store' && viability < MIN_SMOGON_VIABILITY) continue; // not a real pick in this tier
+    const dexNum = gen.species.get(known.set.baseSpecies)?.num;
 
     const perThreat = new Map<string, { result: MatchupResult; weight: number; threatSpecies: string }>();
     let weightedSum = 0;
@@ -100,17 +118,23 @@ export async function buildCounterTeam(
     const hr = historicalWinRates.get(toID(species));
     const historyBonus = hr && hr.total ? HISTORY_WEIGHT * ((hr.wins / hr.total) * 100 - 50) * sampleConfidence(hr.total) : 0;
     const evidenceBonus = known.source === 'store' ? EVIDENCE_BONUS : 0;
-    const qualityScore = viability * 100 * VIABILITY_WEIGHT + historyBonus + evidenceBonus;
+    // Rank 1 scores MAX_VIABILITY_RANK points, the cutoff itself scores ~0 —
+    // a steep, decisive gradient (see VIABILITY_WEIGHT). A locally-recurring
+    // pick with no Smogon rank at all gets a modest flat credit instead of 0,
+    // since it cleared its own (stricter) bar.
+    const viabilityScore = viableByRank ? (MAX_VIABILITY_RANK - rank! + 1) * VIABILITY_WEIGHT : VIABILITY_WEIGHT * 5;
+    const qualityScore = viabilityScore + historyBonus + evidenceBonus;
 
     scored.push({
       species,
       set: known.set,
       source: known.source,
       viability,
+      dexNum,
       perThreat,
       qualityScore,
       standaloneCeiling: qualityScore + weightedSum,
-      rationale: buildRationale(perThreat, hr, known.source, viability),
+      rationale: buildRationale(perThreat, hr, known.source, viability, rank),
     });
   }
 
@@ -145,6 +169,7 @@ function buildRationale(
   hr: { wins: number; total: number } | undefined,
   source: KnownSetSource,
   viability: number,
+  rank: number | undefined,
 ): string[] {
   const notes: string[] = [];
   const ranked = [...perThreat.values()].sort((a, b) => b.result.score - a.result.score);
@@ -158,7 +183,9 @@ function buildRationale(
     const lead = notable.length ? 'Strong into' : 'Best available matchup:';
     notes.push(`${lead} ${threatSpecies} (${weight.toFixed(0)}% usage)${bits.length ? ' — ' + bits.join(', ') : ''}.`);
   }
-  if (viability > 0) notes.push(`~${(viability * 100).toFixed(1)}% real usage in this tier.`);
+  if (rank !== undefined) notes.push(`#${rank} in real ${(viability * 100).toFixed(1)}% usage for this tier.`);
+  else if (viability > 0) notes.push(`~${(viability * 100).toFixed(1)}% real usage in this tier.`);
+  else notes.push('Not tracked by Smogon usage stats — kept only for its recurring local scouting history.');
   if (hr && hr.total >= 2) {
     notes.push(`Historically ${hr.wins}-${hr.total - hr.wins} in scouted games vs. cores with 2+ of these threats.`);
   }
@@ -266,9 +293,15 @@ function searchTeam(
     }
 
     const pickedSet = new Set(node.pickedIdx);
+    // Species Clause: group on the national dex number, not the forme name —
+    // Arceus-Ice and Arceus-Steel are still both "Arceus" as far as the
+    // format's team-legality rules are concerned, so at most one dex number
+    // can appear on the team even though every forme scores as a distinct
+    // candidate everywhere else in this file.
+    const pickedDexNums = new Set(node.pickedIdx.map((i) => scored[i]!.dexNum).filter((n): n is number => n !== undefined));
     const branchCandidates = scored
       .map((c, idx) => ({ idx, c }))
-      .filter(({ idx }) => !pickedSet.has(idx))
+      .filter(({ idx, c }) => !pickedSet.has(idx) && !(c.dexNum !== undefined && pickedDexNums.has(c.dexNum)))
       .map(({ idx, c }) => ({
         idx,
         marginal: coverageGain(c, node.coverage) + c.qualityScore + teammateBonus(idx, node.pickedIdx, affinity),

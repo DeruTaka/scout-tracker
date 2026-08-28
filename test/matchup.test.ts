@@ -200,10 +200,15 @@ describe('buildCounterTeam', () => {
       }),
     );
 
-    store.ingest(replayWithWinner('rA', 'Me', [candidateSets[0]!, candidateSets[1]!], threatSets));
-    store.ingest(replayWithWinner('rB', 'Me', [candidateSets[2]!, candidateSets[3]!], threatSets));
-    store.ingest(replayWithWinner('rC', 'Them', [candidateSets[4]!, candidateSets[5]!, candidateSets[6]!], threatSets));
-    store.ingest(replayWithWinner('rD', 'Opponent', threatSets, [candidateSets[0]!]));
+    // Each candidate needs 3+ separate sightings to clear the new
+    // recurrence bar (a single one-off local sighting is exactly how an
+    // obscure, globally-unplayed forme slipped onto a real generated team).
+    let n = 0;
+    for (const set of candidateSets) {
+      for (let rep = 0; rep < 3; rep++) {
+        store.ingest(replayWithWinner(`r${n++}`, 'Me', [set], threatSets));
+      }
+    }
     store.rebuildUniqueSets();
 
     const threats = await buildThreatProfile(gen, `
@@ -245,8 +250,11 @@ describe('buildCounterTeam', () => {
     const candidateSets = pool.map((species) =>
       mon({ species, baseSpecies: species, ability: 'Pressure', nature: 'Bold', evs: { hp: 252, def: 252 }, moves: ['Body Press'], confidence: 0.7, evSource: 'derived' }),
     );
-    for (let i = 0; i < candidateSets.length; i += 2) {
-      store.ingest(replayWithWinner(`pool${i}`, 'Me', candidateSets.slice(i, i + 2), threatSets));
+    let n = 0;
+    for (const set of candidateSets) {
+      for (let rep = 0; rep < 3; rep++) {
+        store.ingest(replayWithWinner(`pool${n++}`, 'Me', [set], threatSets));
+      }
     }
     store.rebuildUniqueSets();
 
@@ -258,5 +266,44 @@ describe('buildCounterTeam', () => {
     const result = await buildCounterTeam(store, gen, formatid, threats);
     expect(result.team.length).toBe(6);
     expect(new Set(result.team.map((t) => t.species)).size).toBe(6);
+    // Species Clause: Arceus-Ground and Arceus-Water are both dex #493 —
+    // this pool includes both, so this only holds if the clause is enforced.
+    const arceusFormes = result.team.filter((t) => t.species.startsWith('Arceus'));
+    expect(arceusFormes.length).toBeLessThanOrEqual(1);
   }, 30000);
+
+  it('never fields two Pokemon that share a Pokedex number (Species Clause)', async () => {
+    const store = new Datastore('/nonexistent/matchup-species-clause-store.json');
+    const formatid = 'gen9customtest';
+
+    const threatSets: MatchedSet[] = [
+      mon({ species: 'Zacian-Crowned', baseSpecies: 'Zacian-Crowned', ability: 'Intrepid Sword', nature: 'Jolly', evs: { atk: 252, spe: 252 }, moves: ['Behemoth Blade'] }),
+      mon({ species: 'Kyogre', baseSpecies: 'Kyogre', ability: 'Drizzle', nature: 'Timid', evs: { spa: 252, spe: 252 }, moves: ['Water Spout'] }),
+    ];
+    // Both Arceus formes are built to look like standout picks (max SpA,
+    // a strong coverage move) — if Species Clause weren't enforced, the
+    // search would happily take both since each independently scores well.
+    const arceusGround = mon({ species: 'Arceus-Ground', baseSpecies: 'Arceus-Ground', ability: 'Multitype', nature: 'Modest', evs: { spa: 252, spe: 252 }, moves: ['Earth Power'], evSource: 'derived' });
+    const arceusWater = mon({ species: 'Arceus-Water', baseSpecies: 'Arceus-Water', ability: 'Multitype', nature: 'Modest', evs: { spa: 252, spe: 252 }, moves: ['Hydro Pump'], evSource: 'derived' });
+    const filler = ['Ho-Oh', 'Lunala', 'Eternatus', 'Ting-Lu', 'Landorus-Therian', 'Kyogre', 'Kingambit'].map((species) =>
+      mon({ species, baseSpecies: species, ability: 'Pressure', nature: 'Bold', evs: { hp: 252, def: 252 }, moves: ['Body Press'], evSource: 'derived' }),
+    );
+
+    let n = 0;
+    for (const set of [arceusGround, arceusWater, ...filler]) {
+      for (let rep = 0; rep < 3; rep++) {
+        store.ingest(replayWithWinner(`sc${n++}`, 'Me', [set], threatSets));
+      }
+    }
+    store.rebuildUniqueSets();
+
+    const threats = await buildThreatProfile(gen, `
+| Rank | Pokemon        | Use | Usage % | Win % |
+| 1    | Zacian-Crowned |   4 |  100.00% |  50.00% |
+| 2    | Kyogre         |   4 |  100.00% |  50.00% |
+`);
+    const result = await buildCounterTeam(store, gen, formatid, threats);
+    const arceusPicks = result.team.filter((t) => t.species.startsWith('Arceus'));
+    expect(arceusPicks.length).toBeLessThanOrEqual(1);
+  }, 20000);
 });

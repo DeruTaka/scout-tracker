@@ -197,6 +197,28 @@ export async function getUsageWeight(formatid: string, speciesName: string): Pro
   return u?.usage ?? 0;
 }
 
+/** This species' 1-indexed rank by usage among every species Smogon tracked
+ *  for the format (1 = most-used) — a direct, objective stand-in for a
+ *  community Viability Rankings tier (S/A/B/...) when no VR thread is
+ *  available to parse. undefined if the format has no usage data at all, or
+ *  the species was never tracked (i.e. essentially unplayed). */
+export async function getUsageRank(formatid: string, speciesName: string): Promise<number | undefined> {
+  const ranks = await getUsageRankMap(formatid);
+  return ranks.get(toID(speciesName));
+}
+
+/** Every tracked species' 1-indexed usage rank in one pass (id -> rank) — the
+ *  bulk form of getUsageRank, for callers ranking many candidates at once
+ *  instead of re-sorting the whole species list per lookup. */
+export async function getUsageRankMap(formatid: string): Promise<Map<string, number>> {
+  const chaos = await loadUsage(formatid);
+  const map = new Map<string, number>();
+  if (!chaos) return map;
+  const ranked = Object.entries(chaos.data).sort((a, b) => b[1].usage - a[1].usage);
+  ranked.forEach(([species], i) => map.set(toID(species), i + 1));
+  return map;
+}
+
 /** How often real teams pair `speciesName` with `teammate`, as a fraction of
  *  `speciesName`'s own appearances (0..1-ish) — actual teammate co-occurrence
  *  from Smogon's stats, not a guess. 0 if either species is untracked or the
