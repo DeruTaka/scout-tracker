@@ -454,4 +454,42 @@ describe('buildCounterTeam', () => {
     expect(hasFairy).toBe(true);
     expect(result.unmetRequirements).toEqual([]);
   }, 20000);
+
+  it('never fields two Pokemon carrying the same entry hazard move', async () => {
+    const store = new Datastore('/nonexistent/matchup-hazard-store.json');
+    const formatid = 'gen9customtest';
+
+    const threatSets: MatchedSet[] = [
+      mon({ species: 'Kyogre', baseSpecies: 'Kyogre', ability: 'Drizzle', nature: 'Timid', evs: { spa: 252, spe: 252 }, moves: ['Water Spout'] }),
+      mon({ species: 'Lunala', baseSpecies: 'Lunala', ability: 'Shadow Shield', nature: 'Timid', evs: { spa: 252, spe: 252 }, moves: ['Moongeist Beam'] }),
+    ];
+    // Three real, independently-strong Stealth Rock setters and two Toxic
+    // Spikes setters — if hazard dedup weren't enforced, several of these
+    // would happily co-exist since each looks good on its own matchup merit.
+    const rockers = ['Ting-Lu', 'Landorus-Therian', 'Arceus-Ground'].map((species) =>
+      mon({ species, baseSpecies: species, ability: 'Pressure', nature: 'Impish', evs: { hp: 252, def: 252 }, moves: ['Stealth Rock', 'Earthquake'], evSource: 'derived' }),
+    );
+    const spikers = ['Glimmora', 'Hatterene'].map((species) =>
+      mon({ species, baseSpecies: species, ability: 'Pressure', nature: 'Bold', evs: { hp: 252, spd: 252 }, moves: ['Toxic Spikes', 'Sludge Bomb'], evSource: 'derived' }),
+    );
+
+    let n = 0;
+    for (const set of [...rockers, ...spikers]) {
+      for (let rep = 0; rep < 5; rep++) {
+        store.ingest(replayWithWinner(`haz${n++}`, 'Me', [set], threatSets));
+      }
+    }
+    store.rebuildUniqueSets();
+
+    const threats = await buildThreatProfile(gen, `
+| Rank | Pokemon | Use | Usage % | Win % |
+| 1    | Kyogre  |   4 |  100.00% |  50.00% |
+| 2    | Lunala  |   4 |  100.00% |  50.00% |
+`);
+    const result = await buildCounterTeam(store, gen, formatid, threats);
+    const rockCount = result.team.filter((p) => p.set.moves.some((m) => m.toLowerCase().replace(/[^a-z]/g, '') === 'stealthrock')).length;
+    const spikesCount = result.team.filter((p) => p.set.moves.some((m) => m.toLowerCase().replace(/[^a-z]/g, '') === 'toxicspikes')).length;
+    expect(rockCount).toBeLessThanOrEqual(1);
+    expect(spikesCount).toBeLessThanOrEqual(1);
+  }, 20000);
 });

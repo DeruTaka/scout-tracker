@@ -66,6 +66,13 @@ const BRANCH_CAP = 10; // per node, only the top-N unpicked candidates by immedi
 // list — Baton Pass Clause and the OHKO Clause. Fixed rules, not usage data.
 const BANNED_MOVES = new Set(['batonpass', 'fissure', 'guillotine', 'horndrill', 'sheercold']);
 const MANDATORY_SPECIES = ['Koraidon'];
+// Entry hazards don't stack across setters the way it'd take to justify a
+// second moveslot spent on the same one: Stealth Rock only ever has one
+// layer no matter who sets it, and a single Toxic Spikes/Spikes setter can
+// already lay both/all of its own layers by staying in two or three turns.
+// A second team member carrying the identical hazard move is a wasted slot,
+// not real redundancy — at most one pick may carry each.
+const HAZARD_MOVES = new Set(['stealthrock', 'spikes', 'toxicspikes', 'stickyweb', 'steelsurge']);
 // Type-or-Tera coverage every real Ubers team is expected to carry, given how
 // saturated the tier is with Fairy (Zacian-Crowned), Dragon, and Psychic
 // threats. Steel is a plain type requirement (no Tera substitute) per the
@@ -90,6 +97,10 @@ function isTierLegal(sp: { tier?: string; isNonstandard?: string | null } | unde
 
 function hasBannedMove(set: MatchedSet): boolean {
   return set.moves.some((m) => BANNED_MOVES.has(toID(m)));
+}
+
+function hazardMovesOf(set: MatchedSet): string[] {
+  return set.moves.map(toID).filter((m) => HAZARD_MOVES.has(m));
 }
 
 function sampleConfidence(n: number): number {
@@ -431,9 +442,17 @@ function searchTeam(
     // can appear on the team even though every forme scores as a distinct
     // candidate everywhere else in this file.
     const pickedDexNums = new Set(node.pickedIdx.map((i) => scored[i]!.dexNum).filter((n): n is number => n !== undefined));
+    // No two members carrying the same hazard move — a second Stealth Rock
+    // (etc.) setter is a wasted slot, not real redundancy.
+    const pickedHazards = new Set(node.pickedIdx.flatMap((i) => hazardMovesOf(scored[i]!.set)));
     const branchCandidates = scored
       .map((c, idx) => ({ idx, c }))
-      .filter(({ idx, c }) => !pickedSet.has(idx) && !(c.dexNum !== undefined && pickedDexNums.has(c.dexNum)))
+      .filter(
+        ({ idx, c }) =>
+          !pickedSet.has(idx) &&
+          !(c.dexNum !== undefined && pickedDexNums.has(c.dexNum)) &&
+          !hazardMovesOf(c.set).some((m) => pickedHazards.has(m)),
+      )
       .map(({ idx, c }) => ({
         idx,
         marginal: coverageGain(c, node.coverage) + c.qualityScore + teammateBonus(idx, node.pickedIdx, affinity),
@@ -477,9 +496,11 @@ function enforceTypeRequirements(
 
     const pickedIds = new Set(team.map((p) => toID(p.species)));
     const pickedDexNums = new Set(team.map((p) => p.dexNum).filter((n): n is number => n !== undefined));
+    const pickedHazards = new Set(team.flatMap((p) => hazardMovesOf(p.set)));
     const replacementOptions = scored
       .filter((c) => !pickedIds.has(toID(c.species)))
       .filter((c) => c.dexNum === undefined || !pickedDexNums.has(c.dexNum))
+      .filter((c) => !hazardMovesOf(c.set).some((m) => pickedHazards.has(m)))
       .filter((c) => satisfiesTypeRequirement(gen, c, req))
       .map((c) => ({
         c,
