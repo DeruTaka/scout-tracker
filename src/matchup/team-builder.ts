@@ -88,6 +88,17 @@ const FRONTIER_CAP = 500;
 // gets kept over a non-hazard one when it clears it by more than this
 // margin — "meaningfully better," not just nominally top-scoring.
 const MANDATORY_HAZARD_FLEX_MARGIN = 15;
+// A written dex analysis is a curated "here's a good build" from the
+// format's own council; a usage-stats spread is just "whatever the highest-
+// count real games happened to run," which regularly wins on paper against
+// one specific threat list — sometimes by a lot, since a build oriented
+// entirely around raw damage into that particular threat list can easily
+// out-score a written analysis's more balanced set — without being a build
+// anyone should actually be handed. candidate-pool.ts already treats this
+// as close to absolute when picking a SINGLE set per species (dex analysis
+// always wins if any exists at all, no score comparison); the mandatory
+// pick gets the same treatment here rather than a soft margin, since a
+// fixed point margin was consistently too small to matter in practice.
 // Moves banned by clauses standard in every Ubers-family ruleset regardless
 // of tier list — Baton Pass Clause and the OHKO Clause. Fixed rules, not
 // usage data.
@@ -213,28 +224,41 @@ const STATUS_IMMUNITY_BONUS = 12; // flat bonus for a status-immune candidate wh
 const STATUS_PRESSURE_THRESHOLD = 20; // minimum weighted status-move prevalence before the immunity bonus kicks in at all
 
 /**
- * Choose a mandatory pick's build from its real, already-scored variants —
- * preferring the single best-scoring one, UNLESS it carries a hazard move
- * and a non-hazard variant scores within MANDATORY_HAZARD_FLEX_MARGIN of
- * it. A mandatory pick that happens to also be a real hazard-setter can
- * otherwise "hog" that role and hazard-dedup-block a genuinely better
- * teammate later (e.g. Groudon-Primal's Stealth Rock set blocking a
- * Glimmora pick that would otherwise round out the team) — real
- * teambuilding runs the opposite way, switching the mandatory mon to an
- * attacking set (Swords Dance / Rock Polish) specifically BECAUSE something
- * else already covers hazards. Exported as its own pure function (only
- * needs `.set`/`.standaloneCeiling`, no store/network access) so this
- * decision is unit-testable without pulling in real Smogon variant data.
+ * Choose a mandatory pick's build from its real, already-scored variants:
+ *  1. Restrict to dex-analysis/local-evidence variants FIRST, whenever at
+ *     least one exists — a raw usage-stats spread only gets considered at
+ *     all when NO written/derived variant exists. This mirrors
+ *     candidate-pool.ts's own dex-over-usage priority for a single-set pick
+ *     exactly (absolute, not score-based): a written analysis is a curated
+ *     build, a usage-stats spread is just "whatever the highest-count real
+ *     games happened to run," which can out-score a written analysis
+ *     against one specific opponent's threat list without being a build
+ *     anyone should actually be handed.
+ *  2. Within whichever pool that leaves, prefer the single best-scoring
+ *     variant, UNLESS it carries a hazard move and a non-hazard variant
+ *     scores within MANDATORY_HAZARD_FLEX_MARGIN of it — a mandatory pick
+ *     that's also a real hazard-setter can otherwise "hog" that role and
+ *     hazard-dedup-block a genuinely better teammate later (e.g.
+ *     Groudon-Primal's Stealth Rock set blocking a Glimmora pick that would
+ *     otherwise round out the team); real teambuilding runs the opposite
+ *     way, switching the mandatory mon to an attacking set specifically
+ *     BECAUSE something else already covers hazards.
+ * Exported as its own pure function (only needs `.set`/`.standaloneCeiling`/
+ * `.source`, no store/network access) so this decision is unit-testable
+ * without pulling in real Smogon variant data.
  */
-export function pickBestMandatoryVariant<T extends { set: MatchedSet; standaloneCeiling: number }>(candidates: T[]): T | null {
+export function pickBestMandatoryVariant<T extends { set: MatchedSet; standaloneCeiling: number; source: KnownSetSource }>(candidates: T[]): T | null {
+  const nonUsage = candidates.filter((c) => c.source !== 'usage');
+  const pool = nonUsage.length ? nonUsage : candidates;
+
   let best: T | null = null;
   let bestNoHazard: T | null = null;
-  for (const cand of candidates) {
+  for (const cand of pool) {
     if (!best || cand.standaloneCeiling > best.standaloneCeiling) best = cand;
     if (!hazardMovesOf(cand.set).length && (!bestNoHazard || cand.standaloneCeiling > bestNoHazard.standaloneCeiling)) bestNoHazard = cand;
   }
   if (best && bestNoHazard && hazardMovesOf(best.set).length && bestNoHazard.standaloneCeiling >= best.standaloneCeiling - MANDATORY_HAZARD_FLEX_MARGIN) {
-    return bestNoHazard;
+    best = bestNoHazard;
   }
   return best;
 }
@@ -457,7 +481,10 @@ export async function buildCounterTeam(
   const affinity = await buildAffinityMatrix(formatid, scored);
   const picked = searchTeam(scored, resolvedThreats, affinity, mandatoryIdx);
   const { team: requirementsFixed, unmet } = enforceRequirements(picked, scored, gen, config.requirements, config.mandatorySpecies, affinity);
-  const repaired = enforceTopTierCap(requirementsFixed, scored, gen, config.requirements, config.mandatorySpecies, affinity);
+  const bulked = await enforceBulkRequirement(requirementsFixed, scored, gen, config.requirements, config.mandatorySpecies, affinity, store, formatid, scoreKnownSet);
+  const capped = enforceTopTierCap(bulked, scored, gen, config.requirements, config.mandatorySpecies, affinity);
+  const { team: repaired, warning: removalWarning } = enforceHazardRemoval(capped, scored, gen, config.requirements, config.mandatorySpecies, affinity);
+  if (removalWarning) warnings.push(removalWarning);
 
   const team = repaired.map((c) => ({ species: c.species, set: c.set, source: c.source, rationale: c.rationale }));
   return { threats, resolvedThreats, team, unmetRequirements: unmet, warnings };
@@ -864,4 +891,206 @@ function enforceTopTierCap(
   }
 
   return result;
+}
+
+// A real defensive EV spread (HP + a defensive stat) totaling at least
+// this much — high enough that a genuine wall/pivot clears it (a classic
+// 252 HP/252 Def spread is 504), but a bulky-offense hybrid with real
+// investment in one defensive stat can too. A Choice item/max-offense
+// glass cannon (e.g. 248 HP/248 Atk/12 Def) falls well short.
+const BULKY_EV_THRESHOLD = 320;
+// A team that's ALL sharp offensive threats can't actually switch into a
+// real, dangerous setup sweeper (a Dragon Dance Necrozma-Dusk-Mane, an
+// Ultra Necrozma) — it just gets run over, since scoreMatchup's own
+// per-threat scoring rewards winning a damage race, not surviving to take
+// the hit at all. This is a team-structure requirement, the same way speed
+// control or a type requirement is — at least this many non-mandatory picks
+// need a real defensive backbone, not just raw power.
+const MIN_BULKY_PICKS = 2;
+
+function bulkScore(set: MatchedSet): number {
+  return (set.evs.hp ?? 0) + (set.evs.def ?? 0) + (set.evs.spd ?? 0);
+}
+function isBulky(set: MatchedSet): boolean {
+  return bulkScore(set) >= BULKY_EV_THRESHOLD;
+}
+
+/** A Focus Sash hazard-setting lead (sash Glimmora, Deoxys-Speed, Smeargle,
+ *  ...) signals a hyper-offense team archetype on its own — the lead sets
+ *  hazards once and is expected to die, and the other 5 slots are meant to
+ *  be setup sweepers/breakers, not defensive picks. The bulk requirement
+ *  below doesn't apply to that structure at all. */
+function isHazardLead(set: MatchedSet): boolean {
+  return toID(set.item || '') === 'focussash' && hazardMovesOf(set).length > 0;
+}
+
+/**
+ * Runs after enforceRequirements: if fewer than MIN_BULKY_PICKS
+ * non-mandatory members carry real defensive investment, upgrade the
+ * least-bulky of them (worst first). For each, tries a bulkier REAL variant
+ * of the SAME species first (Smogon's own dex analysis very often has a
+ * distinct "Defensive" role alongside the offensive one already picked —
+ * keeping the species is strictly better than swapping it out, since it
+ * doesn't disturb whatever else the search already liked about that slot),
+ * then falls back to swapping in a different bulky species from `scored` —
+ * preferring a top-tier one so this doesn't just get undone by
+ * enforceTopTierCap right after — using the same "don't break a requirement
+ * this member was the only satisfier of" check the other repair passes use.
+ * Skipped entirely for a team already built around a sash hazard lead (see
+ * isHazardLead).
+ */
+async function enforceBulkRequirement(
+  team: ScoredCandidate[],
+  scored: ScoredCandidate[],
+  gen: Generation,
+  requirements: Requirement[],
+  mandatorySpecies: string[],
+  affinity: Map<string, number>,
+  store: Datastore,
+  formatid: string,
+  scoreKnownSet: (species: string, known: KnownSet) => Promise<ScoredCandidate | null>,
+): Promise<ScoredCandidate[]> {
+  const result = [...team];
+  if (result.some((p) => isHazardLead(p.set))) return result;
+  const nonMandatory = result.map((p, i) => ({ p, i })).filter(({ p }) => !mandatorySpecies.includes(p.species));
+  const bulkyCount = nonMandatory.filter(({ p }) => isBulky(p.set)).length;
+  const needed = MIN_BULKY_PICKS - bulkyCount;
+  if (needed <= 0) return result;
+
+  const toUpgrade = nonMandatory
+    .filter(({ p }) => !isBulky(p.set))
+    .sort((a, b) => bulkScore(a.p.set) - bulkScore(b.p.set)) // least bulky first
+    .slice(0, needed);
+
+  for (const { i } of toUpgrade) {
+    const current = result[i]!;
+
+    // First choice: a bulkier real variant of this SAME species, if one
+    // exists — doesn't cost the slot's Species-Clause/hazard/requirement
+    // contribution at all, just swaps the build.
+    const variants = await getKnownSetVariants(store, gen, formatid, current.species);
+    let bulkyRescored: ScoredCandidate | null = null;
+    for (const rawKnown of variants) {
+      if (!isBulky(rawKnown.set)) continue;
+      const filled = await fillRealisticSet(gen, formatid, rawKnown);
+      if (!isBulky(filled.set)) continue; // padding shouldn't change this, but stay honest if it somehow did
+      const rescored = await scoreKnownSet(current.species, filled);
+      if (rescored && (!bulkyRescored || rescored.standaloneCeiling > bulkyRescored.standaloneCeiling)) bulkyRescored = rescored;
+    }
+    if (bulkyRescored) {
+      result[i] = {
+        ...bulkyRescored,
+        rationale: [...bulkyRescored.rationale, 'Switched to a bulkier real set — the team needs a genuine pivot into setup sweepers, not just offense.'],
+      };
+      continue;
+    }
+
+    const pickedIds = new Set(result.map((q) => toID(q.species)));
+    const pickedDexNums = new Set(result.map((q) => q.dexNum).filter((n): n is number => n !== undefined));
+    const pickedHazards = new Set(result.flatMap((q) => hazardMovesOf(q.set)));
+    const candidates = scored
+      .filter((c) => isBulky(c.set))
+      .filter((c) => !pickedIds.has(toID(c.species)))
+      .filter((c) => c.dexNum === undefined || !pickedDexNums.has(c.dexNum))
+      .filter((c) => !hazardMovesOf(c.set).some((m) => pickedHazards.has(m)))
+      .filter((c) =>
+        requirements.every((r) => {
+          const satisfiedBefore = result.some((q) => r.satisfies(gen, q));
+          if (!satisfiedBefore) return true;
+          return result.some((q, j) => (j === i ? r.satisfies(gen, c) : r.satisfies(gen, q)));
+        }),
+      )
+      .map((c) => ({
+        c,
+        value: c.qualityScore + c.weightedSum + result.reduce((s, q, j) => (j === i ? s : s + TEAMMATE_WEIGHT * pairAffinity(affinity, c.idx, q.idx)), 0),
+      }))
+      .sort((a, b) => (Number(b.c.isTopTier) - Number(a.c.isTopTier)) || b.value - a.value); // prefer a top-tier bulky option first
+
+    if (candidates.length) {
+      const upgrade = candidates[0]!.c;
+      result[i] = {
+        ...upgrade,
+        rationale: [...upgrade.rationale, 'Added for real defensive investment — the team needs a genuine pivot into setup sweepers, not just offense.'],
+      };
+    }
+  }
+
+  return result;
+}
+
+const REMOVAL_MOVES = new Set(['defog', 'rapidspin', 'mortalspin', 'courtchange', 'tidyup']);
+function hasRemovalMove(set: MatchedSet): boolean {
+  return set.moves.map(toID).some((m) => REMOVAL_MOVES.has(m));
+}
+
+/**
+ * If nothing on the team can clear entry hazards, the whole team eats
+ * repeated Stealth Rock/Spikes chip on every switch-in. Fix, in order:
+ * (1) swap in a real Defog/Rapid Spin user already among the scored
+ * candidates for team-wide removal, if one exists without breaking a
+ * currently-met requirement; (2) otherwise, give Heavy-Duty Boots to every
+ * pick that isn't locked into a different item by its own forme (a Mega
+ * Stone, Rusted Sword, an Orb) and where doing so doesn't strip away a
+ * requirement's only satisfier (a team's sole Choice Scarf holding up the
+ * speed-control requirement, for instance).
+ */
+function enforceHazardRemoval(
+  team: ScoredCandidate[],
+  scored: ScoredCandidate[],
+  gen: Generation,
+  requirements: Requirement[],
+  mandatorySpecies: string[],
+  affinity: Map<string, number>,
+): { team: ScoredCandidate[]; warning?: string } {
+  if (team.some((p) => hasRemovalMove(p.set))) return { team };
+
+  const pickedIds = new Set(team.map((p) => toID(p.species)));
+  const pickedDexNums = new Set(team.map((p) => p.dexNum).filter((n): n is number => n !== undefined));
+  const pickedHazards = new Set(team.flatMap((p) => hazardMovesOf(p.set)));
+  const defoggers = scored
+    .filter((c) => hasRemovalMove(c.set))
+    .filter((c) => !pickedIds.has(toID(c.species)))
+    .filter((c) => c.dexNum === undefined || !pickedDexNums.has(c.dexNum))
+    .filter((c) => !hazardMovesOf(c.set).some((m) => pickedHazards.has(m)))
+    .sort((a, b) => (Number(b.isTopTier) - Number(a.isTopTier)) || b.qualityScore + b.weightedSum - (a.qualityScore + a.weightedSum));
+
+  if (defoggers.length) {
+    const removable = team
+      .map((p, i) => ({ p, i }))
+      .filter(({ p }) => !mandatorySpecies.includes(p.species))
+      .filter(({ p }) => !requirements.some((r) => r.satisfies(gen, p) && team.filter((q) => q !== p).every((q) => !r.satisfies(gen, q))))
+      .sort(
+        (a, b) =>
+          a.p.qualityScore + a.p.weightedSum + team.reduce((s, q) => s + TEAMMATE_WEIGHT * pairAffinity(affinity, a.p.idx, q.idx), 0) -
+          (b.p.qualityScore + b.p.weightedSum + team.reduce((s, q) => s + TEAMMATE_WEIGHT * pairAffinity(affinity, b.p.idx, q.idx), 0)),
+      )[0];
+    if (removable) {
+      const next = [...team];
+      const pick = defoggers[0]!;
+      next[removable.i] = { ...pick, rationale: [...pick.rationale, 'Added for hazard removal — nothing else on the team could clear Stealth Rock/Spikes.'] };
+      return { team: next };
+    }
+  }
+
+  // No viable Defog/Spin swap-in — fall back to Heavy-Duty Boots on every
+  // eligible pick instead.
+  let bootedAny = false;
+  const next = team.map((p, i) => {
+    const forcedItem = speciesMeta(gen, p.set.baseSpecies)?.requiredItem;
+    if (forcedItem) return p; // Rusted Sword / Red Orb / Blue Orb / a Mega Stone — can't be swapped off
+    if (toID(p.set.item || '') === 'heavydutyboots') return p;
+    const simulated: ScoredCandidate = { ...p, set: { ...p.set, item: 'Heavy-Duty Boots' } };
+    const breaksRequirement = requirements.some((r) => {
+      const satisfiedBefore = team.some((q) => r.satisfies(gen, q));
+      if (!satisfiedBefore) return false;
+      return !team.some((q, j) => (j === i ? r.satisfies(gen, simulated) : r.satisfies(gen, q)));
+    });
+    if (breaksRequirement) return p; // e.g. this pick's Choice Scarf is the team's only speed control
+    bootedAny = true;
+    return { ...p, set: { ...p.set, item: 'Heavy-Duty Boots' }, rationale: [...p.rationale, 'Given Heavy-Duty Boots — no hazard removal on the team, so every eligible pick needs to be self-sufficient against Stealth Rock/Spikes.'] };
+  });
+  return {
+    team: next,
+    warning: bootedAny ? 'No hazard removal was available for this team — every eligible pick was given Heavy-Duty Boots instead.' : undefined,
+  };
 }

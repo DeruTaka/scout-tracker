@@ -771,14 +771,14 @@ Rules<br />
   }, 20000);
 
   it('pickBestMandatoryVariant flexes off a hazard move that only nominally scores best, but not when the hazard variant is clearly stronger', () => {
-    const rocks = { set: mon({ species: 'Groudon-Primal', moves: ['Stealth Rock', 'Precipice Blades'] }), standaloneCeiling: 100 };
-    const attackClose = { set: mon({ species: 'Groudon-Primal', moves: ['Swords Dance', 'Precipice Blades'] }), standaloneCeiling: 90 };
+    const rocks = { set: mon({ species: 'Groudon-Primal', moves: ['Stealth Rock', 'Precipice Blades'] }), standaloneCeiling: 100, source: 'dex' as const };
+    const attackClose = { set: mon({ species: 'Groudon-Primal', moves: ['Swords Dance', 'Precipice Blades'] }), standaloneCeiling: 90, source: 'dex' as const };
     // Within MANDATORY_HAZARD_FLEX_MARGIN (15) of the hazard variant — real
     // teambuilding runs the attacking set here specifically so something
     // else can hold the hazard role without a hazard-dedup conflict.
     expect(pickBestMandatoryVariant([rocks, attackClose])).toBe(attackClose);
 
-    const attackFar = { set: mon({ species: 'Groudon-Primal', moves: ['Swords Dance', 'Precipice Blades'] }), standaloneCeiling: 50 };
+    const attackFar = { set: mon({ species: 'Groudon-Primal', moves: ['Swords Dance', 'Precipice Blades'] }), standaloneCeiling: 50, source: 'dex' as const };
     // Far below the margin — the hazard variant is genuinely, meaningfully
     // better, so it's kept despite the hazard-dedup risk.
     expect(pickBestMandatoryVariant([rocks, attackFar])).toBe(rocks);
@@ -787,9 +787,28 @@ Rules<br />
     expect(pickBestMandatoryVariant([rocks])).toBe(rocks);
 
     // No hazard involved anywhere — plain best-scoring wins, unaffected.
-    const attack1 = { set: mon({ species: 'Groudon-Primal', moves: ['Swords Dance'] }), standaloneCeiling: 80 };
-    const attack2 = { set: mon({ species: 'Groudon-Primal', moves: ['Rock Polish'] }), standaloneCeiling: 95 };
+    const attack1 = { set: mon({ species: 'Groudon-Primal', moves: ['Swords Dance'] }), standaloneCeiling: 80, source: 'dex' as const };
+    const attack2 = { set: mon({ species: 'Groudon-Primal', moves: ['Rock Polish'] }), standaloneCeiling: 95, source: 'dex' as const };
     expect(pickBestMandatoryVariant([attack1, attack2])).toBe(attack2);
+  });
+
+  it('pickBestMandatoryVariant always prefers a dex-analysis/local variant over a usage-stats one, regardless of score, whenever one exists', () => {
+    const usageBest = { set: mon({ species: 'Groudon-Primal', moves: ['Precipice Blades', 'Heat Crash'] }), standaloneCeiling: 100, source: 'usage' as const };
+    const dexClose = { set: mon({ species: 'Groudon-Primal', moves: ['Rock Polish', 'Swords Dance'] }), standaloneCeiling: 85, source: 'dex' as const };
+    // A written dex analysis is more trustworthy than "whatever the top
+    // usage-stats spread happened to be against this one opponent," so it
+    // wins even though it scored lower here.
+    expect(pickBestMandatoryVariant([usageBest, dexClose])).toBe(dexClose);
+
+    const dexFar = { set: mon({ species: 'Groudon-Primal', moves: ['Rock Polish', 'Swords Dance'] }), standaloneCeiling: 50, source: 'dex' as const };
+    // Even when the usage-stats variant scores far higher, ANY real
+    // dex-analysis/local variant still wins — this is an absolute
+    // preference, not a soft score margin (a flat margin was consistently
+    // too small to matter against real matchup score spreads in practice).
+    expect(pickBestMandatoryVariant([usageBest, dexFar])).toBe(dexFar);
+
+    // Only a usage-stats variant available at all — nothing to flex to.
+    expect(pickBestMandatoryVariant([usageBest])).toBe(usageBest);
   });
 
   it('resolves Groudon-Primal/Kyogre-Primal dex-analysis sets via Smogon\'s base-species page (they don\'t get their own), filtered to the orb item', async () => {
