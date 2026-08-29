@@ -7,18 +7,19 @@
 // far] + h(node) [an optimistic estimate of the best remaining slots could
 // add], so the search can look past a locally-strong-but-narrow pick in
 // favor of a combination that covers the whole threat list better. Mandatory
-// picks (Koraidon) and type-coverage requirements (Steel/Dark/Fairy) are
+// picks and coverage requirements are per-format (see tier-config.ts) and
 // enforced as hard constraints, not just scoring bonuses — see
-// buildCounterTeam and enforceTypeRequirements.
+// buildCounterTeam and enforceRequirements.
 import type { Generation, GenerationNum } from '@pkmn/data';
 import type { Datastore } from '../store/datastore.js';
 import type { MatchedSet } from '../types.js';
-import { toID } from '../data/dex.js';
+import { toID, speciesMeta } from '../data/dex.js';
 import type { ThreatProfile } from './threat-profile.js';
 import { getBestKnownSet, getKnownSetVariants, fillRealisticSet, allCandidateSpecies, type KnownSet, type KnownSetSource } from './candidate-pool.js';
 import { scoreMatchup, type MatchupResult } from './score.js';
 import { getHistoricalWinRates, type WinRate } from './historical.js';
 import { getUsageWeight, getUsageRankMap, getTeammateAffinity } from '../data/usage-provider.js';
+import { getTierConfig, type Requirement } from './tier-config.js';
 
 export interface TeamPick {
   species: string;
@@ -31,41 +32,29 @@ export interface CounterTeamResult {
   threats: ThreatProfile;
   resolvedThreats: { species: string; weight: number; set: MatchedSet; source: KnownSetSource }[];
   team: TeamPick[];
-  /** Type/Tera coverage requirements that could NOT be met (no legal,
-   *  species-clause-compatible candidate was available) — normally empty. */
+  /** Requirements that could NOT be met (no legal, Species-Clause-compatible
+   *  candidate was available) — normally empty. */
   unmetRequirements: string[];
 }
 
 const TEAM_SIZE = 6;
 const HISTORY_WEIGHT = 0.6; // points per (winRate% - 50), scaled by sample confidence
 const EVIDENCE_BONUS = 4; // small nudge for real store-derived sets over a Smogon fallback
-// Rank-based, not raw-percent-based: usage% is heavily right-skewed (staples
-// sit at 20-90%, everything else falls off a cliff under ~10%), so a linear
-// weight on the raw percent barely separates rank 5 from rank 50. Scoring by
-// how far inside the viability cutoff a candidate sits gives a much steeper,
-// more decisive gradient — favoring genuine S/A-tier picks over a B--tier
-// one long before matchup differences could ever outweigh it.
-const VIABILITY_WEIGHT = 3;
 const TEAMMATE_WEIGHT = 40; // points per unit of real teammate co-occurrence (0..1-ish) with an already-picked mon
 const UNCOVERED_FLOOR = -100; // sentinel "this threat is entirely unaddressed" coverage level
-// A stand-in for "B- rank and above" on a community Viability Rankings
-// thread, since there's no VR thread to parse — Smogon's own gen9ubers chaos
-// stats track ~200 species total, and Ubers is small/centralized enough that
-// the top ~45 by real usage is a solid proxy for "actually played," not
-// filler that happened to land a good calc.
-const MAX_VIABILITY_RANK = 45;
-// A candidate outside that rank cutoff (or untracked by Smogon at all) is
-// still allowed through if it's a RECURRING local trend — this many separate
-// real sightings in this app's own scouted games, not a single one-off. This
-// does NOT exempt a candidate from the legality check below — a banned mon
-// stays banned no matter how many old replays it appears in.
+// A candidate that doesn't clear its tier's viability bar (usage rank or VR
+// tier — see tier-config.ts) is still allowed through if it's a RECURRING
+// local trend — this many separate real sightings in this app's own scouted
+// games, not a single one-off. This does NOT exempt a candidate from the
+// legality check below — a banned mon stays banned no matter how many old
+// replays it appears in.
 const MIN_LOCAL_RECURRENCE = 3;
 const NODE_BUDGET = 8000; // hard cap on search expansions, so a huge candidate pool can't hang the request
 const BRANCH_CAP = 10; // per node, only the top-N unpicked candidates by immediate marginal gain are explored
-// Moves banned by clauses standard in every Ubers ruleset regardless of tier
-// list — Baton Pass Clause and the OHKO Clause. Fixed rules, not usage data.
+// Moves banned by clauses standard in every Ubers-family ruleset regardless
+// of tier list — Baton Pass Clause and the OHKO Clause. Fixed rules, not
+// usage data.
 const BANNED_MOVES = new Set(['batonpass', 'fissure', 'guillotine', 'horndrill', 'sheercold']);
-const MANDATORY_SPECIES = ['Koraidon'];
 // Entry hazards don't stack across setters the way it'd take to justify a
 // second moveslot spent on the same one: Stealth Rock only ever has one
 // layer no matter who sets it, and a single Toxic Spikes/Spikes setter can
@@ -73,21 +62,18 @@ const MANDATORY_SPECIES = ['Koraidon'];
 // A second team member carrying the identical hazard move is a wasted slot,
 // not real redundancy — at most one pick may carry each.
 const HAZARD_MOVES = new Set(['stealthrock', 'spikes', 'toxicspikes', 'stickyweb', 'steelsurge']);
-// Type-or-Tera coverage every real Ubers team is expected to carry, given how
-// saturated the tier is with Fairy (Zacian-Crowned), Dragon, and Psychic
-// threats. Steel is a plain type requirement (no Tera substitute) per the
-// user's own teambuilding standard.
-const TYPE_REQUIREMENTS: { type: string; allowTera: boolean }[] = [
-  { type: 'Steel', allowTera: false },
-  { type: 'Dark', allowTera: true },
-  { type: 'Fairy', allowTera: true },
-];
 
-/** True if `sp` is legal for Ubers: not AG-banned (Ubers itself IS the tier
- *  restricted mons play in, but a small set of things are too strong even
- *  for THAT — e.g. Miraidon), not Illegal/CAP, and actually obtainable in
- *  this generation (isNonstandard null). Sourced from @pkmn/dex's own
- *  Smogon-tier data, not a hand-maintained banlist. */
+/** True if `sp` is legal: not AG-banned (a tier's own restricted-Pokemon
+ *  format IS the tier those mons play in, but a small set of things are too
+ *  strong even for that — e.g. Miraidon in Ubers), not Illegal/CAP, and
+ *  actually obtainable in this generation. Sourced from @pkmn/dex's own
+ *  Smogon-tier data, not a hand-maintained banlist — but that data only
+ *  exists for species the CURRENT gen's regional dex carries, so this is
+ *  skipped entirely for tiers whose viability comes from a curated list
+ *  instead (see tier-config.ts's trustCuratedLegality): a National Dex-only
+ *  species like Marshadow has no 'tier'/isNonstandard data to check against
+ *  in the first place, and its presence on that curated list already means
+ *  "legal and worth using" for that tier. */
 function isTierLegal(sp: { tier?: string; isNonstandard?: string | null } | undefined): boolean {
   if (!sp) return false;
   if (sp.tier === 'AG' || sp.tier === 'Illegal' || sp.tier === 'CAP') return false;
@@ -107,24 +93,12 @@ function sampleConfidence(n: number): number {
   return Math.min(n / 5, 1);
 }
 
-function speciesTypes(gen: Generation, baseSpecies: string): string[] {
-  const sp = gen.species.get(baseSpecies);
-  return (sp?.types ?? []).map((t) => t.toLowerCase());
-}
-
-function satisfiesTypeRequirement(gen: Generation, pick: { set: MatchedSet }, req: { type: string; allowTera: boolean }): boolean {
-  const t = req.type.toLowerCase();
-  if (speciesTypes(gen, pick.set.baseSpecies).includes(t)) return true;
-  if (req.allowTera && (pick.set.tera ?? '').toLowerCase() === t) return true;
-  return false;
-}
-
 interface ScoredCandidate {
   idx: number; // this candidate's own position in the `scored` array — lets later passes (repair) do affinity/coverage lookups without re-searching
   species: string;
   set: MatchedSet;
   source: KnownSetSource;
-  viability: number; // raw Smogon usage weight, 0 if untracked
+  viability: number; // raw Smogon usage weight, 0 if untracked (display only)
   dexNum: number | undefined; // national dex number — Species Clause groups on this, not on forme name
   perThreat: Map<string, { result: MatchupResult; weight: number; threatSpecies: string }>;
   weightedSum: number; // this mon's own best-case weighted matchup total across every threat, independent of teammates
@@ -139,6 +113,8 @@ export async function buildCounterTeam(
   formatid: string,
   threats: ThreatProfile,
 ): Promise<CounterTeamResult> {
+  const config = getTierConfig(formatid);
+
   const resolvedThreats: CounterTeamResult['resolvedThreats'] = [];
   for (const t of threats.threats) {
     const known = await getBestKnownSet(store, gen, formatid, t.baseSpecies);
@@ -148,7 +124,7 @@ export async function buildCounterTeam(
 
   const threatIds = new Set(resolvedThreats.map((t) => toID(t.set.baseSpecies)));
   const historicalWinRates = getHistoricalWinRates(store, formatid, threatIds);
-  const candidateSpecies = await allCandidateSpecies(store, formatid);
+  const candidateSpecies = await allCandidateSpecies(store, formatid, config.extraCandidateSpecies);
   const genNum = gen.num as GenerationNum;
   const usageRanks = await getUsageRankMap(formatid);
 
@@ -157,17 +133,19 @@ export async function buildCounterTeam(
   /** Score one already-fetched real set for `species` against every
    *  resolved threat. Returns null if it fails legality or viability. */
   const scoreKnownSet = async (species: string, known: KnownSet): Promise<ScoredCandidate | null> => {
-    const sp = gen.species.get(known.set.baseSpecies);
-    if (!isTierLegal(sp)) return null; // e.g. Miraidon: tier 'AG', banned even from Ubers
+    const meta = speciesMeta(gen, known.set.baseSpecies);
+    if (config.trustCuratedLegality !== true) {
+      const sp = gen.species.get(known.set.baseSpecies);
+      if (!isTierLegal(sp)) return null; // e.g. Miraidon: tier 'AG', banned even from Ubers
+    }
     if (hasBannedMove(known.set)) return null; // Baton Pass / OHKO Clause
 
-    const rank = usageRanks.get(toID(species));
-    const viableByRank = rank !== undefined && rank <= MAX_VIABILITY_RANK;
+    const viability = config.getViability(species, { usageRanks });
     const viableLocally = known.source === 'store' && (known.localCount ?? 0) >= MIN_LOCAL_RECURRENCE;
-    if (!viableByRank && !viableLocally) return null; // not actually played in this tier
+    if (!viability.passes && !viableLocally) return null; // not actually played in this tier
 
-    const viability = await getUsageWeight(formatid, species);
-    const dexNum = sp?.num;
+    const usageWeight = await getUsageWeight(formatid, species);
+    const dexNum = meta?.num;
 
     const perThreat = new Map<string, { result: MatchupResult; weight: number; threatSpecies: string }>();
     let weightedSum = 0;
@@ -183,25 +161,20 @@ export async function buildCounterTeam(
     // genuine sample-size signal independent of how recent those games were.
     const historyBonus = hr && hr.total ? HISTORY_WEIGHT * (hr.weightedWinPercent - 50) * sampleConfidence(hr.total) : 0;
     const evidenceBonus = known.source === 'store' ? EVIDENCE_BONUS : 0;
-    // Rank 1 scores MAX_VIABILITY_RANK points, the cutoff itself scores ~0 —
-    // a steep, decisive gradient (see VIABILITY_WEIGHT). A locally-recurring
-    // pick with no Smogon rank at all gets a modest flat credit instead of 0,
-    // since it cleared its own (stricter) bar.
-    const viabilityScore = viableByRank ? (MAX_VIABILITY_RANK - rank! + 1) * VIABILITY_WEIGHT : VIABILITY_WEIGHT * 5;
-    const qualityScore = viabilityScore + historyBonus + evidenceBonus;
+    const qualityScore = viability.score + historyBonus + evidenceBonus;
 
     return {
       idx: -1, // assigned once pushed into `scored`
       species,
       set: known.set,
       source: known.source,
-      viability,
+      viability: usageWeight,
       dexNum,
       perThreat,
       weightedSum,
       qualityScore,
       standaloneCeiling: qualityScore + weightedSum,
-      rationale: buildRationale(perThreat, hr, known.source, viability, rank),
+      rationale: buildRationale(perThreat, hr, known.source, viability.label),
     };
   };
 
@@ -217,7 +190,7 @@ export async function buildCounterTeam(
   // "most popular" when a different real, evidenced spread/Tera/item choice
   // for the same species handles the real matchup better.
   const mandatoryIdx: number[] = [];
-  for (const species of MANDATORY_SPECIES) {
+  for (const species of config.mandatorySpecies) {
     const variants = await getKnownSetVariants(store, gen, formatid, species);
     let best: ScoredCandidate | null = null;
     for (const rawKnown of variants) {
@@ -227,14 +200,14 @@ export async function buildCounterTeam(
     }
     if (!best) {
       // No variant cleared legality/viability (shouldn't happen for a real
-      // Ubers staple) — fall back to whatever's known at all, unfiltered,
+      // tier staple) — fall back to whatever's known at all, unfiltered,
       // rather than silently dropping a supposedly-mandatory pick.
       const rawKnown = await getBestKnownSet(store, gen, formatid, species);
       if (rawKnown) {
         const known = await fillRealisticSet(gen, formatid, rawKnown);
         best = await scoreKnownSet(species, known);
         if (!best) {
-          const dexNum = gen.species.get(known.set.baseSpecies)?.num;
+          const dexNum = speciesMeta(gen, known.set.baseSpecies)?.num;
           best = {
             idx: -1, species, set: known.set, source: known.source, viability: 0, dexNum,
             perThreat: new Map(), weightedSum: 0, qualityScore: 0, standaloneCeiling: 0,
@@ -261,7 +234,7 @@ export async function buildCounterTeam(
 
   const affinity = await buildAffinityMatrix(formatid, scored);
   const picked = searchTeam(scored, resolvedThreats, affinity, mandatoryIdx);
-  const { team: repaired, unmet } = enforceTypeRequirements(picked, scored, gen, resolvedThreats, affinity);
+  const { team: repaired, unmet } = enforceRequirements(picked, scored, gen, config.requirements, config.mandatorySpecies, affinity);
 
   const team = repaired.map((c) => ({ species: c.species, set: c.set, source: c.source, rationale: c.rationale }));
   return { threats, resolvedThreats, team, unmetRequirements: unmet };
@@ -292,8 +265,7 @@ function buildRationale(
   perThreat: Map<string, { result: MatchupResult; weight: number; threatSpecies: string }>,
   hr: WinRate | undefined,
   source: KnownSetSource,
-  viability: number,
-  rank: number | undefined,
+  viabilityLabel: string,
 ): string[] {
   const notes: string[] = [];
   const ranked = [...perThreat.values()].sort((a, b) => b.result.score - a.result.score);
@@ -301,15 +273,13 @@ function buildRationale(
   const best = notable.length ? notable : ranked.slice(0, 1);
   for (const { result, weight, threatSpecies } of best) {
     const bits: string[] = [];
-    if (result.candidateOhko) bits.push('OHKOs');
-    else if (result.candidateGuaranteed2hko) bits.push('guaranteed 2HKO');
-    if (result.candidateFaster) bits.push('outspeeds');
+    if (result.candidateOhko) bits.push(result.candidateActsFirst ? 'OHKOs' : 'OHKOs, but only if it survives first (slower, no Trick Room)');
+    else if (result.candidateGuaranteed2hko) bits.push(result.candidateActsFirst ? 'guaranteed 2HKO' : 'guaranteed 2HKO if it survives first');
+    if (result.candidateActsFirst && result.candidateFaster) bits.push(result.candidateNaturallyFaster ? 'naturally outspeeds' : 'outspeeds (needs Scarf)');
     const lead = notable.length ? 'Strong into' : 'Best available matchup:';
     notes.push(`${lead} ${threatSpecies} (${weight.toFixed(0)}% usage)${bits.length ? ' — ' + bits.join(', ') : ''}.`);
   }
-  if (rank !== undefined) notes.push(`#${rank} in real ${(viability * 100).toFixed(1)}% usage for this tier.`);
-  else if (viability > 0) notes.push(`~${(viability * 100).toFixed(1)}% real usage in this tier.`);
-  else notes.push('Not tracked by Smogon usage stats — kept only for its recurring local scouting history.');
+  notes.push(viabilityLabel.charAt(0).toUpperCase() + viabilityLabel.slice(1) + '.');
   if (hr && hr.total >= 2) {
     notes.push(`Historically ${hr.wins}-${hr.total - hr.wins} in scouted games vs. cores with 2+ of these threats.`);
   }
@@ -404,8 +374,8 @@ function searchTeam(
     .sort((a, b) => b.value - a.value);
 
   // Mandatory picks are seeded into the root node up front — the search
-  // never gets a chance to "not" pick Koraidon, it only fills the remaining
-  // slots around it.
+  // never gets a chance to "not" pick them, it only fills the remaining
+  // slots around them.
   let start: SearchNode = { pickedIdx: [], coverage: new Map(threatIds.map((id) => [id, UNCOVERED_FLOOR])), g: 0 };
   for (const idx of mandatoryIdx) start = applyPick(start, idx, scored, affinity);
 
@@ -474,25 +444,26 @@ function searchTeam(
 
 /**
  * Hard-constraint repair pass: the search optimizes for threat coverage and
- * doesn't know about type-requirement rules, so after it returns, swap in a
- * real, legal, Species-Clause-compatible replacement for any unmet
- * requirement (Steel / Dark-or-Tera / Fairy-or-Tera). The replaced slot is
- * always the current team's weakest, non-mandatory member that isn't itself
- * the ONLY thing satisfying some other still-relevant requirement — so
- * fixing one requirement never silently breaks another.
+ * doesn't know about this tier's coverage requirements, so after it returns,
+ * swap in a real, legal, Species-Clause-compatible, non-duplicate-hazard
+ * replacement for any unmet requirement. The replaced slot is always the
+ * current team's weakest, non-mandatory member that isn't itself the ONLY
+ * thing satisfying some other still-relevant requirement — so fixing one
+ * requirement never silently breaks another.
  */
-function enforceTypeRequirements(
+function enforceRequirements(
   picked: ScoredCandidate[],
   scored: ScoredCandidate[],
   gen: Generation,
-  resolvedThreats: CounterTeamResult['resolvedThreats'],
+  requirements: Requirement[],
+  mandatorySpecies: string[],
   affinity: Map<string, number>,
 ): { team: ScoredCandidate[]; unmet: string[] } {
   const team = [...picked];
   const unmet: string[] = [];
 
-  for (const req of TYPE_REQUIREMENTS) {
-    if (team.some((p) => satisfiesTypeRequirement(gen, p, req))) continue;
+  for (const req of requirements) {
+    if (team.some((p) => req.satisfies(gen, p))) continue;
 
     const pickedIds = new Set(team.map((p) => toID(p.species)));
     const pickedDexNums = new Set(team.map((p) => p.dexNum).filter((n): n is number => n !== undefined));
@@ -501,7 +472,7 @@ function enforceTypeRequirements(
       .filter((c) => !pickedIds.has(toID(c.species)))
       .filter((c) => c.dexNum === undefined || !pickedDexNums.has(c.dexNum))
       .filter((c) => !hazardMovesOf(c.set).some((m) => pickedHazards.has(m)))
-      .filter((c) => satisfiesTypeRequirement(gen, c, req))
+      .filter((c) => req.satisfies(gen, c))
       .map((c) => ({
         c,
         value: c.qualityScore + c.weightedSum + team.reduce((s, p) => s + TEAMMATE_WEIGHT * pairAffinity(affinity, c.idx, p.idx), 0),
@@ -509,30 +480,30 @@ function enforceTypeRequirements(
       .sort((a, b) => b.value - a.value);
 
     if (!replacementOptions.length) {
-      unmet.push(`${req.type}${req.allowTera ? ' (type or Tera)' : ''}`);
+      unmet.push(req.label);
       continue;
     }
 
     const removable = team
       .map((p, i) => ({ p, i }))
-      .filter(({ p }) => !MANDATORY_SPECIES.includes(p.species))
+      .filter(({ p }) => !mandatorySpecies.includes(p.species))
       .filter(({ p }) => {
-        const otherReqs = TYPE_REQUIREMENTS.filter((r) => r !== req);
+        const otherReqs = requirements.filter((r) => r !== req);
         // Never remove a member if it's the ONLY current pick satisfying
         // some other requirement.
-        return !otherReqs.some((r) => satisfiesTypeRequirement(gen, p, r) && team.filter((q) => q !== p).every((q) => !satisfiesTypeRequirement(gen, q, r)));
+        return !otherReqs.some((r) => r.satisfies(gen, p) && team.filter((q) => q !== p).every((q) => !r.satisfies(gen, q)));
       })
       .sort((a, b) => a.p.qualityScore + a.p.weightedSum - (b.p.qualityScore + b.p.weightedSum))[0];
 
     if (!removable) {
-      unmet.push(`${req.type}${req.allowTera ? ' (type or Tera)' : ''}`);
+      unmet.push(req.label);
       continue;
     }
 
     const replacement = replacementOptions[0]!.c;
     team[removable.i] = {
       ...replacement,
-      rationale: [...replacement.rationale, `Added for required ${req.type} coverage.`],
+      rationale: [...replacement.rationale, `Added for required ${req.label}.`],
     };
   }
 

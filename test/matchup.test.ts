@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { Datastore } from '../src/store/datastore.js';
-import { getGen } from '../src/data/dex.js';
+import { getGen, speciesMeta } from '../src/data/dex.js';
 import { parseUsageTable, parseScoutingDigest, buildThreatProfile } from '../src/matchup/threat-profile.js';
 import { scoreMatchup } from '../src/matchup/score.js';
 import { getHistoricalWinRates } from '../src/matchup/historical.js';
@@ -193,11 +193,60 @@ describe('scoreMatchup', () => {
     expect(result.candidateFaster).toBe(false);
     expect(result.score).toBeLessThan(-50);
   });
+
+  it('a Trick Room user acts first (and isn\'t discounted) despite being literally slower', () => {
+    // Torkoal (base 20 Speed) into Dragapult (base 142) — Torkoal never wins
+    // a real speed check, but Trick Room flips that, so its own damage
+    // should count at full value instead of the "might get hit first"
+    // discount a plain slow attacker eats.
+    const dragapult = mon({ species: 'Dragapult', baseSpecies: 'Dragapult', nature: 'Timid', evs: { spe: 252, hp: 4 }, moves: [] });
+    const trTorkoal = mon({
+      species: 'Torkoal', baseSpecies: 'Torkoal', nature: 'Quiet', item: 'Choice Specs',
+      evs: { spa: 252, hp: 252 }, moves: ['Trick Room', 'Eruption'],
+    });
+    const plainTorkoal = mon({
+      species: 'Torkoal', baseSpecies: 'Torkoal', nature: 'Quiet', item: 'Choice Specs',
+      evs: { spa: 252, hp: 252 }, moves: ['Eruption'],
+    });
+
+    const withTR = scoreMatchup(9, trTorkoal, dragapult);
+    const withoutTR = scoreMatchup(9, plainTorkoal, dragapult);
+
+    expect(withTR.candidateFaster).toBe(false);
+    expect(withTR.candidateActsFirst).toBe(true); // Trick Room overrides the raw speed check
+    expect(withoutTR.candidateActsFirst).toBe(false);
+    // Same attacker, same move, same target — only the Trick Room discount
+    // and speed-bonus sign differ, so this isolates that effect.
+    expect(withTR.score).toBeGreaterThan(withoutTR.score + 20);
+  });
+
+  it('rewards naturally outspeeding over merely outspeeding via Choice Scarf', () => {
+    // Same species/move/Atk investment both ways — only speed method differs,
+    // so any score gap traces to score.ts's NATURAL_SPEED_BONUS_MULT alone.
+    const registeel = mon({ species: 'Registeel', baseSpecies: 'Registeel', nature: 'Relaxed', evs: { hp: 252, def: 252 }, moves: [] });
+    const naturallyFast = mon({
+      species: 'Conkeldurr', baseSpecies: 'Conkeldurr', nature: 'Serious',
+      evs: { atk: 252, spe: 252 }, moves: ['Drain Punch'],
+    });
+    const scarfReliant = mon({
+      species: 'Conkeldurr', baseSpecies: 'Conkeldurr', nature: 'Serious', item: 'Choice Scarf',
+      evs: { atk: 252, hp: 252 }, ivs: { spe: 0 }, moves: ['Drain Punch'],
+    });
+
+    const naturalResult = scoreMatchup(9, naturallyFast, registeel);
+    const scarfResult = scoreMatchup(9, scarfReliant, registeel);
+
+    expect(naturalResult.candidateFaster).toBe(true);
+    expect(naturalResult.candidateNaturallyFaster).toBe(true);
+    expect(scarfResult.candidateFaster).toBe(true); // only wins the speed check because of the Scarf
+    expect(scarfResult.candidateNaturallyFaster).toBe(false);
+    expect(naturalResult.score).toBeGreaterThan(scarfResult.score);
+  });
 });
 
-function replayWithWinner(id: string, winner: string, mine: MatchedSet[], theirs: MatchedSet[], uploadtime = 1700000000): ScoutedReplay {
+function replayWithWinner(id: string, winner: string, mine: MatchedSet[], theirs: MatchedSet[], uploadtime = 1700000000, formatid = 'gen9customtest'): ScoutedReplay {
   const replay: Replay = {
-    id, url: `https://replay.pokemonshowdown.com/${id}`, format: '[Gen 9] Ubers', formatid: 'gen9customtest',
+    id, url: `https://replay.pokemonshowdown.com/${id}`, format: '[Gen 9] Ubers', formatid,
     gen: 9, players: ['Me', 'Them'], log: '', uploadtime, winner,
   };
   return {
@@ -257,7 +306,7 @@ describe('getHistoricalWinRates', () => {
 describe('buildCounterTeam', () => {
   it('picks up to 6 distinct, real, non-threat species from the local store', async () => {
     const store = new Datastore('/nonexistent/matchup-team-store.json');
-    const formatid = 'gen9customtest';
+    const formatid = 'gen9ubers'; // Koraidon is a gen9ubers-specific mandatory pick (see tier-config.ts)
 
     const threatSets: MatchedSet[] = [
       mon({ species: 'Zacian-Crowned', baseSpecies: 'Zacian-Crowned', ability: 'Intrepid Sword', item: 'Rusted Sword', nature: 'Jolly', evs: { atk: 252, spe: 252 }, moves: ['Behemoth Blade'] }),
@@ -414,7 +463,7 @@ describe('buildCounterTeam', () => {
 
   it('always satisfies Steel / Dark-or-Tera / Fairy-or-Tera coverage when a legal candidate can provide it', async () => {
     const store = new Datastore('/nonexistent/matchup-typereq-store.json');
-    const formatid = 'gen9customtest';
+    const formatid = 'gen9ubers'; // Steel/Dark/Fairy requirements are gen9ubers-specific (see tier-config.ts)
 
     const threatSets: MatchedSet[] = [
       mon({ species: 'Kyogre', baseSpecies: 'Kyogre', ability: 'Drizzle', nature: 'Timid', evs: { spa: 252, spe: 252 }, moves: ['Water Spout'] }),
@@ -491,5 +540,70 @@ describe('buildCounterTeam', () => {
     const spikesCount = result.team.filter((p) => p.set.moves.some((m) => m.toLowerCase().replace(/[^a-z]/g, '') === 'toxicspikes')).length;
     expect(rockCount).toBeLessThanOrEqual(1);
     expect(spikesCount).toBeLessThanOrEqual(1);
+  }, 20000);
+
+  it('applies gen9nationaldexubers-specific rules: Primal Groudon mandatory, Dark-or-Marshadow/Poison/Steel coverage, no D-tier VR picks', async () => {
+    const store = new Datastore('/nonexistent/matchup-natdex-store.json');
+    const formatid = 'gen9nationaldexubers';
+
+    const threatSets: MatchedSet[] = [
+      mon({ species: 'Rayquaza', baseSpecies: 'Rayquaza', ability: 'Air Lock', nature: 'Naive', evs: { atk: 252, spe: 252 }, moves: ['Dragon Ascent'] }),
+      mon({ species: 'Kyogre-Primal', baseSpecies: 'Kyogre-Primal', ability: 'Primordial Sea', nature: 'Timid', evs: { spa: 252, spe: 252 }, moves: ['Water Spout'] }),
+    ];
+
+    // Groudon-Primal (mandatory, S+) — needs to actually resolve via
+    // speciesMeta's National-Dex fallback, not just the gen9 regional dex.
+    const groudonPrimal = mon({ species: 'Groudon-Primal', baseSpecies: 'Groudon-Primal', ability: 'Desolate Land', nature: 'Adamant', evs: { atk: 252, hp: 252 }, moves: ['Precipice Blades'], evSource: 'derived' });
+    // Marshadow (A+) satisfies the Dark-or-Marshadow requirement despite
+    // being Fighting/Ghost, not Dark.
+    const marshadow = mon({ species: 'Marshadow', baseSpecies: 'Marshadow', ability: 'Technician', nature: 'Jolly', evs: { atk: 252, spe: 252 }, moves: ['Spectral Thief'], evSource: 'derived' });
+    // Ferrothorn (B+) is the Steel requirement's satisfier.
+    const ferrothorn = mon({ species: 'Ferrothorn', baseSpecies: 'Ferrothorn', ability: 'Iron Barbs', nature: 'Relaxed', evs: { hp: 252, def: 252 }, moves: ['Gyro Ball'], evSource: 'derived' });
+    // Glimmora (B-) is Poison/Rock — the Poison requirement's satisfier —
+    // and carries the team's Choice Scarf speed control.
+    const glimmora = mon({ species: 'Glimmora', baseSpecies: 'Glimmora', item: 'Choice Scarf', ability: 'Toxic Debris', nature: 'Timid', evs: { spa: 252, spe: 252 }, moves: ['Sludge Wave'], evSource: 'derived' });
+    // Ho-Oh (S-) is real, strong, VR-ranked filler.
+    const hooh = mon({ species: 'Ho-Oh', baseSpecies: 'Ho-Oh', ability: 'Regenerator', nature: 'Adamant', evs: { atk: 252, hp: 252 }, moves: ['Sacred Fire'], evSource: 'derived' });
+    // Shaymin-Sky is explicitly D-tier on the real VR list ("unviable, but
+    // Ubers by tiering") — given a strong matchup move but deliberately kept
+    // UNDER the local-recurrence bypass threshold, so the only way it could
+    // make the team is if VR-based viability filtering isn't actually wired
+    // up.
+    const shayminSky = mon({ species: 'Shaymin-Sky', baseSpecies: 'Shaymin-Sky', ability: 'Serene Grace', nature: 'Timid', evs: { spa: 252, spe: 252 }, moves: ['Air Slash'], evSource: 'derived' });
+
+    let n = 0;
+    for (const set of [groudonPrimal, marshadow, ferrothorn, glimmora, hooh]) {
+      for (let rep = 0; rep < 4; rep++) {
+        store.ingest(replayWithWinner(`nd${n++}`, 'Me', [set], threatSets, 1700000000, formatid));
+      }
+    }
+    // Only 2 sightings — below MIN_LOCAL_RECURRENCE (3), so Shaymin-Sky
+    // can't sneak in through the local-recurrence bypass either.
+    for (let rep = 0; rep < 2; rep++) {
+      store.ingest(replayWithWinner(`nd${n++}`, 'Me', [shayminSky], threatSets, 1700000000, formatid));
+    }
+    store.rebuildUniqueSets();
+
+    const threats = await buildThreatProfile(gen, `
+| Rank | Pokemon      | Use | Usage % | Win % |
+| 1    | Rayquaza     |   4 |  100.00% |  50.00% |
+| 2    | Kyogre-Primal|   4 |  100.00% |  50.00% |
+`);
+    const result = await buildCounterTeam(store, gen, formatid, threats);
+    const species = result.team.map((t) => t.species);
+
+    expect(species).toContain('Groudon-Primal'); // mandatory for this tier
+    expect(species).not.toContain('Shaymin-Sky'); // D-tier on the VR list, and under the local-recurrence bypass
+
+    const hasSteel = result.team.some((p) => speciesMeta(gen, p.set.baseSpecies)?.types.map((x) => x.toLowerCase()).includes('steel'));
+    const hasDarkOrMarshadow = result.team.some(
+      (p) => speciesMeta(gen, p.set.baseSpecies)?.types.map((x) => x.toLowerCase()).includes('dark') ||
+        (p.set.tera ?? '').toLowerCase() === 'dark' || p.species === 'Marshadow',
+    );
+    const hasPoison = result.team.some((p) => speciesMeta(gen, p.set.baseSpecies)?.types.map((x) => x.toLowerCase()).includes('poison') || (p.set.tera ?? '').toLowerCase() === 'poison');
+    expect(hasSteel).toBe(true);
+    expect(hasDarkOrMarshadow).toBe(true);
+    expect(hasPoison).toBe(true);
+    expect(result.unmetRequirements).toEqual([]);
   }, 20000);
 });

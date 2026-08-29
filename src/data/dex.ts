@@ -101,6 +101,31 @@ export function isForme(gen: Generation, setKey: string): boolean {
   return !!(sp && sp.baseSpecies && sp.baseSpecies !== sp.name);
 }
 
+export interface SpeciesMeta {
+  num: number;
+  types: string[];
+  baseSpecies: string;
+  forme: string;
+}
+
+/**
+ * Types/dex-number/forme info for a species, even one the CURRENT gen's
+ * regional dex doesn't carry — @pkmn/dex's per-gen wrapper only includes
+ * what's obtainable in that gen's home games (e.g. gen9's wrapper excludes
+ * Marshadow, Ferrothorn, Primal Groudon — real National Dex Ubers staples —
+ * even though the underlying species data exists), so this falls back to the
+ * ungenned base Dex (which carries every species regardless of current-gen
+ * availability) whenever the gen-scoped lookup comes up empty. Base
+ * stats/types don't change across gens for an already-existing species, so
+ * the fallback's data is exactly as correct as the gen-scoped one would be.
+ */
+export function speciesMeta(gen: Generation, name: string): SpeciesMeta | undefined {
+  const cleaned = name.replace(/-\*$/, '');
+  const sp = gen.species.get(cleaned) ?? Dex.species.get(cleaned);
+  if (!sp || !sp.exists) return undefined;
+  return { num: sp.num, types: [...sp.types], baseSpecies: sp.baseSpecies || sp.name, forme: sp.forme || '' };
+}
+
 /**
  * Filename slug for play.pokemonshowdown.com/sprites/gen5/<slug>.png. NOT
  * simply toID(displayName) — Showdown IDs the base species and forme

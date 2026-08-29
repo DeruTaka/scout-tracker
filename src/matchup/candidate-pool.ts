@@ -1,8 +1,14 @@
 // A real, plausible built set for any species in a format — the shared
 // source of truth for both "what does this threat run" and "what can our
 // counter-team actually field." Prefers the app's own scouted/derived data
-// (real evidence, from any trainer) over Smogon usage stats, over Smogon's
-// dex analysis sets, in that order.
+// (real evidence, from any trainer), then Smogon's dex analysis (a curated,
+// written-up "here's a good build" from the format's own C&C team), then
+// Smogon usage stats' top spread LAST — usage-stat spreads are just "whatever
+// the highest-count real games happened to run," which regularly includes
+// legitimately bad/gimmick sets (a real example: Shaymin-Sky @ Groundium Z
+// with Healing Wish showed up as a top National Dex Ubers usage spread, which
+// is not a build anyone should be handed as "the" Shaymin-Sky set) — a
+// written analysis is much more trustworthy than raw popularity for this.
 import type { Generation } from '@pkmn/data';
 import type { Datastore } from '../store/datastore.js';
 import type { DexSet, MatchedSet } from '../types.js';
@@ -58,8 +64,9 @@ export interface KnownSet {
 
 /** The single best real build available for `baseSpecies` in `formatid`:
  *  the app's own most-evidenced derived set for it (across every trainer
- *  scouted, not just one), falling back to Smogon usage stats, then Smogon's
- *  dex analysis. Returns null if nothing is known about this species at all. */
+ *  scouted, not just one), falling back to Smogon's dex analysis, then
+ *  (last resort) Smogon's raw usage-stats top spread. Returns null if
+ *  nothing is known about this species at all. */
 export async function getBestKnownSet(
   store: Datastore,
   gen: Generation,
@@ -78,14 +85,14 @@ export async function getBestKnownSet(
     return { set: local[0]!.set, source: 'store', localCount };
   }
 
-  const usageSets = await getUsageSets(gen, formatid, baseSpecies);
-  if (usageSets.length) {
-    return { set: dexSetToMatchedSet(gen, baseSpecies, usageSets[0]!, `Smogon usage stats (${formatid}) — not locally scouted.`), source: 'usage' };
-  }
-
   const dexSets = await getSetsForSpecies(formatid, baseSpecies);
   if (dexSets.length) {
     return { set: dexSetToMatchedSet(gen, baseSpecies, dexSets[0]!, `Smogon dex analysis (${formatid}) — not locally scouted.`), source: 'dex' };
+  }
+
+  const usageSets = await getUsageSets(gen, formatid, baseSpecies);
+  if (usageSets.length) {
+    return { set: dexSetToMatchedSet(gen, baseSpecies, usageSets[0]!, `Smogon usage stats (${formatid}) — not locally scouted, and no dex analysis available.`), source: 'usage' };
   }
 
   return null;
@@ -116,14 +123,14 @@ export async function getKnownSetVariants(
     });
   for (const u of local.slice(0, 4)) out.push({ set: u.set, source: 'store', localCount: u.count });
 
-  const usageSets = await getUsageSets(gen, formatid, baseSpecies);
-  for (const ds of usageSets) {
-    out.push({ set: dexSetToMatchedSet(gen, baseSpecies, ds, `Smogon usage stats (${formatid}).`), source: 'usage' });
-  }
-
   const dexSets = await getSetsForSpecies(formatid, baseSpecies);
   for (const ds of dexSets.slice(0, 4)) {
     out.push({ set: dexSetToMatchedSet(gen, baseSpecies, ds, `Smogon dex analysis (${formatid}).`), source: 'dex' });
+  }
+
+  const usageSets = await getUsageSets(gen, formatid, baseSpecies);
+  for (const ds of usageSets) {
+    out.push({ set: dexSetToMatchedSet(gen, baseSpecies, ds, `Smogon usage stats (${formatid}).`), source: 'usage' });
   }
 
   return out;
@@ -138,18 +145,19 @@ function evTotal(evs: Partial<Record<string, number>> | undefined): number {
  * locally-scouted build whose moveset is only whatever the trainer happened
  * to reveal in one replay (1-2 moves), not a full 4-move set, or whose EVs
  * never got real damage evidence to derive a full spread from. Fills gaps
- * from the SAME species' top Smogon usage spread (falling back to dex
- * analysis), so what comes out is still a real, commonly-run build — never
- * fabricated from nothing. Already-complete sets pass through unchanged.
+ * from the SAME species' Smogon dex analysis (falling back to its usage-stats
+ * top spread only if there's no written analysis at all), so what comes out
+ * is still a real, commonly-run build — never fabricated from nothing.
+ * Already-complete sets pass through unchanged.
  */
 export async function fillRealisticSet(gen: Generation, formatid: string, known: KnownSet): Promise<KnownSet> {
   const needsMoves = known.set.moves.length < 4;
   const needsSpread = evTotal(known.set.evs) < 500; // a real 508-total spread rounds down to increments of 4
   if (!needsMoves && !needsSpread) return known;
 
-  const usageSets = await getUsageSets(gen, formatid, known.set.baseSpecies);
-  const dexSets = needsMoves || needsSpread ? await getSetsForSpecies(formatid, known.set.baseSpecies) : [];
-  const fallback = usageSets[0] ?? dexSets[0];
+  const dexSets = await getSetsForSpecies(formatid, known.set.baseSpecies);
+  const usageSets = dexSets.length ? [] : await getUsageSets(gen, formatid, known.set.baseSpecies);
+  const fallback = dexSets[0] ?? usageSets[0];
   if (!fallback) return known;
 
   const set = { ...known.set };
@@ -181,20 +189,23 @@ export async function fillRealisticSet(gen: Generation, formatid: string, known:
 
 /** Every base species with at least one usable set for this format: the
  *  app's own scouted species, unioned with everything Smogon tracked usage
- *  for (one cached fetch) — the candidate pool the team-builder searches. */
-export async function allCandidateSpecies(store: Datastore, formatid: string): Promise<string[]> {
+ *  for (one cached fetch), unioned with `extraSpecies` (a tier config's own
+ *  curated viable list, e.g. from a Viability Rankings thread — makes sure a
+ *  real staple is considered even if it's thin on usage-stat tracking) — the
+ *  candidate pool the team-builder searches. */
+export async function allCandidateSpecies(store: Datastore, formatid: string, extraSpecies: string[] = []): Promise<string[]> {
   const ids = new Set<string>();
   const display = new Map<string, string>();
-  for (const u of store.uniqueSets) {
-    if (u.formatid !== formatid) continue;
-    const id = toID(u.baseSpecies);
-    ids.add(id);
-    if (!display.has(id)) display.set(id, u.baseSpecies);
-  }
-  for (const species of await getAllUsageSpecies(formatid)) {
+  const add = (species: string) => {
     const id = toID(species);
     ids.add(id);
     if (!display.has(id)) display.set(id, species);
+  };
+  for (const u of store.uniqueSets) {
+    if (u.formatid !== formatid) continue;
+    add(u.baseSpecies);
   }
+  for (const species of await getAllUsageSpecies(formatid)) add(species);
+  for (const species of extraSpecies) add(species);
   return [...ids].map((id) => display.get(id)!);
 }

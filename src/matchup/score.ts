@@ -38,6 +38,10 @@ function effectiveSpeed(p: calc.Pokemon, item: string | undefined): number {
   return p.rawStats.spe * (toID(item).startsWith('choicescarf') ? 1.5 : 1);
 }
 
+function hasTrickRoom(set: MatchedSet): boolean {
+  return set.moves.some((m) => toID(m) === 'trickroom');
+}
+
 interface HitResult {
   pct: number; // best move's max-roll damage, as % of defender's max HP
   guaranteedOhko: boolean; // even the WORST roll of that move KOs
@@ -71,7 +75,9 @@ export interface MatchupResult {
   score: number; // positive favors the candidate, negative favors the threat
   candidateDamagePercent: number;
   threatDamagePercent: number;
-  candidateFaster: boolean;
+  candidateFaster: boolean; // literal speed-check result, ignoring Trick Room
+  candidateActsFirst: boolean; // candidateFaster, OR candidate runs Trick Room
+  candidateNaturallyFaster: boolean; // wins the speed check WITHOUT its own Choice Scarf
   candidateOhko: boolean;
   candidateGuaranteed2hko: boolean;
   threatOhko: boolean;
@@ -83,6 +89,8 @@ const NEUTRAL: MatchupResult = {
   candidateDamagePercent: 0,
   threatDamagePercent: 0,
   candidateFaster: false,
+  candidateActsFirst: false,
+  candidateNaturallyFaster: false,
   candidateOhko: false,
   candidateGuaranteed2hko: false,
   threatOhko: false,
@@ -90,13 +98,27 @@ const NEUTRAL: MatchupResult = {
 };
 
 const SPEED_BONUS = 15;
+const NATURAL_SPEED_BONUS_MULT = 1.3; // extra credit for winning speed without needing its own Choice Scarf
 const OHKO_BONUS = 20;
 const TWOHKO_BONUS = 8;
+// A big hit that can't actually be landed safely — the attacker is slower,
+// isn't running Trick Room, and would eat the threat's own hit first — is
+// still worth SOMETHING (it might survive and land it next turn, or the
+// threat might not have picked the "kill first" line), but nowhere near as
+// much as a hit that's a sure thing. A real example: Shaymin-Sky can 1-shot
+// Pheromosa on paper, but without a Scarf or a setup turn it's slower and
+// gets hit first — that "OHKO" isn't the same kind of asset as Pheromosa's
+// own naturally-faster Triple Axel into Rayquaza.
+const UNSAFE_HIT_DISCOUNT = 0.35;
 
 /** How favorably `candidate` matches up into `threat`, one-on-one, on a
  *  neutral field. Combines best-move damage in both directions with bonuses
- *  for a guaranteed OHKO/2HKO and for outspeeding — a documented heuristic,
- *  not a full turn-by-turn simulation. */
+ *  for a guaranteed OHKO/2HKO and for winning the speed check — discounted
+ *  when winning that KO requires actually going first and the attacker can't
+ *  guarantee that (Trick Room is the one exception: its whole point is
+ *  embracing being slow, so a Trick Room user's own damage output is never
+ *  discounted for lacking raw speed). A documented heuristic, not a full
+ *  turn-by-turn simulation. */
 export function scoreMatchup(genNum: GenerationNum, candidate: MatchedSet, threat: MatchedSet): MatchupResult {
   const gen = calc.Generations.get(genNum);
   const field = new calc.Field({});
@@ -106,20 +128,35 @@ export function scoreMatchup(genNum: GenerationNum, candidate: MatchedSet, threa
 
   const cHit = bestHit(gen, c, t, candidate.moves, field);
   const tHit = bestHit(gen, t, c, threat.moves, field);
-  const candidateFaster = effectiveSpeed(c, candidate.item) > effectiveSpeed(t, threat.item);
+
+  const cEffSpeed = effectiveSpeed(c, candidate.item);
+  const tEffSpeed = effectiveSpeed(t, threat.item);
+  const candidateFaster = cEffSpeed > tEffSpeed;
+  const candidateTrickRoom = hasTrickRoom(candidate);
+  const threatTrickRoom = hasTrickRoom(threat);
+  const candidateActsFirst = candidateTrickRoom || candidateFaster;
+  const threatActsFirst = threatTrickRoom || !candidateFaster;
+  const candidateNaturallyFaster = c.rawStats.spe > tEffSpeed;
 
   let score = cHit.pct - tHit.pct;
-  if (cHit.guaranteedOhko) score += OHKO_BONUS;
-  else if (cHit.guaranteed2hko) score += TWOHKO_BONUS;
-  if (tHit.guaranteedOhko) score -= OHKO_BONUS;
-  else if (tHit.guaranteed2hko) score -= TWOHKO_BONUS;
-  score += candidateFaster ? SPEED_BONUS : -SPEED_BONUS;
+  if (cHit.guaranteedOhko) score += OHKO_BONUS * (candidateActsFirst ? 1 : UNSAFE_HIT_DISCOUNT);
+  else if (cHit.guaranteed2hko) score += TWOHKO_BONUS * (candidateActsFirst ? 1 : UNSAFE_HIT_DISCOUNT);
+  if (tHit.guaranteedOhko) score -= OHKO_BONUS * (threatActsFirst ? 1 : UNSAFE_HIT_DISCOUNT);
+  else if (tHit.guaranteed2hko) score -= TWOHKO_BONUS * (threatActsFirst ? 1 : UNSAFE_HIT_DISCOUNT);
+
+  if (candidateActsFirst) {
+    score += candidateTrickRoom || candidateNaturallyFaster ? SPEED_BONUS * NATURAL_SPEED_BONUS_MULT : SPEED_BONUS;
+  } else {
+    score -= SPEED_BONUS;
+  }
 
   return {
     score,
     candidateDamagePercent: cHit.pct,
     threatDamagePercent: tHit.pct,
     candidateFaster,
+    candidateActsFirst,
+    candidateNaturallyFaster,
     candidateOhko: cHit.guaranteedOhko,
     candidateGuaranteed2hko: cHit.guaranteed2hko,
     threatOhko: tHit.guaranteedOhko,
