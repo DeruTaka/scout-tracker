@@ -571,6 +571,9 @@ describe('buildCounterTeam', () => {
     const glimmora = mon({ species: 'Glimmora', baseSpecies: 'Glimmora', item: 'Choice Scarf', ability: 'Toxic Debris', nature: 'Timid', evs: { spa: 252, spe: 252, hp: 4 }, moves: ['Sludge Wave', 'Earth Power', 'Energy Ball', 'Mortal Spin'], evSource: 'derived' });
     // Ho-Oh (S-) is real, strong, VR-ranked filler.
     const hooh = mon({ species: 'Ho-Oh', baseSpecies: 'Ho-Oh', ability: 'Regenerator', nature: 'Adamant', evs: { atk: 252, hp: 252 }, moves: ['Sacred Fire'], evSource: 'derived' });
+    // Arceus-Fairy (A+) satisfies both the new Arceus-forme requirement and
+    // the Fairy requirement (naturally Fairy-typed) at once.
+    const arceusFairy = mon({ species: 'Arceus-Fairy', baseSpecies: 'Arceus-Fairy', ability: 'Multitype', nature: 'Timid', evs: { hp: 252, spa: 252, spe: 4 }, moves: ['Judgment', 'Recover', 'Calm Mind', 'Ice Beam'], evSource: 'derived' });
     // Shaymin-Sky is explicitly D-tier on the real VR list ("unviable, but
     // Ubers by tiering") — given a strong matchup move but deliberately kept
     // UNDER the local-recurrence bypass threshold, so the only way it could
@@ -579,7 +582,7 @@ describe('buildCounterTeam', () => {
     const shayminSky = mon({ species: 'Shaymin-Sky', baseSpecies: 'Shaymin-Sky', ability: 'Serene Grace', nature: 'Timid', evs: { spa: 252, spe: 252 }, moves: ['Air Slash'], evSource: 'derived' });
 
     let n = 0;
-    for (const set of [groudonPrimal, marshadow, ferrothorn, glimmora, hooh]) {
+    for (const set of [groudonPrimal, marshadow, ferrothorn, glimmora, hooh, arceusFairy]) {
       for (let rep = 0; rep < 4; rep++) {
         store.ingest(replayWithWinner(`nd${n++}`, 'Me', [set], threatSets, 1700000000, formatid));
       }
@@ -625,6 +628,7 @@ S-<br />
 <br />
 A+<br />
 <a href="https://www.smogon.com/dex/sv/pokemon/marshadow/national-dex-ubers/">Marshadow</a><br />
+<a href="https://www.smogon.com/dex/sv/pokemon/arceus/national-dex-ubers/fairy">Arceus-Fairy</a><br />
 <br />
 B+<br />
 <a href="https://www.smogon.com/dex/sv/pokemon/ferrothorn/national-dex-ubers/">Ferrothorn</a><br />
@@ -658,12 +662,12 @@ Rules<br />
     );
     const hasPoison = result.team.some((p) => speciesMeta(gen, p.set.baseSpecies)?.types.map((x) => x.toLowerCase()).includes('poison') || (p.set.tera ?? '').toLowerCase() === 'poison');
     const hasFairy = result.team.some((p) => speciesMeta(gen, p.set.baseSpecies)?.types.map((x) => x.toLowerCase()).includes('fairy') || (p.set.tera ?? '').toLowerCase() === 'fairy');
+    const hasArceus = result.team.some((p) => toID(speciesMeta(gen, p.set.baseSpecies)?.baseSpecies ?? p.species).startsWith('arceus'));
     expect(hasSteel).toBe(true);
     expect(hasDarkOrMarshadow).toBe(true);
     expect(hasPoison).toBe(true);
-    // No natural Fairy-type is anywhere in this fixture's pool — this only
-    // passes if an existing team member got its Tera reassigned to Fairy.
-    expect(hasFairy).toBe(true);
+    expect(hasFairy).toBe(true); // Arceus-Fairy's own natural typing satisfies this
+    expect(hasArceus).toBe(true); // the new "an Arceus forme" requirement
     expect(result.unmetRequirements).toEqual([]);
   }, 20000);
 

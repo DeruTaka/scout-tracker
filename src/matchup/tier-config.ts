@@ -57,6 +57,19 @@ function typeOrSpeciesRequirement(type: string, allowTera: boolean, altSpecies: 
   };
 }
 
+/** At least one Arceus forme (any type/plate) somewhere on the team — a
+ *  species-family requirement, not a type-or-Tera one, so it has no
+ *  teraType and always needs an actual Arceus fielded. */
+function arceusFormRequirement(): Requirement {
+  return {
+    label: 'an Arceus forme',
+    satisfies: (gen, pick) => {
+      const meta = speciesMeta(gen, pick.set.baseSpecies);
+      return toID(meta?.baseSpecies ?? pick.species).startsWith('arceus');
+    },
+  };
+}
+
 const SPEED_CONTROL_MOVES = new Set(['trickroom', 'tailwind', 'stickyweb', 'thunderwave', 'glare', 'nuzzle', 'icywind']);
 
 /** At least one real speed-control tool: Trick Room (flips the whole speed
@@ -79,6 +92,12 @@ export interface ViabilityResult {
   passes: boolean; // clears this tier's "actually worth recommending" bar
   score: number; // feeds directly into qualityScore
   label: string; // shown in the pick's rationale
+  /** True for a genuine top-tier pick (A- and above on a VR list; always
+   *  true for a usage-rank-based tier, which has no letter-grade concept).
+   *  team-builder.ts caps how many non-mandatory picks may fall below this
+   *  on a VR-driven tier, so the team stays weighted toward real top-tier
+   *  answers instead of reaching for a merely-legal one. */
+  isTopTier: boolean;
 }
 
 export interface ViabilityContext {
@@ -97,9 +116,11 @@ function usageRankViability(maxRank: number, weight: number) {
   return (species: string, ctx: ViabilityContext): ViabilityResult => {
     const rank = ctx.usageRanks.get(toID(species));
     if (rank !== undefined && rank <= maxRank) {
-      return { passes: true, score: (maxRank - rank + 1) * weight, label: `#${rank} in real usage for this tier` };
+      // No letter-grade concept for a usage-rank tier, so nothing here is
+      // capped as "below top tier" the way a VR-driven tier's B/C ranks are.
+      return { passes: true, score: (maxRank - rank + 1) * weight, label: `#${rank} in real usage for this tier`, isTopTier: true };
     }
-    return { passes: false, score: 0, label: 'not ranked in top real usage for this tier' };
+    return { passes: false, score: 0, label: 'not ranked in top real usage for this tier', isTopTier: false };
   };
 }
 
@@ -115,14 +136,15 @@ function usageRankViability(maxRank: number, weight: number) {
 // (vrMap null) correctly fails here too, same as one genuinely unlisted.
 function vrListViability(weight: number) {
   return (species: string, ctx: ViabilityContext): ViabilityResult => {
-    if (!ctx.vrMap) return { passes: false, score: 0, label: 'Viability Rankings unavailable (fetch failed)' };
+    if (!ctx.vrMap) return { passes: false, score: 0, label: 'Viability Rankings unavailable (fetch failed)', isTopTier: false };
     // toID-normalized lookup, not a direct key match — candidateSpecies can
     // carry whatever exact casing/hyphenation its own source (local store,
     // Smogon usage stats) used, which won't always match the VR thread's.
     const tier = Object.entries(ctx.vrMap).find(([k]) => toID(k) === toID(species))?.[1];
-    if (!tier) return { passes: false, score: 0, label: 'not on the Viability Rankings list' };
+    if (!tier) return { passes: false, score: 0, label: 'not on the Viability Rankings list', isTopTier: false };
     const score = VR_TIER_SCORE[tier];
-    return { passes: score > 0, score: score * weight, label: `${tier} rank on the Viability Rankings` };
+    const isTopTier = VR_TIER_SCORE[tier] >= VR_TIER_SCORE['A-'];
+    return { passes: score > 0, score: score * weight, label: `${tier} rank on the Viability Rankings`, isTopTier };
   };
 }
 
@@ -191,6 +213,7 @@ const CONFIGS: Record<string, TierConfig> = {
       typeOrSpeciesRequirement('Dark', true, ['Marshadow']),
       typeRequirement('Poison', true),
       typeRequirement('Fairy', true), // unlike gen9ubers, Fairy can be satisfied via Tera here
+      arceusFormRequirement(),
       speedControlRequirement(),
     ],
     extraCandidateSpecies: [],

@@ -122,6 +122,15 @@ function hasBannedMove(set: MatchedSet): boolean {
   return set.moves.some((m) => BANNED_MOVES.has(toID(m)));
 }
 
+/** A Mega-evolved or Primal-Reverted forme is locked into that forme's own
+ *  typing for the whole battle — the game doesn't let it also Terastallize
+ *  (the two transformations are mutually exclusive), so it's never a valid
+ *  target for the Tera-reassignment repair pass below. */
+function canTerastallize(gen: Generation, baseSpecies: string): boolean {
+  const forme = speciesMeta(gen, baseSpecies)?.forme ?? '';
+  return !/^Mega/.test(forme) && forme !== 'Primal';
+}
+
 function hazardMovesOf(set: MatchedSet): string[] {
   return set.moves.map(toID).filter((m) => HAZARD_MOVES.has(m));
 }
@@ -129,6 +138,79 @@ function hazardMovesOf(set: MatchedSet): string[] {
 function sampleConfidence(n: number): number {
   return Math.min(n / 5, 1);
 }
+
+// A candidate's set is classified physical/special by its own moves' real
+// category (not just EV investment) — a set can run a strong physical STAB
+// with special-leaning EVs for bulk, and the move category is what actually
+// determines whether Will-O-Wisp/burn or a physical wall's Defense stat
+// touches it.
+function isPhysicalSet(gen: Generation, set: MatchedSet): boolean {
+  let physicalCount = 0;
+  let specialCount = 0;
+  for (const m of set.moves) {
+    const move = gen.moves.get(m);
+    if (!move) continue;
+    if (move.category === 'Physical') physicalCount++;
+    else if (move.category === 'Special') specialCount++;
+  }
+  if (physicalCount !== specialCount) return physicalCount > specialCount;
+  return (set.evs.atk ?? 0) >= (set.evs.spa ?? 0); // tie (e.g. all-status, or 2-and-2) — fall back to EV investment
+}
+
+// Lum Berry cures/blocks any status on hold; these abilities give an
+// outright, permanent status immunity; a Fire Tera specifically blocks
+// burn (the status that actually cripples a physical attacker — Toxic just
+// costs HP over time rather than gutting the relevant stat).
+const STATUS_IMMUNE_ABILITIES = new Set(['waterbubble', 'guts', 'magicbounce', 'comatose', 'purifyingsalt', 'shielddust', 'leafguard']);
+function hasStatusImmunity(set: MatchedSet): boolean {
+  if (toID(set.item || '') === 'lumberry') return true;
+  if (STATUS_IMMUNE_ABILITIES.has(toID(set.ability || ''))) return true;
+  if (toID(set.tera || '') === 'fire') return true;
+  return false;
+}
+
+interface OpponentPattern {
+  // Positive favors a physical-leaning candidate, negative favors special —
+  // derived from which offensive category the opponent's own team structure
+  // seems built to punish or invite.
+  physicalLean: number;
+  // Weighted prevalence of Will-O-Wisp/Toxic among the threats — a real
+  // status-immune answer (Lum Berry, an immunity ability, Tera Fire) is
+  // worth more the higher this is.
+  statusPressure: number;
+}
+
+// Real teambuilding reads the opponent's own move choices, not just their
+// species: heavy Will-O-Wisp/Toxic usage cripples a physical attacker
+// (burn halves Attack) and rewards anything status-immune; a bulky core
+// built specifically around Iron Defense PLUS that status (a physical
+// wall) invites special pressure instead, since Iron Defense doesn't touch
+// Special Defense. The opposite pattern — Calm Mind + Psyshock (a special
+// sweeper that deals physical-formula damage off the target's real
+// Defense, telling you the opponent already expects to face weak physical
+// bulk) or heavy Blissey usage (the archetypal special wall, physically
+// frail) — invites physical pressure instead.
+function analyzeOpponentPattern(resolvedThreats: CounterTeamResult['resolvedThreats']): OpponentPattern {
+  let physicalWallWeight = 0;
+  let specialWallWeight = 0;
+  let statusPressure = 0;
+  for (const t of resolvedThreats) {
+    const moves = t.set.moves.map(toID);
+    const hasWisp = moves.includes('willowisp');
+    const hasToxic = moves.includes('toxic') || moves.includes('toxicspikes');
+    const hasIronDefense = moves.includes('irondefense');
+    const hasCalmMind = moves.includes('calmmind');
+    const hasPsyshock = moves.includes('psyshock') || moves.includes('psystrike') || moves.includes('secretsword');
+    if (hasWisp || hasToxic) statusPressure += t.weight;
+    if ((hasWisp || hasToxic) && hasIronDefense) physicalWallWeight += t.weight;
+    if ((hasCalmMind && hasPsyshock) || toID(t.species) === 'blissey') specialWallWeight += t.weight;
+  }
+  return { physicalLean: specialWallWeight - physicalWallWeight, statusPressure };
+}
+
+const PHYSICAL_LEAN_SCALE = 0.15; // points per (weight-point of lean) applied to a matching-category candidate
+const STATUS_IMMUNITY_BONUS = 12; // flat bonus for a status-immune candidate when statusPressure is real
+const STATUS_PRESSURE_THRESHOLD = 20; // minimum weighted status-move prevalence before the immunity bonus kicks in at all
 
 /**
  * Choose a mandatory pick's build from its real, already-scored variants —
@@ -163,6 +245,7 @@ interface ScoredCandidate {
   set: MatchedSet;
   source: KnownSetSource;
   viability: number; // raw Smogon usage weight, 0 if untracked (display only)
+  isTopTier: boolean; // A- and above on a VR-driven tier's list (see tier-config.ts); always true off a usage-rank tier
   dexNum: number | undefined; // national dex number — Species Clause groups on this, not on forme name
   perThreat: Map<string, { result: MatchupResult; weight: number; threatSpecies: string }>;
   weightedSum: number; // this mon's own best-case weighted matchup total across every threat, independent of teammates
@@ -194,6 +277,7 @@ export async function buildCounterTeam(
   const historicalWinRates = getHistoricalWinRates(store, formatid, threatIds);
   const genNum = gen.num as GenerationNum;
   const usageRanks = await getUsageRankMap(formatid);
+  const opponentPattern = analyzeOpponentPattern(resolvedThreats);
 
   // A VR-driven tier restricts the ENTIRE candidate pool to that list —
   // fetched fresh every call (see vr-thread.ts, which already retries a
@@ -261,6 +345,12 @@ export async function buildCounterTeam(
     const perThreat = new Map<string, { result: MatchupResult; weight: number; threatSpecies: string }>();
     let weightedSum = 0;
     for (const t of resolvedThreats) {
+      // Ditto's whole set is Transform — its "own" stats/moves are whatever
+      // it copies from its opponent mid-battle, not anything fixed, so a
+      // speed/damage comparison against its base kit is meaningless noise
+      // rather than a real matchup signal. Still shown in the threat list
+      // (real scouting info that Ditto was used), just not scored.
+      if (toID(t.species) === 'ditto') continue;
       const result = scoreMatchup(genNum, known.set, t.set);
       perThreat.set(toID(t.set.baseSpecies), { result, weight: t.weight, threatSpecies: t.species });
       weightedSum += t.weight * result.score;
@@ -272,7 +362,24 @@ export async function buildCounterTeam(
     // genuine sample-size signal independent of how recent those games were.
     const historyBonus = hr && hr.total ? HISTORY_WEIGHT * (hr.weightedWinPercent - 50) * sampleConfidence(hr.total) : 0;
     const evidenceBonus = known.source === 'store' ? EVIDENCE_BONUS : 0;
-    const qualityScore = viability.score + historyBonus + evidenceBonus;
+
+    // Reads the opponent's own move choices, not just species — see
+    // analyzeOpponentPattern for the reasoning behind each signal.
+    const physical = isPhysicalSet(gen, known.set);
+    const leanBonus = opponentPattern.physicalLean * (physical ? 1 : -1) * PHYSICAL_LEAN_SCALE;
+    const immunityBonus =
+      opponentPattern.statusPressure >= STATUS_PRESSURE_THRESHOLD && hasStatusImmunity(known.set) ? STATUS_IMMUNITY_BONUS : 0;
+
+    const qualityScore = viability.score + historyBonus + evidenceBonus + leanBonus + immunityBonus;
+    const patternNotes: string[] = [];
+    if (leanBonus >= 1) {
+      patternNotes.push(
+        physical
+          ? "Opponent's team leans on special walls (Calm Mind/Psyshock, Blissey) — physical pressure is favored here."
+          : "Opponent's team leans on physical walls (status + Iron Defense) — special pressure is favored here.",
+      );
+    }
+    if (immunityBonus > 0) patternNotes.push('Status-immune — safe into the opponent\'s heavy Will-O-Wisp/Toxic usage.');
 
     return {
       idx: -1, // assigned once pushed into `scored`
@@ -280,12 +387,13 @@ export async function buildCounterTeam(
       set: known.set,
       source: known.source,
       viability: usageWeight,
+      isTopTier: viability.isTopTier,
       dexNum,
       perThreat,
       weightedSum,
       qualityScore,
       standaloneCeiling: qualityScore + weightedSum,
-      rationale: buildRationale(perThreat, hr, known.source, viability.label),
+      rationale: [...buildRationale(perThreat, hr, known.source, viability.label), ...patternNotes],
     };
   };
 
@@ -321,7 +429,7 @@ export async function buildCounterTeam(
         if (!best) {
           const dexNum = speciesMeta(gen, known.set.baseSpecies)?.num;
           best = {
-            idx: -1, species, set: known.set, source: known.source, viability: 0, dexNum,
+            idx: -1, species, set: known.set, source: known.source, viability: 0, isTopTier: true, dexNum,
             perThreat: new Map(), weightedSum: 0, qualityScore: 0, standaloneCeiling: 0,
             rationale: ['Mandatory pick — no matchup/viability data available.'],
           };
@@ -337,7 +445,9 @@ export async function buildCounterTeam(
 
   for (const species of candidateSpecies) {
     if (mandatoryIds.has(toID(species))) continue; // already scored above
-    if (threatIds.has(toID(species))) continue; // don't recommend fielding the opponent's own top threats
+    // No restriction on recommending a species the opponent also fields —
+    // using the same real, strong Pokemon on both sides is completely
+    // normal teambuilding, not something to avoid.
     const rawKnown = await getBestKnownSet(store, gen, formatid, species);
     if (!rawKnown) continue;
     const known = await fillRealisticSet(gen, formatid, rawKnown);
@@ -346,7 +456,8 @@ export async function buildCounterTeam(
 
   const affinity = await buildAffinityMatrix(formatid, scored);
   const picked = searchTeam(scored, resolvedThreats, affinity, mandatoryIdx);
-  const { team: repaired, unmet } = enforceRequirements(picked, scored, gen, config.requirements, config.mandatorySpecies, affinity);
+  const { team: requirementsFixed, unmet } = enforceRequirements(picked, scored, gen, config.requirements, config.mandatorySpecies, affinity);
+  const repaired = enforceTopTierCap(requirementsFixed, scored, gen, config.requirements, config.mandatorySpecies, affinity);
 
   const team = repaired.map((c) => ({ species: c.species, set: c.set, source: c.source, rationale: c.rationale }));
   return { threats, resolvedThreats, team, unmetRequirements: unmet, warnings };
@@ -614,6 +725,7 @@ function enforceRequirements(
       const otherRequirements = requirements.filter((r) => r !== req);
       const reassignable = team
         .map((p, i) => ({ p, i }))
+        .filter(({ p }) => canTerastallize(gen, p.set.baseSpecies)) // Mega/Primal formes are locked to their own typing, no Tera
         .filter(({ p, i }) => {
           const simulated: ScoredCandidate = { ...p, set: { ...p.set, tera: teraType } };
           // Changing p's Tera must not break any OTHER requirement that
@@ -685,4 +797,71 @@ function enforceRequirements(
   }
 
   return { team, unmet };
+}
+
+// Beyond the mandatory pick itself, at most this many non-mandatory picks
+// may fall below top tier (A- and up on a VR-driven tier) — a hard cap, not
+// just a scoring lean, so a narrow structural requirement (a natural-only
+// type with thin top-tier options) can still use its one exception without
+// the rest of the team drifting down with it.
+const MAX_LOW_TIER_PICKS = 1;
+
+/**
+ * Runs after enforceRequirements, once every coverage requirement is
+ * already satisfied: if more than MAX_LOW_TIER_PICKS non-mandatory members
+ * are below top tier, try upgrading all but the single best of them to a
+ * real, unpicked top-tier candidate — reusing the same
+ * "don't break a requirement this member was the only satisfier of" check
+ * enforceRequirements already uses, so an upgrade can never undo a fix that
+ * pass just made. A member with no viable top-tier replacement (nothing
+ * else covers what it does) is left in place — the cap is a target, not a
+ * guarantee when the real candidate pool can't support it.
+ */
+function enforceTopTierCap(
+  team: ScoredCandidate[],
+  scored: ScoredCandidate[],
+  gen: Generation,
+  requirements: Requirement[],
+  mandatorySpecies: string[],
+  affinity: Map<string, number>,
+): ScoredCandidate[] {
+  const result = [...team];
+  const isCappable = (p: ScoredCandidate) => !p.isTopTier && !mandatorySpecies.includes(p.species);
+  const lowTier = result.map((p, i) => ({ p, i })).filter(({ p }) => isCappable(p));
+  if (lowTier.length <= MAX_LOW_TIER_PICKS) return result;
+
+  // Keep the single best (by its own quality + matchup) low-tier member as
+  // the allowed exception; try to upgrade the rest.
+  lowTier.sort((a, b) => b.p.qualityScore + b.p.weightedSum - (a.p.qualityScore + a.p.weightedSum));
+  const toUpgrade = lowTier.slice(MAX_LOW_TIER_PICKS);
+
+  for (const { i } of toUpgrade) {
+    const pickedIds = new Set(result.map((q) => toID(q.species)));
+    const pickedDexNums = new Set(result.map((q) => q.dexNum).filter((n): n is number => n !== undefined));
+    const pickedHazards = new Set(result.flatMap((q) => hazardMovesOf(q.set)));
+    const candidates = scored
+      .filter((c) => c.isTopTier)
+      .filter((c) => !pickedIds.has(toID(c.species)))
+      .filter((c) => c.dexNum === undefined || !pickedDexNums.has(c.dexNum))
+      .filter((c) => !hazardMovesOf(c.set).some((m) => pickedHazards.has(m)))
+      .filter((c) =>
+        requirements.every((r) => {
+          const satisfiedBefore = result.some((q) => r.satisfies(gen, q));
+          if (!satisfiedBefore) return true;
+          return result.some((q, j) => (j === i ? r.satisfies(gen, c) : r.satisfies(gen, q)));
+        }),
+      )
+      .map((c) => ({
+        c,
+        value: c.qualityScore + c.weightedSum + result.reduce((s, q, j) => (j === i ? s : s + TEAMMATE_WEIGHT * pairAffinity(affinity, c.idx, q.idx)), 0),
+      }))
+      .sort((a, b) => b.value - a.value);
+
+    if (candidates.length) {
+      const upgrade = candidates[0]!.c;
+      result[i] = { ...upgrade, rationale: [...upgrade.rationale, 'Swapped in to keep the team weighted toward top-tier picks.'] };
+    }
+  }
+
+  return result;
 }
