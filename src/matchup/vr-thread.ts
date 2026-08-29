@@ -16,11 +16,22 @@ const CACHE_DIR = fileURLToPath(new URL('../../data/cache/', import.meta.url));
 export type VrTier = 'S+' | 'S' | 'S-' | 'A+' | 'A' | 'A-' | 'B+' | 'B' | 'B-' | 'C+' | 'C' | 'C-' | 'D';
 const TIER_LABELS: readonly VrTier[] = ['S+', 'S', 'S-', 'A+', 'A', 'A-', 'B+', 'B', 'B-', 'C+', 'C', 'C-', 'D'];
 
+// Steep, not linear: S+ through A- need to dominate a candidate's overall
+// score decisively over B/C-tier, even against a meaningfully better
+// matchup or history bonus elsewhere — a real request after the search
+// kept reaching for low-tier mons just because they had the right type or
+// a marginally better matchup than a real top-tier answer. The old linear
+// 13..2 scale left barely any gap between neighboring tiers relative to
+// how much a strong matchup could swing a candidate's score, so a C-tier
+// mon with a great matchup could out-score an A-tier mon with a merely
+// good one. This scale (combined with vrListViability's own weight
+// multiplier below) keeps that from happening except in genuinely extreme
+// matchup mismatches.
 export const VR_TIER_SCORE: Record<VrTier, number> = {
-  'S+': 13, S: 12, 'S-': 11,
-  'A+': 10, A: 9, 'A-': 8,
-  'B+': 7, B: 6, 'B-': 5,
-  'C+': 4, C: 3, 'C-': 2,
+  'S+': 120, S: 108, 'S-': 96,
+  'A+': 70, A: 60, 'A-': 50,
+  'B+': 30, B: 22, 'B-': 15,
+  'C+': 8, C: 5, 'C-': 2,
   D: 0,
 };
 

@@ -600,6 +600,48 @@ function enforceRequirements(
   for (const req of requirements) {
     if (team.some((p) => req.satisfies(gen, p))) continue;
 
+    // Prefer reassigning an existing team member's Tera over swapping in a
+    // whole different species — a real top-tier pick's Tera slot is
+    // basically free coverage flexibility, whereas bringing in a new
+    // species just because it happens to have the right natural typing
+    // risks importing a much lower-tier mon for a single requirement. Only
+    // applies to type-or-Tera requirements (teraType set) — Steel/Fairy
+    // etc. require an actual Pokemon of that type, not a Tera stand-in, so
+    // this is skipped entirely for those and falls straight to the
+    // species-swap logic below.
+    if (req.teraType) {
+      const teraType = req.teraType;
+      const otherRequirements = requirements.filter((r) => r !== req);
+      const reassignable = team
+        .map((p, i) => ({ p, i }))
+        .filter(({ p, i }) => {
+          const simulated: ScoredCandidate = { ...p, set: { ...p.set, tera: teraType } };
+          // Changing p's Tera must not break any OTHER requirement that
+          // currently depends on p (its natural type or its current Tera)
+          // being the team's only satisfier of that requirement.
+          return otherRequirements.every((r) => {
+            const satisfiedBefore = team.some((q) => r.satisfies(gen, q));
+            if (!satisfiedBefore) return true; // already unmet — this swap can't make it worse
+            return team.some((q, j) => (j === i ? r.satisfies(gen, simulated) : r.satisfies(gen, q)));
+          });
+        })
+        .sort((a, b) => {
+          // Prefer a member whose Tera isn't already doing anything (free
+          // to reassign) over one that would be giving something up.
+          const idle = (p: ScoredCandidate) => (!p.set.tera || p.set.tera.toLowerCase() === 'nothing' ? 0 : 1);
+          return idle(a.p) - idle(b.p) || b.p.qualityScore - a.p.qualityScore;
+        })[0];
+
+      if (reassignable) {
+        team[reassignable.i] = {
+          ...reassignable.p,
+          set: { ...reassignable.p.set, tera: teraType },
+          rationale: [...reassignable.p.rationale, `Tera changed to ${teraType} to satisfy required ${req.label}.`],
+        };
+        continue;
+      }
+    }
+
     const pickedIds = new Set(team.map((p) => toID(p.species)));
     const pickedDexNums = new Set(team.map((p) => p.dexNum).filter((n): n is number => n !== undefined));
     const pickedHazards = new Set(team.flatMap((p) => hazardMovesOf(p.set)));

@@ -657,10 +657,113 @@ Rules<br />
         (p.set.tera ?? '').toLowerCase() === 'dark' || p.species === 'Marshadow',
     );
     const hasPoison = result.team.some((p) => speciesMeta(gen, p.set.baseSpecies)?.types.map((x) => x.toLowerCase()).includes('poison') || (p.set.tera ?? '').toLowerCase() === 'poison');
+    const hasFairy = result.team.some((p) => speciesMeta(gen, p.set.baseSpecies)?.types.map((x) => x.toLowerCase()).includes('fairy') || (p.set.tera ?? '').toLowerCase() === 'fairy');
     expect(hasSteel).toBe(true);
     expect(hasDarkOrMarshadow).toBe(true);
     expect(hasPoison).toBe(true);
+    // No natural Fairy-type is anywhere in this fixture's pool — this only
+    // passes if an existing team member got its Tera reassigned to Fairy.
+    expect(hasFairy).toBe(true);
     expect(result.unmetRequirements).toEqual([]);
+  }, 20000);
+
+  it('prefers reassigning an existing top-tier pick\'s Tera over importing a lower-tier natural-type mon for a type-or-Tera requirement', async () => {
+    const store = new Datastore('/nonexistent/matchup-tera-reassign-store.json');
+    const formatid = 'gen9nationaldexubers';
+    const threatSets: MatchedSet[] = [
+      mon({ species: 'Rayquaza', baseSpecies: 'Rayquaza', ability: 'Air Lock', nature: 'Naive', evs: { atk: 252, spe: 252 }, moves: ['Dragon Ascent'] }),
+      mon({ species: 'Kyogre-Primal', baseSpecies: 'Kyogre-Primal', ability: 'Primordial Sea', nature: 'Timid', evs: { spa: 252, spe: 252 }, moves: ['Water Spout'] }),
+    ];
+    const groudonPrimal = mon({ species: 'Groudon-Primal', baseSpecies: 'Groudon-Primal', ability: 'Desolate Land', nature: 'Adamant', evs: { atk: 252, hp: 252 }, moves: ['Precipice Blades', 'Fire Punch', 'Stone Edge', 'Toxic'], evSource: 'derived' });
+    const marshadow = mon({ species: 'Marshadow', baseSpecies: 'Marshadow', ability: 'Technician', nature: 'Jolly', evs: { atk: 252, spe: 252 }, moves: ['Spectral Thief', 'Close Combat', 'Ice Punch', 'Bulk Up'], evSource: 'derived' });
+    const ferrothorn = mon({ species: 'Ferrothorn', baseSpecies: 'Ferrothorn', ability: 'Iron Barbs', nature: 'Relaxed', evs: { hp: 252, def: 252 }, moves: ['Gyro Ball', 'Leech Seed', 'Knock Off', 'Body Press'], evSource: 'derived' });
+    const hooh = mon({ species: 'Ho-Oh', baseSpecies: 'Ho-Oh', ability: 'Regenerator', nature: 'Adamant', evs: { atk: 252, hp: 252 }, moves: ['Sacred Fire', 'Brave Bird', 'Recover', 'Whirlwind'], evSource: 'derived' });
+    // Two more real, strong, top-tier options — enough that the search's
+    // own picks (by matchup + quality alone, before any repair pass runs)
+    // can fill all 6 slots without ever touching the low-tier option below.
+    const lunala = mon({ species: 'Lunala', baseSpecies: 'Lunala', ability: 'Shadow Shield', nature: 'Timid', evs: { spa: 252, spe: 252, hp: 4 }, moves: ['Moongeist Beam', 'Moonblast', 'Psyshock', 'Calm Mind'], evSource: 'derived' });
+    // Yveltal, not Eternatus — Eternatus is naturally Poison/Dragon, which
+    // would satisfy the Poison requirement outright and defeat the point
+    // of this test (it needs to actually reach the Tera-reassignment path).
+    const yveltal = mon({ species: 'Yveltal', baseSpecies: 'Yveltal', ability: 'Dark Aura', nature: 'Timid', evs: { spa: 252, spe: 252, hp: 4 }, moves: ['Oblivion Wing', 'Dark Pulse', 'Taunt', 'Roost'], evSource: 'derived' });
+    // A real, but only C- tier, natural Poison-type — legal and viable
+    // enough to be a candidate, but clearly lower-ranked than every pick
+    // above. If the repair pass reaches for this just because it naturally
+    // has the right type instead of Tera-ing an existing top pick, that's
+    // exactly the regression this test guards against.
+    const lowTierPoison = mon({ species: 'Weezing', baseSpecies: 'Weezing', ability: 'Levitate', nature: 'Bold', evs: { hp: 252, def: 252 }, moves: ['Sludge Bomb', 'Will-O-Wisp', 'Pain Split', 'Toxic Spikes'], evSource: 'derived' });
+
+    let n = 0;
+    for (const set of [groudonPrimal, marshadow, ferrothorn, hooh, lunala, yveltal, lowTierPoison]) {
+      for (let rep = 0; rep < 5; rep++) {
+        store.ingest(replayWithWinner(`tera${n++}`, 'Me', [set], threatSets, 1700000000, formatid));
+      }
+    }
+    store.rebuildUniqueSets();
+
+    const threats = await buildThreatProfile(gen, `
+| Rank | Pokemon      | Use | Usage % | Win % |
+| 1    | Rayquaza     |   4 |  100.00% |  50.00% |
+| 2    | Kyogre-Primal|   4 |  100.00% |  50.00% |
+`);
+    const dFiller = ['Kyogre', 'Palkia', 'Dialga', 'Zacian', 'Reshiram', 'Solgaleo', 'Lugia', 'Palafin',
+      'Darkrai', 'Deoxys', 'Genesect', 'Naganadel', 'Dragapult', 'Espathra', 'Baxcalibur', 'Urshifu',
+      'Landorus', 'Sneasler', 'Cresselia', 'Terapagos', 'Melmetal', 'Zekrom', 'Magearna', 'Spectrier',
+      'Annihilape', 'Roaring Moon', 'Iron Bundle', 'Grimmsnarl', 'Gothitelle', 'Hatterene', 'Shuckle',
+      'Chansey', 'Dondozo', 'Kingambit', 'Mewtwo', 'Ribombee', 'Alomomola', 'Pheromosa', 'Rayquaza',
+      'Chien-Pao', 'Fezandipiti', 'Ditto', 'Arceus', 'Eternatus', 'Smeargle',
+      'Chi-Yu', 'Garganacl',
+    ].map((sp) => `${sp}<br />`).join('\n');
+    const fakeVrHtml = `
+<article class="message message--post">
+<div class="message-body">
+National Dex Ubers Ranking Tier List [Last Update: fixture]<br />
+<br />
+S+<br />
+<br />
+<a href="https://www.smogon.com/dex/sv/pokemon/groudon/national-dex-ubers/">Primal Groudon</a><br />
+<br />
+S-<br />
+<a href="https://www.smogon.com/dex/sv/pokemon/ho-oh/national-dex-ubers/">Ho-Oh</a><br />
+<br />
+A+<br />
+<a href="https://www.smogon.com/dex/sv/pokemon/marshadow/national-dex-ubers/">Marshadow</a><br />
+<a href="https://www.smogon.com/dex/sv/pokemon/yveltal/national-dex-ubers/">Yveltal</a><br />
+<br />
+A<br />
+<a href="https://www.smogon.com/dex/sv/pokemon/lunala/national-dex-ubers/">Lunala</a><br />
+<br />
+B+<br />
+<a href="https://www.smogon.com/dex/sv/pokemon/ferrothorn/national-dex-ubers/">Ferrothorn</a><br />
+<br />
+C-<br />
+<a href="https://www.smogon.com/dex/sv/pokemon/weezing/national-dex-ubers/">Weezing</a><br />
+<br />
+D Rank<br />
+Reminder: These Pokemon are unviable, but Ubers by tiering.<br />
+${dFiller}
+<br />
+Rules<br />
+</div>
+</article>
+<article class="message message--post" data-author="someoneelse">
+</article>`;
+    const fakeFetch = (async () => ({ ok: true, text: async () => fakeVrHtml })) as unknown as typeof fetch;
+
+    _clearVrCacheForTests();
+    const result = await buildCounterTeam(store, gen, formatid, threats, fakeFetch);
+    const species = result.team.map((t) => t.species);
+
+    // Poison coverage should come from an existing top-tier pick's Tera,
+    // not by importing the much-lower-tier Weezing.
+    expect(species).not.toContain('Weezing');
+    const poisonSatisfier = result.team.find(
+      (p) => speciesMeta(gen, p.set.baseSpecies)?.types.map((x) => x.toLowerCase()).includes('poison') || (p.set.tera ?? '').toLowerCase() === 'poison',
+    );
+    expect(poisonSatisfier).toBeDefined();
+    expect((poisonSatisfier!.set.tera ?? '').toLowerCase()).toBe('poison');
+    expect(poisonSatisfier!.rationale.some((r) => r.includes('Tera changed to Poison'))).toBe(true);
+    expect(result.unmetRequirements).not.toContain('Poison coverage (type or Tera)');
   }, 20000);
 
   it('pickBestMandatoryVariant flexes off a hazard move that only nominally scores best, but not when the hazard variant is clearly stronger', () => {

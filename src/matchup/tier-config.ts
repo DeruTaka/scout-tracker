@@ -18,6 +18,15 @@ export interface RequirementCandidate {
 export interface Requirement {
   label: string;
   satisfies: (gen: Generation, pick: RequirementCandidate) => boolean;
+  /** The Tera type that would satisfy this requirement, set only when this
+   *  IS a type-or-Tera requirement (allowTera true) — lets the repair pass
+   *  (see enforceRequirements in team-builder.ts) prefer reassigning an
+   *  already-strong team member's Tera over swapping in a whole different,
+   *  likely lower-tier species that happens to carry the type naturally.
+   *  Left unset for a natural-type-only requirement (e.g. Steel, Fairy),
+   *  where an actual Pokemon of that type is required — Tera can't stand
+   *  in for it. */
+  teraType?: string;
 }
 
 function typeRequirement(type: string, allowTera: boolean): Requirement {
@@ -30,6 +39,7 @@ function typeRequirement(type: string, allowTera: boolean): Requirement {
       if (allowTera && (pick.set.tera ?? '').toLowerCase() === type.toLowerCase()) return true;
       return false;
     },
+    teraType: allowTera ? type : undefined,
   };
 }
 
@@ -43,6 +53,7 @@ function typeOrSpeciesRequirement(type: string, allowTera: boolean, altSpecies: 
   return {
     label: `${base.label} or ${altSpecies.join('/')}`,
     satisfies: (gen, pick) => base.satisfies(gen, pick) || altIds.has(toID(pick.species)),
+    teraType: base.teraType,
   };
 }
 
@@ -165,7 +176,7 @@ const CONFIGS: Record<string, TierConfig> = {
   gen9ubers: {
     mandatorySpecies: ['Koraidon'],
     requirements: [
-      typeRequirement('Steel', false),
+      typeRequirement('Steel', false), // an actual Steel-type, not Tera
       typeRequirement('Dark', true),
       typeRequirement('Fairy', true),
       speedControlRequirement(),
@@ -176,13 +187,14 @@ const CONFIGS: Record<string, TierConfig> = {
   gen9nationaldexubers: {
     mandatorySpecies: ['Groudon-Primal'],
     requirements: [
-      typeRequirement('Steel', false),
+      typeRequirement('Steel', false), // an actual Steel-type, not Tera
       typeOrSpeciesRequirement('Dark', true, ['Marshadow']),
       typeRequirement('Poison', true),
+      typeRequirement('Fairy', true), // unlike gen9ubers, Fairy can be satisfied via Tera here
       speedControlRequirement(),
     ],
     extraCandidateSpecies: [],
-    getViability: vrListViability(3),
+    getViability: vrListViability(8),
     trustCuratedLegality: true,
     vrThreadUrl: 'https://www.smogon.com/forums/threads/national-dex-ubers-viability-rankings-update-12-at-post-377.3712169/',
     bundledVrFallback: GEN9_NATDEX_UBERS_BUNDLED_VR,
