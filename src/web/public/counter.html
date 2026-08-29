@@ -275,6 +275,46 @@ function render(data){
   wirePokepaste($('results'));
 }
 
+// A poll that fails outright (a dropped response, a slow request that
+// itself times out) must never silently kill the loop — that leaves the UI
+// stuck forever with no explanation. Failures are retried with backoff, not
+// fatal; only an actual job-level error (returned by the server once the
+// job finishes) ends it. Mirrors index.html's pollJob/startJob exactly.
+function pollJob(endpoint, { onTick, onDone, onPollError }) {
+  let failures = 0;
+  async function tick() {
+    let s;
+    try {
+      s = await (await fetch(endpoint)).json();
+      failures = 0;
+    } catch (e) {
+      failures++;
+      onPollError?.(e, failures);
+      setTimeout(tick, Math.min(2000 * failures, 10000));
+      return;
+    }
+    if (s.running) {
+      onTick(s);
+      setTimeout(tick, 1200);
+    } else {
+      onDone(s);
+    }
+  }
+  tick();
+}
+
+async function startJob(endpoint, body, onError) {
+  try {
+    const opts = body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : { method: 'POST' };
+    const r = await (await fetch(endpoint, opts)).json();
+    if (r.error) { onError(r.error); return false; }
+    return true;
+  } catch (e) {
+    onError(e.message || e);
+    return false;
+  }
+}
+
 async function build(){
   const input = $('input').value.trim();
   if (!input) return;
@@ -282,16 +322,22 @@ async function build(){
   $('buildBtn').disabled = true;
   $('busy').innerHTML = '<span class="busy"><span class="spin"></span> analyzing matchups…</span>';
   $('results').innerHTML = '';
-  try {
-    const r = await (await fetch('/api/counter-team', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ input, formatid }) })).json();
-    if (r.error) { $('results').innerHTML = `<div class="err">${esc(r.error)}</div>`; return; }
-    render(r);
-  } catch (e) {
-    $('results').innerHTML = `<div class="err">${esc(e.message || e)}</div>`;
-  } finally {
-    $('buildBtn').disabled = false;
-    $('busy').textContent = '';
-  }
+  const finish = () => { $('buildBtn').disabled = false; $('busy').textContent = ''; };
+  const ok = await startJob('/api/counter-team', { input, formatid }, (err) => {
+    $('results').innerHTML = `<div class="err">${esc(err)}</div>`;
+    finish();
+  });
+  if (!ok) return;
+  pollJob('/api/counter-team', {
+    onTick: () => { $('buildBtn').disabled = true; },
+    onPollError: () => { $('busy').innerHTML = '<span class="busy"><span class="spin"></span> reconnecting…</span>'; },
+    onDone: (s) => {
+      finish();
+      if (!s.finishedAt) return; // nothing has ever run — stay quiet (page-load resume check)
+      if (s.error) { $('results').innerHTML = `<div class="err">${esc(s.error)}</div>`; return; }
+      render(s.result);
+    },
+  });
 }
 
 $('buildBtn').onclick = build;

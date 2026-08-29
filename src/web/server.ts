@@ -157,28 +157,42 @@ export function startServer(store: Datastore, config: Config, port: number): voi
   });
   app.get('/api/refresh', (_req, res) => res.json(refreshJob.current));
 
-  app.post('/api/counter-team', async (req, res) => {
-    try {
-      const input = String(req.body?.input || '').trim();
-      if (!input) { res.status(400).json({ error: 'input is required (a usage table or a PokePaste URL)' }); return; }
-      const formatid = String(req.body?.formatid || 'gen9ubers').trim();
-      const gen = getGen(genFromFormatId(formatid));
+  // Building a counter-team means an async lookup (local store, then Smogon
+  // dex/usage stats, network-backed) for every candidate species in the
+  // format — for a VR-driven tier like gen9nationaldexubers that's 100+
+  // species, run mostly sequentially. That routinely runs well past what a
+  // reverse proxy/host holds a request open for, hitting the exact
+  // HTML-error-page-instead-of-JSON failure documented above /api/ingest —
+  // so this runs as a background job too, POST-then-poll like the rest.
+  const counterTeamJob = new BackgroundJob<{
+    threats: Awaited<ReturnType<typeof buildCounterTeam>>['threats'];
+    resolvedThreats: (Awaited<ReturnType<typeof buildCounterTeam>>['resolvedThreats'][number] & { sprite: string })[];
+    team: (Awaited<ReturnType<typeof buildCounterTeam>>['team'][number] & { sprite: string; paste: string })[];
+    unmetRequirements: string[];
+  }>();
 
+  app.post('/api/counter-team', (req, res) => {
+    const input = String(req.body?.input || '').trim();
+    if (!input) { res.status(400).json({ error: 'input is required (a usage table or a PokePaste URL)' }); return; }
+    const formatid = String(req.body?.formatid || 'gen9ubers').trim();
+    const { started, error } = counterTeamJob.start(1, async () => {
+      const gen = getGen(genFromFormatId(formatid));
       const threats = await buildThreatProfile(gen, input);
       const result = await buildCounterTeam(store, gen, formatid, threats);
 
-      for (const t of result.resolvedThreats) (t as any).sprite = spriteSlug(gen, t.set.species);
+      const resolvedThreats = result.resolvedThreats.map((t) => ({ ...t, sprite: spriteSlug(gen, t.set.species) }));
       const team = result.team.map((pick) => ({
         ...pick,
         sprite: spriteSlug(gen, pick.set.species),
         paste: exportSet(pick.set),
       }));
 
-      res.json({ threats: result.threats, resolvedThreats: result.resolvedThreats, team, unmetRequirements: result.unmetRequirements });
-    } catch (e) {
-      res.status(400).json({ error: e instanceof Error ? e.message : String(e) });
-    }
+      return { threats: result.threats, resolvedThreats, team, unmetRequirements: result.unmetRequirements };
+    });
+    if (!started) { res.status(409).json({ error }); return; }
+    res.json({ started: true });
   });
+  app.get('/api/counter-team', (_req, res) => res.json(counterTeamJob.current));
 
   app.get('/api/player-usage', (req, res) => {
     const player = String(req.query.player || '').trim();
