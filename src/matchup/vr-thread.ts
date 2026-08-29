@@ -5,8 +5,13 @@
 // buildCounterTeam call for a VR-driven tier (see team-builder.ts) — one
 // HTTP GET + string parsing per call, not per-candidate, so the cost is
 // negligible next to everything else a counter-team build already does.
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { Generation } from '@pkmn/data';
 import { speciesMeta } from '../data/dex.js';
+
+const CACHE_DIR = fileURLToPath(new URL('../../data/cache/', import.meta.url));
 
 export type VrTier = 'S+' | 'S' | 'S-' | 'A+' | 'A' | 'A-' | 'B+' | 'B' | 'B-' | 'C+' | 'C' | 'C-' | 'D';
 const TIER_LABELS: readonly VrTier[] = ['S+', 'S', 'S-', 'A+', 'A', 'A-', 'B+', 'B', 'B-', 'C+', 'C', 'C-', 'D'];
@@ -166,9 +171,22 @@ async function fetchWithRetry(url: string, fetchImpl: typeof fetch): Promise<{ h
   let reason: string | null = null;
   for (let attempt = 0; attempt <= FETCH_RETRIES; attempt++) {
     try {
-      const res = await fetchImpl(url);
+      // Smogon's forums (unlike its static stats/dex JSON mirrors) sit
+      // behind bot-protection that reacts to Node's bare fetch() — no
+      // User-Agent, no Accept header, nothing an ordinary browser request
+      // wouldn't have — with a flat 403, not a rate-limit response. A
+      // realistic browser-shaped request header set is what actually gets
+      // through; a server/datacenter egress IP hits this far more reliably
+      // than a home connection would.
+      const res = await fetchImpl(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+        },
+      });
       if (res.ok) return { html: await res.text(), reason: null };
-      reason = `HTTP ${res.status}${res.status === 429 ? ' (rate-limited)' : ''}`;
+      reason = `HTTP ${res.status}${res.status === 429 ? ' (rate-limited)' : res.status === 403 ? ' (blocked)' : ''}`;
     } catch (e) {
       reason = e instanceof Error ? e.message : String(e);
     }
@@ -195,32 +213,94 @@ export function _clearVrCacheForTests(): void {
   cache = null;
 }
 
+/** Test-only: delete the on-disk last-known-good fallback for `formatid`,
+ *  so a test exercising "no live fetch AND no saved copy" doesn't
+ *  accidentally succeed off a file a previous real run (or test) left
+ *  behind. Best-effort — a missing file is not an error. */
+export function _clearSavedVrMapForTests(formatid: string): void {
+  try {
+    if (existsSync(savedMapPath(formatid))) writeFileSync(savedMapPath(formatid), '');
+  } catch {
+    /* ignore */
+  }
+}
+
+// A hosted deployment's egress IP (Render, Railway, Fly, ...) is shared
+// across many unrelated services and gets bot-protection-blocked by
+// Cloudflare far more readily than a home connection — realistic headers
+// (above) fix most of that, but not all of it, and it can recur. When even
+// a fresh, retried fetch is rejected, falling back to the last SUCCESSFUL
+// fetch (persisted to disk, arbitrarily old) keeps the feature usable
+// instead of hard-failing every build until Smogon's forums happen to let
+// this IP back in. This is a fallback of last resort, not the normal path —
+// the live fetch above is always tried first, on every call.
+function savedMapPath(formatid: string): string {
+  return join(CACHE_DIR, `vr-${formatid}.json`);
+}
+
+function loadSavedVrMap(formatid: string): { map: Record<string, VrTier>; savedAt: number } | null {
+  try {
+    const parsed = JSON.parse(readFileSync(savedMapPath(formatid), 'utf8'));
+    if (parsed && typeof parsed === 'object' && parsed.map && typeof parsed.savedAt === 'number') return parsed;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function saveVrMap(formatid: string, map: Record<string, VrTier>): void {
+  try {
+    if (!existsSync(CACHE_DIR)) mkdirSync(CACHE_DIR, { recursive: true });
+    writeFileSync(savedMapPath(formatid), JSON.stringify({ map, savedAt: Date.now() }));
+  } catch {
+    /* best-effort — a write failure here shouldn't break the live result */
+  }
+}
+
+export interface VrFetchResult {
+  map: Record<string, VrTier> | null;
+  /** Set whenever the LIVE fetch itself failed, even if `map` ended up
+   *  populated from the saved fallback — a caller can use this to warn
+   *  "using a cached list" without treating it as a hard error. */
+  reason: string | null;
+  /** True if `map` came from the on-disk last-known-good fallback, not a
+   *  fresh fetch. */
+  stale: boolean;
+  /** When the stale fallback was originally fetched (only set if `stale`). */
+  savedAt?: number;
+}
+
 /**
  * Fetch and parse a VR thread's current first post into a
- * species -> tier map (cached briefly — see CACHE_TTL_MS above — so this
- * always reflects whatever the council currently has posted, without
- * re-fetching on every single call). Returns { map: null, reason } on any
- * failure (network, unexpected page structure, or a suspiciously small
- * parse) — `reason` says why, so a caller reporting the failure to a user
- * doesn't have to guess between "the network is down" and "Smogon changed
- * the page layout."
+ * species -> tier map (cached briefly in memory — see CACHE_TTL_MS above —
+ * so this always reflects whatever the council currently has posted,
+ * without re-fetching on every single call). `formatid` keys the on-disk
+ * last-known-good fallback used if the live fetch fails outright. Returns
+ * `{ map: null, reason, stale: false }` only when there's neither a fresh
+ * fetch NOR any previously-saved copy to fall back to.
  */
 export async function fetchLiveVrMap(
   gen: Generation,
   url: string,
+  formatid: string,
   fetchImpl: typeof fetch = fetch,
-): Promise<{ map: Record<string, VrTier> | null; reason: string | null }> {
+): Promise<VrFetchResult> {
   if (cache && cache.url === url && Date.now() - cache.fetchedAt < CACHE_TTL_MS) {
-    return { map: cache.map, reason: null };
+    return { map: cache.map, reason: null, stale: false };
   }
 
+  const fail = (reason: string): VrFetchResult => {
+    const saved = loadSavedVrMap(formatid);
+    return saved ? { map: saved.map, reason, stale: true, savedAt: saved.savedAt } : { map: null, reason, stale: false };
+  };
+
   const { html, reason: fetchReason } = await fetchWithRetry(url, fetchImpl);
-  if (!html) return { map: null, reason: fetchReason ?? 'fetch failed' };
+  if (!html) return fail(fetchReason ?? 'fetch failed');
 
   const raw = parseVrThreadFirstPost(html);
-  if (!raw) return { map: null, reason: "couldn't find the tier list in the page (its layout may have changed)" };
+  if (!raw) return fail("couldn't find the tier list in the page (its layout may have changed)");
   if (raw.length < MIN_PLAUSIBLE_ENTRIES) {
-    return { map: null, reason: `only parsed ${raw.length} entries, expected 100+ (the page's layout may have changed)` };
+    return fail(`only parsed ${raw.length} entries, expected 100+ (the page's layout may have changed)`);
   }
 
   const map: Record<string, VrTier> = {};
@@ -233,8 +313,9 @@ export async function fetchLiveVrMap(
     if (!existing || VR_TIER_SCORE[tier] > VR_TIER_SCORE[existing]) map[resolved] = tier;
   }
   if (Object.keys(map).length < MIN_PLAUSIBLE_ENTRIES) {
-    return { map: null, reason: `only resolved ${Object.keys(map).length} real species names out of ${raw.length} parsed entries` };
+    return fail(`only resolved ${Object.keys(map).length} real species names out of ${raw.length} parsed entries`);
   }
   cache = { url, map, fetchedAt: Date.now() };
-  return { map, reason: null };
+  saveVrMap(formatid, map);
+  return { map, reason: null, stale: false };
 }

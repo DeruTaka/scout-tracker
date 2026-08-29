@@ -169,6 +169,7 @@ export function startServer(store: Datastore, config: Config, port: number): voi
     resolvedThreats: (Awaited<ReturnType<typeof buildCounterTeam>>['resolvedThreats'][number] & { sprite: string })[];
     team: (Awaited<ReturnType<typeof buildCounterTeam>>['team'][number] & { sprite: string; paste: string })[];
     unmetRequirements: string[];
+    warnings: string[];
   }>();
 
   app.post('/api/counter-team', (req, res) => {
@@ -187,7 +188,7 @@ export function startServer(store: Datastore, config: Config, port: number): voi
         paste: exportSet(pick.set),
       }));
 
-      return { threats: result.threats, resolvedThreats, team, unmetRequirements: result.unmetRequirements };
+      return { threats: result.threats, resolvedThreats, team, unmetRequirements: result.unmetRequirements, warnings: result.warnings };
     });
     if (!started) { res.status(409).json({ error }); return; }
     res.json({ started: true });

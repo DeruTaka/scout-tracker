@@ -36,6 +36,10 @@ export interface CounterTeamResult {
   /** Requirements that could NOT be met (no legal, Species-Clause-compatible
    *  candidate was available) — normally empty. */
   unmetRequirements: string[];
+  /** Non-fatal notes worth surfacing — e.g. a VR-driven tier's live fetch
+   *  failed and this build fell back to the last successfully-fetched copy.
+   *  Normally empty. */
+  warnings: string[];
 }
 
 const TEAM_SIZE = 6;
@@ -184,7 +188,7 @@ export async function buildCounterTeam(
     const known = await getBestKnownSet(store, gen, formatid, t.baseSpecies);
     if (known) resolvedThreats.push({ species: t.species, weight: t.weight, set: known.set, source: known.source });
   }
-  if (!resolvedThreats.length) return { threats, resolvedThreats, team: [], unmetRequirements: [] };
+  if (!resolvedThreats.length) return { threats, resolvedThreats, team: [], unmetRequirements: [], warnings: [] };
 
   const threatIds = new Set(resolvedThreats.map((t) => toID(t.set.baseSpecies)));
   const historicalWinRates = getHistoricalWinRates(store, formatid, threatIds);
@@ -193,21 +197,30 @@ export async function buildCounterTeam(
 
   // A VR-driven tier restricts the ENTIRE candidate pool to that list —
   // fetched fresh every call (see vr-thread.ts, which already retries a
-  // transient failure a couple of times), never a stored snapshot. Nothing
-  // outside it is usable here, no matter how common it is locally or in
-  // Smogon's usage stats, so this replaces allCandidateSpecies() entirely
-  // rather than adding to it. If the fetch still fails after retrying, fail
-  // loudly here rather than quietly proceeding with an empty pool — that
-  // silent path used to surface as every single coverage requirement
-  // failing at once ("no legal option was available"), which reads like a
-  // real teambuilding problem instead of the network hiccup it actually is.
-  const vrFetch = config.vrThreadUrl ? await fetchLiveVrMap(gen, config.vrThreadUrl, vrFetchImpl) : { map: null, reason: null };
+  // transient failure a couple of times, then falls back to the last
+  // successfully-fetched copy on disk). Nothing outside it is usable here,
+  // no matter how common it is locally or in Smogon's usage stats, so this
+  // replaces allCandidateSpecies() entirely rather than adding to it. Only
+  // fail outright when there's truly nothing to work with — no fresh fetch
+  // AND no saved fallback (e.g. this is the very first run and Smogon is
+  // unreachable) — rather than quietly proceeding with an empty pool, which
+  // used to surface as every single coverage requirement failing at once
+  // ("no legal option was available"), reading like a real teambuilding
+  // problem instead of the network/blocking issue it actually is.
+  const vrFetch = config.vrThreadUrl ? await fetchLiveVrMap(gen, config.vrThreadUrl, formatid, vrFetchImpl) : { map: null, reason: null, stale: false as const };
   const vrMap = vrFetch.map;
   if (config.vrThreadUrl && !vrMap) {
     throw new Error(
       `Couldn't fetch the live Viability Rankings list for ${formatid} (${config.vrThreadUrl}): ${vrFetch.reason}. Try again in a moment.`,
     );
   }
+  const warnings: string[] = vrFetch.stale
+    ? [
+        `Couldn't reach the live Viability Rankings list (${vrFetch.reason}) — using the last successfully-fetched copy` +
+          ('savedAt' in vrFetch && vrFetch.savedAt ? ` from ${new Date(vrFetch.savedAt).toLocaleString()}` : '') +
+          '. Rankings may be slightly out of date.',
+      ]
+    : [];
   const candidateSpecies = config.vrThreadUrl
     ? Object.entries(vrMap ?? {})
         .filter(([, tier]) => VR_TIER_SCORE[tier] > 0)
@@ -324,7 +337,7 @@ export async function buildCounterTeam(
   const { team: repaired, unmet } = enforceRequirements(picked, scored, gen, config.requirements, config.mandatorySpecies, affinity);
 
   const team = repaired.map((c) => ({ species: c.species, set: c.set, source: c.source, rationale: c.rationale }));
-  return { threats, resolvedThreats, team, unmetRequirements: unmet };
+  return { threats, resolvedThreats, team, unmetRequirements: unmet, warnings };
 }
 
 /** Precompute real teammate co-occurrence for every candidate pair up front

@@ -6,7 +6,7 @@ import { scoreMatchup } from '../src/matchup/score.js';
 import { getHistoricalWinRates } from '../src/matchup/historical.js';
 import { buildCounterTeam, pickBestMandatoryVariant } from '../src/matchup/team-builder.js';
 import { getBestKnownSet } from '../src/matchup/candidate-pool.js';
-import { _clearVrCacheForTests } from '../src/matchup/vr-thread.js';
+import { _clearVrCacheForTests, _clearSavedVrMapForTests } from '../src/matchup/vr-thread.js';
 import type { MatchedSet, Replay, ScoutedReplay } from '../src/types.js';
 
 const gen = getGen(9);
@@ -699,7 +699,7 @@ Rules<br />
     expect(known!.set.baseSpecies).toBe('Groudon-Primal');
   }, 20000);
 
-  it('fails loudly (not with an empty near-mandatory-only team) when a VR-driven tier\'s live fetch is unavailable', async () => {
+  it('fails loudly (not with an empty near-mandatory-only team) when a VR-driven tier\'s live fetch is unavailable and there is no saved fallback', async () => {
     const store = new Datastore('/nonexistent/matchup-vr-fetch-fail-store.json');
     const formatid = 'gen9nationaldexubers';
     const threatSets: MatchedSet[] = [
@@ -715,10 +715,71 @@ Rules<br />
     // A fetch that always fails (network down / Smogon unreachable) — this
     // used to silently degrade to a near-empty candidate pool and surface
     // as every coverage requirement failing at once, which reads like a
-    // real teambuilding problem rather than the actual network hiccup.
+    // real teambuilding problem rather than the actual network hiccup. With
+    // no saved fallback available either (a real first-ever run against a
+    // blocked host), there's genuinely nothing to build from — this is the
+    // one case that should still fail outright, clearly.
     const alwaysFailFetch = (async () => { throw new Error('network unreachable'); }) as unknown as typeof fetch;
-    _clearVrCacheForTests(); // don't let another test's successful fetch for this same URL short-circuit this one
+    _clearVrCacheForTests();
+    _clearSavedVrMapForTests(formatid);
     await expect(buildCounterTeam(store, gen, formatid, threats, alwaysFailFetch)).rejects.toThrow(/Viability Rankings/);
+  }, 20000);
+
+  it('falls back to the last successfully-fetched VR list (with a warning) when the live fetch fails but a saved copy exists', async () => {
+    const store = new Datastore('/nonexistent/matchup-vr-fallback-store.json');
+    const formatid = 'gen9nationaldexubers';
+    const threatSets: MatchedSet[] = [
+      mon({ species: 'Zacian-Crowned', baseSpecies: 'Zacian-Crowned', ability: 'Intrepid Sword', nature: 'Jolly', evs: { atk: 252, spe: 252 }, moves: ['Behemoth Blade'] }),
+    ];
+    const threats = await buildThreatProfile(gen, `
+| Rank | Pokemon        | Use | Usage % | Win % |
+| 1    | Zacian-Crowned |   4 |  100.00% |  50.00% |
+| 2    | Kyogre         |   4 |  100.00% |  50.00% |
+`);
+    const dFiller = ['Kyogre', 'Palkia', 'Dialga', 'Zacian', 'Reshiram', 'Solgaleo', 'Lugia', 'Palafin',
+      'Darkrai', 'Deoxys', 'Genesect', 'Naganadel', 'Dragapult', 'Espathra', 'Baxcalibur', 'Urshifu',
+      'Landorus', 'Sneasler', 'Cresselia', 'Terapagos', 'Melmetal', 'Zekrom', 'Magearna', 'Spectrier',
+      'Annihilape', 'Roaring Moon', 'Iron Bundle', 'Grimmsnarl', 'Gothitelle', 'Hatterene', 'Shuckle',
+      'Chansey', 'Dondozo', 'Kingambit', 'Mewtwo', 'Ribombee', 'Alomomola', 'Pheromosa', 'Rayquaza',
+      'Chien-Pao', 'Fezandipiti', 'Ditto', 'Arceus', 'Lunala', 'Eternatus', 'Yveltal', 'Smeargle',
+      'Chi-Yu', 'Garganacl',
+    ].map((sp) => `${sp}<br />`).join('\n');
+    const fakeVrHtml = `
+<article class="message message--post">
+<div class="message-body">
+National Dex Ubers Ranking Tier List [Last Update: fixture]<br />
+<br />
+S+<br />
+<br />
+<a href="https://www.smogon.com/dex/sv/pokemon/groudon/national-dex-ubers/">Primal Groudon</a><br />
+<br />
+D Rank<br />
+Reminder: These Pokemon are unviable, but Ubers by tiering.<br />
+${dFiller}
+<br />
+Rules<br />
+</div>
+</article>
+<article class="message message--post" data-author="someoneelse">
+</article>`;
+    const succeedingFetch = (async () => ({ ok: true, text: async () => fakeVrHtml })) as unknown as typeof fetch;
+
+    // First, a successful fetch — this is what populates the on-disk
+    // last-known-good copy in real usage.
+    _clearVrCacheForTests();
+    const first = await buildCounterTeam(store, gen, formatid, threats, succeedingFetch);
+    expect(first.warnings).toEqual([]);
+    expect(first.team.some((p) => p.species === 'Groudon-Primal')).toBe(true);
+
+    // Now the live fetch fails outright (blocked/unreachable) — only the
+    // in-memory cache needs clearing to force a real fetch attempt; the
+    // on-disk copy from the call above should carry this one through.
+    const alwaysFailFetch = (async () => { throw new Error('HTTP 403'); }) as unknown as typeof fetch;
+    _clearVrCacheForTests();
+    const second = await buildCounterTeam(store, gen, formatid, threats, alwaysFailFetch);
+    expect(second.team.some((p) => p.species === 'Groudon-Primal')).toBe(true); // still built a real team
+    expect(second.warnings.length).toBe(1);
+    expect(second.warnings[0]).toMatch(/last successfully-fetched copy/);
   }, 20000);
 
   it('caps the number of resolved threats instead of scoring every row of a huge pasted usage table (regression: OOM on a full stats dump)', async () => {

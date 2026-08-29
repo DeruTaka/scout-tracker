@@ -270,7 +270,11 @@ function render(data){
     ? `<div class="err" style="margin-top:14px">Could not satisfy required coverage: ${data.unmetRequirements.map(esc).join(', ')} — no legal, Species-Clause-compatible option was available.</div>`
     : '';
 
-  $('results').innerHTML = threatsHtml + teamHtml + unmetHtml;
+  const warningsHtml = (data.warnings || []).length
+    ? data.warnings.map((w) => `<div class="card pad" style="margin-top:14px;color:var(--muted);font-size:13px">${esc(w)}</div>`).join('')
+    : '';
+
+  $('results').innerHTML = threatsHtml + teamHtml + unmetHtml + warningsHtml;
   wireCopy($('results'));
   wirePokepaste($('results'));
 }
