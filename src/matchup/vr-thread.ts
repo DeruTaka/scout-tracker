@@ -166,19 +166,33 @@ const MIN_PLAUSIBLE_ENTRIES = 40;
  * can degrade gracefully instead of building a team off a broken/partial
  * list.
  */
+// A candidate pool this consequential shouldn't collapse to "basically just
+// the mandatory pick" over one transient blip (a dropped connection, a
+// momentary 5xx/rate-limit from Smogon) — retry a couple of times with a
+// short backoff before actually giving up.
+const FETCH_RETRIES = 2;
+const RETRY_DELAY_MS = 600;
+
+async function fetchWithRetry(url: string, fetchImpl: typeof fetch): Promise<string | null> {
+  for (let attempt = 0; attempt <= FETCH_RETRIES; attempt++) {
+    try {
+      const res = await fetchImpl(url);
+      if (res.ok) return await res.text();
+    } catch {
+      /* network error — fall through to retry/give up below */
+    }
+    if (attempt < FETCH_RETRIES) await new Promise((r) => setTimeout(r, RETRY_DELAY_MS * (attempt + 1)));
+  }
+  return null;
+}
+
 export async function fetchLiveVrMap(
   gen: Generation,
   url: string,
   fetchImpl: typeof fetch = fetch,
 ): Promise<Record<string, VrTier> | null> {
-  let html: string;
-  try {
-    const res = await fetchImpl(url);
-    if (!res.ok) return null;
-    html = await res.text();
-  } catch {
-    return null;
-  }
+  const html = await fetchWithRetry(url, fetchImpl);
+  if (!html) return null;
 
   const raw = parseVrThreadFirstPost(html);
   if (!raw || raw.length < MIN_PLAUSIBLE_ENTRIES) return null;

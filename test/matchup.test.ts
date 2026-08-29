@@ -697,6 +697,27 @@ Rules<br />
     expect(known!.set.baseSpecies).toBe('Groudon-Primal');
   }, 20000);
 
+  it('fails loudly (not with an empty near-mandatory-only team) when a VR-driven tier\'s live fetch is unavailable', async () => {
+    const store = new Datastore('/nonexistent/matchup-vr-fetch-fail-store.json');
+    const formatid = 'gen9nationaldexubers';
+    const threatSets: MatchedSet[] = [
+      mon({ species: 'Zacian-Crowned', baseSpecies: 'Zacian-Crowned', ability: 'Intrepid Sword', nature: 'Jolly', evs: { atk: 252, spe: 252 }, moves: ['Behemoth Blade'] }),
+    ];
+    store.ingest(replayWithWinner('vrfail0', 'Me', [mon({ species: 'Blissey', baseSpecies: 'Blissey' })], threatSets, 1700000000, formatid));
+    store.rebuildUniqueSets();
+    const threats = await buildThreatProfile(gen, `
+| Rank | Pokemon        | Use | Usage % | Win % |
+| 1    | Zacian-Crowned |   4 |  100.00% |  50.00% |
+| 2    | Kyogre         |   4 |  100.00% |  50.00% |
+`);
+    // A fetch that always fails (network down / Smogon unreachable) — this
+    // used to silently degrade to a near-empty candidate pool and surface
+    // as every coverage requirement failing at once, which reads like a
+    // real teambuilding problem rather than the actual network hiccup.
+    const alwaysFailFetch = (async () => { throw new Error('network unreachable'); }) as unknown as typeof fetch;
+    await expect(buildCounterTeam(store, gen, formatid, threats, alwaysFailFetch)).rejects.toThrow(/Viability Rankings/);
+  }, 20000);
+
   it('caps the number of resolved threats instead of scoring every row of a huge pasted usage table (regression: OOM on a full stats dump)', async () => {
     const store = new Datastore('/nonexistent/matchup-threat-cap-store.json');
     const formatid = 'gen9customtest';

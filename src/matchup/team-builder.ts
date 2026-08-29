@@ -192,13 +192,21 @@ export async function buildCounterTeam(
   const usageRanks = await getUsageRankMap(formatid);
 
   // A VR-driven tier restricts the ENTIRE candidate pool to that list —
-  // fetched fresh every call (see vr-thread.ts), never a stored snapshot.
-  // Nothing outside it is usable here, no matter how common it is locally
-  // or in Smogon's usage stats, so this replaces allCandidateSpecies()
-  // entirely rather than adding to it. A failed fetch degrades to an empty
-  // pool (aside from any mandatory pick, resolved separately below) rather
-  // than silently falling back to the unrestricted candidate set.
+  // fetched fresh every call (see vr-thread.ts, which already retries a
+  // transient failure a couple of times), never a stored snapshot. Nothing
+  // outside it is usable here, no matter how common it is locally or in
+  // Smogon's usage stats, so this replaces allCandidateSpecies() entirely
+  // rather than adding to it. If the fetch still fails after retrying, fail
+  // loudly here rather than quietly proceeding with an empty pool — that
+  // silent path used to surface as every single coverage requirement
+  // failing at once ("no legal option was available"), which reads like a
+  // real teambuilding problem instead of the network hiccup it actually is.
   const vrMap = config.vrThreadUrl ? await fetchLiveVrMap(gen, config.vrThreadUrl, vrFetchImpl) : null;
+  if (config.vrThreadUrl && !vrMap) {
+    throw new Error(
+      `Couldn't fetch the live Viability Rankings list for ${formatid} (${config.vrThreadUrl}) — Smogon's forums may be temporarily unreachable or rate-limiting. Try again in a moment.`,
+    );
+  }
   const candidateSpecies = config.vrThreadUrl
     ? Object.entries(vrMap ?? {})
         .filter(([, tier]) => VR_TIER_SCORE[tier] > 0)
