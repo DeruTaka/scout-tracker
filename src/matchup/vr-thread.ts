@@ -155,17 +155,6 @@ export function resolveVrDisplayName(gen: Generation, displayName: string): stri
 // back a truncated, wrong candidate pool.
 const MIN_PLAUSIBLE_ENTRIES = 40;
 
-/**
- * Fetch and parse a VR thread's current first post into a
- * species -> tier map, re-derived fresh on every call (no caching, and
- * nothing persisted to disk) so it always reflects whatever the council
- * currently has posted — a tier list this consequential (it gates which
- * Pokemon a counter-team build is even allowed to consider) shouldn't ever
- * be working off a stale snapshot. Returns null on any failure (network,
- * unexpected page structure, or a suspiciously small parse) so the caller
- * can degrade gracefully instead of building a team off a broken/partial
- * list.
- */
 // A candidate pool this consequential shouldn't collapse to "basically just
 // the mandatory pick" over one transient blip (a dropped connection, a
 // momentary 5xx/rate-limit from Smogon) — retry a couple of times with a
@@ -173,29 +162,66 @@ const MIN_PLAUSIBLE_ENTRIES = 40;
 const FETCH_RETRIES = 2;
 const RETRY_DELAY_MS = 600;
 
-async function fetchWithRetry(url: string, fetchImpl: typeof fetch): Promise<string | null> {
+async function fetchWithRetry(url: string, fetchImpl: typeof fetch): Promise<{ html: string | null; reason: string | null }> {
+  let reason: string | null = null;
   for (let attempt = 0; attempt <= FETCH_RETRIES; attempt++) {
     try {
       const res = await fetchImpl(url);
-      if (res.ok) return await res.text();
-    } catch {
-      /* network error — fall through to retry/give up below */
+      if (res.ok) return { html: await res.text(), reason: null };
+      reason = `HTTP ${res.status}${res.status === 429 ? ' (rate-limited)' : ''}`;
+    } catch (e) {
+      reason = e instanceof Error ? e.message : String(e);
     }
     if (attempt < FETCH_RETRIES) await new Promise((r) => setTimeout(r, RETRY_DELAY_MS * (attempt + 1)));
   }
-  return null;
+  return { html: null, reason };
 }
 
+// Re-fetching on literally every call means every rapid-fire retry (a user
+// hitting "try again" a few times after a failure, or building several
+// counter-teams back to back) sends a fresh request to Smogon's forums —
+// exactly the kind of pattern that trips rate-limiting in the first place.
+// A short in-memory cache breaks that loop while staying, in any practical
+// sense, "live": the council doesn't revise a VR list minute to minute, so
+// nothing meaningful goes stale in this window — it just stops hammering
+// the same page over and over for calls seconds apart. Not persisted to
+// disk, and gone the moment the process restarts.
+const CACHE_TTL_MS = 5 * 60 * 1000;
+let cache: { url: string; map: Record<string, VrTier>; fetchedAt: number } | null = null;
+
+/** Test-only: clear the in-memory cache so tests using different fetchImpl
+ *  stubs against the same URL don't see a previous test's cached result. */
+export function _clearVrCacheForTests(): void {
+  cache = null;
+}
+
+/**
+ * Fetch and parse a VR thread's current first post into a
+ * species -> tier map (cached briefly — see CACHE_TTL_MS above — so this
+ * always reflects whatever the council currently has posted, without
+ * re-fetching on every single call). Returns { map: null, reason } on any
+ * failure (network, unexpected page structure, or a suspiciously small
+ * parse) — `reason` says why, so a caller reporting the failure to a user
+ * doesn't have to guess between "the network is down" and "Smogon changed
+ * the page layout."
+ */
 export async function fetchLiveVrMap(
   gen: Generation,
   url: string,
   fetchImpl: typeof fetch = fetch,
-): Promise<Record<string, VrTier> | null> {
-  const html = await fetchWithRetry(url, fetchImpl);
-  if (!html) return null;
+): Promise<{ map: Record<string, VrTier> | null; reason: string | null }> {
+  if (cache && cache.url === url && Date.now() - cache.fetchedAt < CACHE_TTL_MS) {
+    return { map: cache.map, reason: null };
+  }
+
+  const { html, reason: fetchReason } = await fetchWithRetry(url, fetchImpl);
+  if (!html) return { map: null, reason: fetchReason ?? 'fetch failed' };
 
   const raw = parseVrThreadFirstPost(html);
-  if (!raw || raw.length < MIN_PLAUSIBLE_ENTRIES) return null;
+  if (!raw) return { map: null, reason: "couldn't find the tier list in the page (its layout may have changed)" };
+  if (raw.length < MIN_PLAUSIBLE_ENTRIES) {
+    return { map: null, reason: `only parsed ${raw.length} entries, expected 100+ (the page's layout may have changed)` };
+  }
 
   const map: Record<string, VrTier> = {};
   for (const { tier, displayName } of raw) {
@@ -206,5 +232,9 @@ export async function fetchLiveVrMap(
     const existing = map[resolved];
     if (!existing || VR_TIER_SCORE[tier] > VR_TIER_SCORE[existing]) map[resolved] = tier;
   }
-  return Object.keys(map).length >= MIN_PLAUSIBLE_ENTRIES ? map : null;
+  if (Object.keys(map).length < MIN_PLAUSIBLE_ENTRIES) {
+    return { map: null, reason: `only resolved ${Object.keys(map).length} real species names out of ${raw.length} parsed entries` };
+  }
+  cache = { url, map, fetchedAt: Date.now() };
+  return { map, reason: null };
 }

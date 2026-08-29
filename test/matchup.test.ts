@@ -6,6 +6,7 @@ import { scoreMatchup } from '../src/matchup/score.js';
 import { getHistoricalWinRates } from '../src/matchup/historical.js';
 import { buildCounterTeam, pickBestMandatoryVariant } from '../src/matchup/team-builder.js';
 import { getBestKnownSet } from '../src/matchup/candidate-pool.js';
+import { _clearVrCacheForTests } from '../src/matchup/vr-thread.js';
 import type { MatchedSet, Replay, ScoutedReplay } from '../src/types.js';
 
 const gen = getGen(9);
@@ -643,6 +644,7 @@ Rules<br />
 </article>`;
     const fakeFetch = (async () => ({ ok: true, text: async () => fakeVrHtml })) as unknown as typeof fetch;
 
+    _clearVrCacheForTests(); // don't let another test's cached fetch for this same URL short-circuit this one
     const result = await buildCounterTeam(store, gen, formatid, threats, fakeFetch);
     const species = result.team.map((t) => t.species);
 
@@ -715,6 +717,7 @@ Rules<br />
     // as every coverage requirement failing at once, which reads like a
     // real teambuilding problem rather than the actual network hiccup.
     const alwaysFailFetch = (async () => { throw new Error('network unreachable'); }) as unknown as typeof fetch;
+    _clearVrCacheForTests(); // don't let another test's successful fetch for this same URL short-circuit this one
     await expect(buildCounterTeam(store, gen, formatid, threats, alwaysFailFetch)).rejects.toThrow(/Viability Rankings/);
   }, 20000);
 

@@ -201,10 +201,11 @@ export async function buildCounterTeam(
   // silent path used to surface as every single coverage requirement
   // failing at once ("no legal option was available"), which reads like a
   // real teambuilding problem instead of the network hiccup it actually is.
-  const vrMap = config.vrThreadUrl ? await fetchLiveVrMap(gen, config.vrThreadUrl, vrFetchImpl) : null;
+  const vrFetch = config.vrThreadUrl ? await fetchLiveVrMap(gen, config.vrThreadUrl, vrFetchImpl) : { map: null, reason: null };
+  const vrMap = vrFetch.map;
   if (config.vrThreadUrl && !vrMap) {
     throw new Error(
-      `Couldn't fetch the live Viability Rankings list for ${formatid} (${config.vrThreadUrl}) — Smogon's forums may be temporarily unreachable or rate-limiting. Try again in a moment.`,
+      `Couldn't fetch the live Viability Rankings list for ${formatid} (${config.vrThreadUrl}): ${vrFetch.reason}. Try again in a moment.`,
     );
   }
   const candidateSpecies = config.vrThreadUrl
