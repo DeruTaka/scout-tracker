@@ -1,10 +1,11 @@
 import { describe, it, expect } from 'vitest';
 import { Datastore } from '../src/store/datastore.js';
-import { getGen, speciesMeta } from '../src/data/dex.js';
+import { getGen, speciesMeta, toID } from '../src/data/dex.js';
 import { parseUsageTable, parseScoutingDigest, buildThreatProfile } from '../src/matchup/threat-profile.js';
 import { scoreMatchup } from '../src/matchup/score.js';
 import { getHistoricalWinRates } from '../src/matchup/historical.js';
-import { buildCounterTeam } from '../src/matchup/team-builder.js';
+import { buildCounterTeam, pickBestMandatoryVariant } from '../src/matchup/team-builder.js';
+import { getBestKnownSet } from '../src/matchup/candidate-pool.js';
 import type { MatchedSet, Replay, ScoutedReplay } from '../src/types.js';
 
 const gen = getGen(9);
@@ -560,8 +561,13 @@ describe('buildCounterTeam', () => {
     // Ferrothorn (B+) is the Steel requirement's satisfier.
     const ferrothorn = mon({ species: 'Ferrothorn', baseSpecies: 'Ferrothorn', ability: 'Iron Barbs', nature: 'Relaxed', evs: { hp: 252, def: 252 }, moves: ['Gyro Ball'], evSource: 'derived' });
     // Glimmora (B-) is Poison/Rock — the Poison requirement's satisfier —
-    // and carries the team's Choice Scarf speed control.
-    const glimmora = mon({ species: 'Glimmora', baseSpecies: 'Glimmora', item: 'Choice Scarf', ability: 'Toxic Debris', nature: 'Timid', evs: { spa: 252, spe: 252 }, moves: ['Sludge Wave'], evSource: 'derived' });
+    // and carries the team's Choice Scarf speed control. A full 4-move,
+    // full-EV set on purpose: Glimmora's real Smogon fallback set runs
+    // Stealth Rock, which would collide with Groudon-Primal's own (also
+    // real) Stealth Rock set under hazard dedup if fillRealisticSet ever
+    // padded this one out — giving it a complete set up front means it
+    // never needs padding.
+    const glimmora = mon({ species: 'Glimmora', baseSpecies: 'Glimmora', item: 'Choice Scarf', ability: 'Toxic Debris', nature: 'Timid', evs: { spa: 252, spe: 252, hp: 4 }, moves: ['Sludge Wave', 'Earth Power', 'Energy Ball', 'Mortal Spin'], evSource: 'derived' });
     // Ho-Oh (S-) is real, strong, VR-ranked filler.
     const hooh = mon({ species: 'Ho-Oh', baseSpecies: 'Ho-Oh', ability: 'Regenerator', nature: 'Adamant', evs: { atk: 252, hp: 252 }, moves: ['Sacred Fire'], evSource: 'derived' });
     // Shaymin-Sky is explicitly D-tier on the real VR list ("unviable, but
@@ -589,7 +595,55 @@ describe('buildCounterTeam', () => {
 | 1    | Rayquaza     |   4 |  100.00% |  50.00% |
 | 2    | Kyogre-Primal|   4 |  100.00% |  50.00% |
 `);
-    const result = await buildCounterTeam(store, gen, formatid, threats);
+    // The real VR list is fetched fresh on every call (see vr-thread.ts) —
+    // stub that fetch with a small fixture so this test stays deterministic
+    // and offline instead of depending on Smogon's live thread content.
+    // fetchLiveVrMap refuses a suspiciously small parse (MIN_PLAUSIBLE_ENTRIES),
+    // so this pads the D tier with real, resolvable filler species past that
+    // floor — they're excluded from the candidate pool either way (D never
+    // passes viability), so they can't affect what the test actually asserts.
+    const dFiller = ['Kyogre', 'Palkia', 'Dialga', 'Zacian', 'Reshiram', 'Solgaleo', 'Lugia', 'Palafin',
+      'Darkrai', 'Deoxys', 'Genesect', 'Naganadel', 'Dragapult', 'Espathra', 'Baxcalibur', 'Urshifu',
+      'Landorus', 'Sneasler', 'Cresselia', 'Terapagos', 'Melmetal', 'Zekrom', 'Magearna', 'Spectrier',
+      'Annihilape', 'Roaring Moon', 'Iron Bundle', 'Grimmsnarl', 'Gothitelle', 'Hatterene', 'Shuckle',
+      'Chansey', 'Dondozo', 'Kingambit', 'Mewtwo', 'Ribombee', 'Alomomola', 'Pheromosa', 'Rayquaza',
+      'Chien-Pao', 'Fezandipiti', 'Ditto', 'Arceus', 'Lunala', 'Eternatus', 'Yveltal', 'Smeargle',
+      'Chi-Yu', 'Garganacl',
+    ].map((sp) => `${sp}<br />`).join('\n');
+    const fakeVrHtml = `
+<article class="message message--post">
+<div class="message-body">
+National Dex Ubers Ranking Tier List [Last Update: fixture]<br />
+<br />
+S+<br />
+<br />
+<a href="https://www.smogon.com/dex/sv/pokemon/groudon/national-dex-ubers/">Primal Groudon</a><br />
+<br />
+S-<br />
+<a href="https://www.smogon.com/dex/sv/pokemon/ho-oh/national-dex-ubers/">Ho-Oh</a><br />
+<br />
+A+<br />
+<a href="https://www.smogon.com/dex/sv/pokemon/marshadow/national-dex-ubers/">Marshadow</a><br />
+<br />
+B+<br />
+<a href="https://www.smogon.com/dex/sv/pokemon/ferrothorn/national-dex-ubers/">Ferrothorn</a><br />
+<br />
+B-<br />
+<a href="https://www.smogon.com/dex/sv/pokemon/glimmora/national-dex-ubers/">Glimmora</a><br />
+<br />
+D Rank<br />
+Reminder: These Pokemon are unviable, but Ubers by tiering.<br />
+Shaymin-S<br />
+${dFiller}
+<br />
+Rules<br />
+</div>
+</article>
+<article class="message message--post" data-author="someoneelse">
+</article>`;
+    const fakeFetch = (async () => ({ ok: true, text: async () => fakeVrHtml })) as unknown as typeof fetch;
+
+    const result = await buildCounterTeam(store, gen, formatid, threats, fakeFetch);
     const species = result.team.map((t) => t.species);
 
     expect(species).toContain('Groudon-Primal'); // mandatory for this tier
@@ -605,5 +659,81 @@ describe('buildCounterTeam', () => {
     expect(hasDarkOrMarshadow).toBe(true);
     expect(hasPoison).toBe(true);
     expect(result.unmetRequirements).toEqual([]);
+  }, 20000);
+
+  it('pickBestMandatoryVariant flexes off a hazard move that only nominally scores best, but not when the hazard variant is clearly stronger', () => {
+    const rocks = { set: mon({ species: 'Groudon-Primal', moves: ['Stealth Rock', 'Precipice Blades'] }), standaloneCeiling: 100 };
+    const attackClose = { set: mon({ species: 'Groudon-Primal', moves: ['Swords Dance', 'Precipice Blades'] }), standaloneCeiling: 90 };
+    // Within MANDATORY_HAZARD_FLEX_MARGIN (15) of the hazard variant — real
+    // teambuilding runs the attacking set here specifically so something
+    // else can hold the hazard role without a hazard-dedup conflict.
+    expect(pickBestMandatoryVariant([rocks, attackClose])).toBe(attackClose);
+
+    const attackFar = { set: mon({ species: 'Groudon-Primal', moves: ['Swords Dance', 'Precipice Blades'] }), standaloneCeiling: 50 };
+    // Far below the margin — the hazard variant is genuinely, meaningfully
+    // better, so it's kept despite the hazard-dedup risk.
+    expect(pickBestMandatoryVariant([rocks, attackFar])).toBe(rocks);
+
+    // No non-hazard alternative at all — nothing to flex to.
+    expect(pickBestMandatoryVariant([rocks])).toBe(rocks);
+
+    // No hazard involved anywhere — plain best-scoring wins, unaffected.
+    const attack1 = { set: mon({ species: 'Groudon-Primal', moves: ['Swords Dance'] }), standaloneCeiling: 80 };
+    const attack2 = { set: mon({ species: 'Groudon-Primal', moves: ['Rock Polish'] }), standaloneCeiling: 95 };
+    expect(pickBestMandatoryVariant([attack1, attack2])).toBe(attack2);
+  });
+
+  it('resolves Groudon-Primal/Kyogre-Primal dex-analysis sets via Smogon\'s base-species page (they don\'t get their own), filtered to the orb item', async () => {
+    const store = new Datastore('/nonexistent/matchup-primal-dexsets-store.json');
+    const formatid = 'gen9nationaldexubers';
+    // No local data at all — this exercises the real dex-analysis fallback
+    // (Smogon bundles Primal-forme sets onto the base "Groudon"/"Kyogre"
+    // page rather than a dedicated one) end to end, including the Red/Blue
+    // Orb item filter.
+    const known = await getBestKnownSet(store, gen, formatid, 'Groudon-Primal');
+    expect(known).not.toBeNull();
+    expect(known!.source).toBe('dex'); // not a fallback to usage stats
+    expect(toID(known!.set.item ?? '')).toBe('redorb');
+    expect(known!.set.baseSpecies).toBe('Groudon-Primal');
+  }, 20000);
+
+  it('caps the number of resolved threats instead of scoring every row of a huge pasted usage table (regression: OOM on a full stats dump)', async () => {
+    const store = new Datastore('/nonexistent/matchup-threat-cap-store.json');
+    const formatid = 'gen9customtest';
+
+    // A real usage-stats page can be hundreds of rows deep into <1% usage.
+    // Every extra threat multiplies the per-candidate damage-calc work and
+    // the size of every search node's coverage map — uncapped, this blew
+    // the process heap in practice. Use 80 distinct real species (well past
+    // any sane cap) as the "opponent's" full stats dump.
+    const allReal: string[] = [];
+    for (const sp of gen.species as unknown as Iterable<{ name: string; exists: boolean; isNonstandard?: string | null }>) {
+      if (sp.exists && !sp.isNonstandard) allReal.push(sp.name);
+      if (allReal.length >= 80) break;
+    }
+    const threatSets = allReal.map((species) => mon({ species, baseSpecies: species, moves: ['Tackle'] }));
+    const candidateSets = ['Blissey', 'Skarmory', 'Chansey'].map((species) =>
+      mon({ species, baseSpecies: species, ability: 'Pressure', nature: 'Bold', evs: { hp: 252, def: 252 }, moves: ['Body Press'], evSource: 'derived' }),
+    );
+
+    let n = 0;
+    for (const set of candidateSets) {
+      for (let rep = 0; rep < 3; rep++) store.ingest(replayWithWinner(`cap${n++}`, 'Me', [set], [threatSets[0]!], 1700000000, formatid));
+    }
+    // Seed every threat locally too, so resolving them never needs a
+    // network fetch (keeps this test fast and offline).
+    for (const set of threatSets) {
+      store.ingest(replayWithWinner(`capT${n++}`, 'Them', [candidateSets[0]!], [set], 1700000000, formatid));
+    }
+    store.rebuildUniqueSets();
+
+    const tableRows = allReal.map((sp, i) => `| ${i + 1} | ${sp} | 10 | ${(90 - i * 0.5).toFixed(2)}% | 50.00% |`).join('\n');
+    const threats = await buildThreatProfile(gen, `| Rank | Pokemon | Use | Usage % | Win % |\n${tableRows}`);
+    expect(threats.threats.length).toBe(80); // sanity: the full table did parse
+
+    const result = await buildCounterTeam(store, gen, formatid, threats);
+    expect(result.resolvedThreats.length).toBeLessThan(threats.threats.length);
+    expect(result.resolvedThreats.length).toBeLessThanOrEqual(40);
+    expect(result.team.length).toBeGreaterThan(0);
   }, 20000);
 });

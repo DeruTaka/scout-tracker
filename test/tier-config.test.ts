@@ -74,25 +74,34 @@ describe('tier-config requirements', () => {
   });
 
   it('vrListViability rejects D-tier species and accepts everything above it', () => {
-    const shaymin = natdex.getViability('Shaymin-Sky', { usageRanks: new Map() });
+    // vrMap is fetched fresh per buildCounterTeam call (see vr-thread.ts),
+    // never a static import — a synthetic one stands in for that here.
+    const vrMap = { 'Groudon-Primal': 'S+' as const, 'Shaymin-Sky': 'D' as const };
+
+    const shaymin = natdex.getViability('Shaymin-Sky', { usageRanks: new Map(), vrMap });
     expect(shaymin.passes).toBe(false);
     expect(shaymin.score).toBe(0);
 
-    const groudon = natdex.getViability('Groudon-Primal', { usageRanks: new Map() });
+    const groudon = natdex.getViability('Groudon-Primal', { usageRanks: new Map(), vrMap });
     expect(groudon.passes).toBe(true);
     expect(groudon.score).toBeGreaterThan(0);
 
-    const unranked = natdex.getViability('Not A Real Species', { usageRanks: new Map() });
+    const unranked = natdex.getViability('Not A Real Species', { usageRanks: new Map(), vrMap });
     expect(unranked.passes).toBe(false);
+  });
+
+  it('vrListViability fails closed when the live fetch is unavailable', () => {
+    const groudon = natdex.getViability('Groudon-Primal', { usageRanks: new Map(), vrMap: null });
+    expect(groudon.passes).toBe(false);
   });
 
   it('usageRankViability passes within the rank cutoff and fails outside it', () => {
     const ranks = new Map([['koraidon', 1], ['obscuremon', 999]]);
-    const koraidon = ubers.getViability('Koraidon', { usageRanks: ranks });
+    const koraidon = ubers.getViability('Koraidon', { usageRanks: ranks, vrMap: null });
     expect(koraidon.passes).toBe(true);
-    const obscure = ubers.getViability('Obscuremon', { usageRanks: ranks });
+    const obscure = ubers.getViability('Obscuremon', { usageRanks: ranks, vrMap: null });
     expect(obscure.passes).toBe(false);
-    const untracked = ubers.getViability('NeverSeenMon', { usageRanks: ranks });
+    const untracked = ubers.getViability('NeverSeenMon', { usageRanks: ranks, vrMap: null });
     expect(untracked.passes).toBe(false);
   });
 });

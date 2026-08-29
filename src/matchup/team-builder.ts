@@ -20,6 +20,7 @@ import { scoreMatchup, type MatchupResult } from './score.js';
 import { getHistoricalWinRates, type WinRate } from './historical.js';
 import { getUsageWeight, getUsageRankMap, getTeammateAffinity } from '../data/usage-provider.js';
 import { getTierConfig, type Requirement } from './tier-config.js';
+import { fetchLiveVrMap, VR_TIER_SCORE } from './vr-thread.js';
 
 export interface TeamPick {
   species: string;
@@ -49,8 +50,40 @@ const UNCOVERED_FLOOR = -100; // sentinel "this threat is entirely unaddressed" 
 // legality check below — a banned mon stays banned no matter how many old
 // replays it appears in.
 const MIN_LOCAL_RECURRENCE = 3;
+// A pasted usage table can legitimately be a full Smogon stats dump —
+// hundreds of rows down into <1% usage. Every extra threat multiplies the
+// real damage-calc work below (one scoreMatchup call per candidate per
+// threat) and the size of every search node's coverage map, so beyond a
+// generous head of the real, meaningfully-used metagame the tail just isn't
+// worth the cost — a mon a handful of games ever used can't materially
+// change which 6 real counters get picked. threats.threats is already
+// sorted by weight desc (see threat-profile.ts), so this keeps the biggest
+// threats and drops the long tail.
+const MAX_THREATS = 40;
 const NODE_BUDGET = 8000; // hard cap on search expansions, so a huge candidate pool can't hang the request
 const BRANCH_CAP = 10; // per node, only the top-N unpicked candidates by immediate marginal gain are explored
+// Best-first search frontier nodes are cheap individually, but with no cap
+// the frontier can retain tens of thousands of them by the time NODE_BUDGET
+// is exhausted (each expansion nets +[BRANCH_CAP-1]), and each one carries a
+// coverage map sized to the threat count — that combination is exactly what
+// blew the process heap in practice (real, differentiated matchup scores
+// plus a large threat list stall the depth-biased heuristic's usual fast
+// convergence to a full 6-mon node). Pruning the frontier back to its best
+// FRONTIER_CAP nodes after every expansion bounds retained memory
+// regardless of candidate/threat count — standard beam-search practice —
+// without changing which team a small/medium search would have found,
+// since it only discards nodes that were already losing on f-score.
+const FRONTIER_CAP = 500;
+// A mandatory pick's own hazard move can accidentally "hog" that role and
+// hazard-dedup-block a genuinely better teammate elsewhere (a real example:
+// Groudon-Primal's Stealth Rock set blocking a Glimmora pick that would
+// otherwise round out a Poison-requirement-satisfying team). Real
+// teambuilding practice runs the opposite way — the mandatory mon switches
+// to an attacking set (Swords Dance / Rock Polish) specifically BECAUSE
+// something else handles rocks. So a hazard-carrying mandatory variant only
+// gets kept over a non-hazard one when it clears it by more than this
+// margin — "meaningfully better," not just nominally top-scoring.
+const MANDATORY_HAZARD_FLEX_MARGIN = 15;
 // Moves banned by clauses standard in every Ubers-family ruleset regardless
 // of tier list — Baton Pass Clause and the OHKO Clause. Fixed rules, not
 // usage data.
@@ -93,6 +126,33 @@ function sampleConfidence(n: number): number {
   return Math.min(n / 5, 1);
 }
 
+/**
+ * Choose a mandatory pick's build from its real, already-scored variants —
+ * preferring the single best-scoring one, UNLESS it carries a hazard move
+ * and a non-hazard variant scores within MANDATORY_HAZARD_FLEX_MARGIN of
+ * it. A mandatory pick that happens to also be a real hazard-setter can
+ * otherwise "hog" that role and hazard-dedup-block a genuinely better
+ * teammate later (e.g. Groudon-Primal's Stealth Rock set blocking a
+ * Glimmora pick that would otherwise round out the team) — real
+ * teambuilding runs the opposite way, switching the mandatory mon to an
+ * attacking set (Swords Dance / Rock Polish) specifically BECAUSE something
+ * else already covers hazards. Exported as its own pure function (only
+ * needs `.set`/`.standaloneCeiling`, no store/network access) so this
+ * decision is unit-testable without pulling in real Smogon variant data.
+ */
+export function pickBestMandatoryVariant<T extends { set: MatchedSet; standaloneCeiling: number }>(candidates: T[]): T | null {
+  let best: T | null = null;
+  let bestNoHazard: T | null = null;
+  for (const cand of candidates) {
+    if (!best || cand.standaloneCeiling > best.standaloneCeiling) best = cand;
+    if (!hazardMovesOf(cand.set).length && (!bestNoHazard || cand.standaloneCeiling > bestNoHazard.standaloneCeiling)) bestNoHazard = cand;
+  }
+  if (best && bestNoHazard && hazardMovesOf(best.set).length && bestNoHazard.standaloneCeiling >= best.standaloneCeiling - MANDATORY_HAZARD_FLEX_MARGIN) {
+    return bestNoHazard;
+  }
+  return best;
+}
+
 interface ScoredCandidate {
   idx: number; // this candidate's own position in the `scored` array — lets later passes (repair) do affinity/coverage lookups without re-searching
   species: string;
@@ -112,11 +172,15 @@ export async function buildCounterTeam(
   gen: Generation,
   formatid: string,
   threats: ThreatProfile,
+  /** Injectable for tests, so a VR-driven tier's live fetch can be stubbed
+   *  with a fixture instead of hitting the real network. Defaults to the
+   *  global fetch, same as every other network call in this app. */
+  vrFetchImpl: typeof fetch = fetch,
 ): Promise<CounterTeamResult> {
   const config = getTierConfig(formatid);
 
   const resolvedThreats: CounterTeamResult['resolvedThreats'] = [];
-  for (const t of threats.threats) {
+  for (const t of threats.threats.slice(0, MAX_THREATS)) {
     const known = await getBestKnownSet(store, gen, formatid, t.baseSpecies);
     if (known) resolvedThreats.push({ species: t.species, weight: t.weight, set: known.set, source: known.source });
   }
@@ -124,9 +188,22 @@ export async function buildCounterTeam(
 
   const threatIds = new Set(resolvedThreats.map((t) => toID(t.set.baseSpecies)));
   const historicalWinRates = getHistoricalWinRates(store, formatid, threatIds);
-  const candidateSpecies = await allCandidateSpecies(store, formatid, config.extraCandidateSpecies);
   const genNum = gen.num as GenerationNum;
   const usageRanks = await getUsageRankMap(formatid);
+
+  // A VR-driven tier restricts the ENTIRE candidate pool to that list —
+  // fetched fresh every call (see vr-thread.ts), never a stored snapshot.
+  // Nothing outside it is usable here, no matter how common it is locally
+  // or in Smogon's usage stats, so this replaces allCandidateSpecies()
+  // entirely rather than adding to it. A failed fetch degrades to an empty
+  // pool (aside from any mandatory pick, resolved separately below) rather
+  // than silently falling back to the unrestricted candidate set.
+  const vrMap = config.vrThreadUrl ? await fetchLiveVrMap(gen, config.vrThreadUrl, vrFetchImpl) : null;
+  const candidateSpecies = config.vrThreadUrl
+    ? Object.entries(vrMap ?? {})
+        .filter(([, tier]) => VR_TIER_SCORE[tier] > 0)
+        .map(([species]) => species)
+    : await allCandidateSpecies(store, formatid, config.extraCandidateSpecies);
 
   const scored: ScoredCandidate[] = [];
 
@@ -140,7 +217,7 @@ export async function buildCounterTeam(
     }
     if (hasBannedMove(known.set)) return null; // Baton Pass / OHKO Clause
 
-    const viability = config.getViability(species, { usageRanks });
+    const viability = config.getViability(species, { usageRanks, vrMap });
     const viableLocally = known.source === 'store' && (known.localCount ?? 0) >= MIN_LOCAL_RECURRENCE;
     if (!viability.passes && !viableLocally) return null; // not actually played in this tier
 
@@ -192,12 +269,13 @@ export async function buildCounterTeam(
   const mandatoryIdx: number[] = [];
   for (const species of config.mandatorySpecies) {
     const variants = await getKnownSetVariants(store, gen, formatid, species);
-    let best: ScoredCandidate | null = null;
+    const candidates: ScoredCandidate[] = [];
     for (const rawKnown of variants) {
       const known = await fillRealisticSet(gen, formatid, rawKnown);
       const cand = await scoreKnownSet(species, known);
-      if (cand && (!best || cand.standaloneCeiling > best.standaloneCeiling)) best = cand;
+      if (cand) candidates.push(cand);
     }
+    let best = pickBestMandatoryVariant(candidates);
     if (!best) {
       // No variant cleared legality/viability (shouldn't happen for a real
       // tier staple) — fall back to whatever's known at all, unfiltered,
@@ -385,6 +463,14 @@ function searchTeam(
   // to follow.
   let frontier: SearchNode[] = [start];
   let best: SearchNode | null = null;
+  // The candidate pool can be smaller than TEAM_SIZE (a heavily-restricted
+  // tier, or just a thin scouting library) — the search then exhausts its
+  // whole frontier down to nothing without ever popping a complete node.
+  // Track the best node actually popped along the way so that case still
+  // returns whatever real partial team it found, instead of falling through
+  // to the frontier array (already empty by then) and landing on the
+  // pristine, empty `start` node.
+  let bestPartial: SearchNode = start;
   let expansions = 0;
 
   while (frontier.length && expansions < NODE_BUDGET) {
@@ -399,6 +485,10 @@ function searchTeam(
     }
     const node = frontier.splice(bestI, 1)[0]!;
     expansions++;
+
+    if (node.pickedIdx.length > bestPartial.pickedIdx.length || (node.pickedIdx.length === bestPartial.pickedIdx.length && node.g > bestPartial.g)) {
+      bestPartial = node;
+    }
 
     if (node.pickedIdx.length >= TEAM_SIZE) {
       best = node;
@@ -431,13 +521,24 @@ function searchTeam(
       .slice(0, BRANCH_CAP);
 
     for (const { idx } of branchCandidates) frontier.push(applyPick(node, idx, scored, affinity));
+
+    // Beam-search prune: keep only the best FRONTIER_CAP nodes by f-score.
+    // Every node this drops was already losing the very comparison the next
+    // iteration's "find max" scan would have made, so this can only discard
+    // nodes the search wouldn't have expanded first anyway.
+    if (frontier.length > FRONTIER_CAP) {
+      frontier = frontier
+        .map((n) => ({ n, f: n.g + heuristic(n, standaloneSorted) }))
+        .sort((a, b) => b.f - a.f)
+        .slice(0, FRONTIER_CAP)
+        .map(({ n }) => n);
+    }
   }
 
-  // Budget exhausted without a complete node popped (pathological/tiny pool)
-  // — fall back to whatever partial frontier node has gone furthest.
-  if (!best) {
-    best = frontier.sort((a, b) => b.pickedIdx.length - a.pickedIdx.length || b.g - a.g)[0] ?? start;
-  }
+  // Budget exhausted, or the frontier fully drained, without a complete
+  // node popped — fall back to the best real partial team the search
+  // actually found along the way.
+  if (!best) best = bestPartial;
 
   return best.pickedIdx.map((idx) => scored[idx]!);
 }

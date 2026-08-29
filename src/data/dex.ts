@@ -102,10 +102,21 @@ export function isForme(gen: Generation, setKey: string): boolean {
 }
 
 export interface SpeciesMeta {
+  /** The canonical display name @pkmn/dex resolved `name` to — NOT
+   *  necessarily equal to the input: dex lookups tolerate some aliases/
+   *  alternate phrasings (e.g. "Primal Groudon" resolves successfully but
+   *  isn't itself the canonical "Groudon-Primal"), so callers that need the
+   *  real name back (not just confirmation that lookup succeeded) must read
+   *  this field rather than reusing whatever string they passed in. */
+  name: string;
   num: number;
   types: string[];
   baseSpecies: string;
   forme: string;
+  /** The item this forme requires to be battled as (e.g. "Red Orb" for
+   *  Groudon-Primal, "Rusted Sword" for Zacian-Crowned) — undefined for a
+   *  species with no such requirement. */
+  requiredItem?: string;
 }
 
 /**
@@ -123,7 +134,10 @@ export function speciesMeta(gen: Generation, name: string): SpeciesMeta | undefi
   const cleaned = name.replace(/-\*$/, '');
   const sp = gen.species.get(cleaned) ?? Dex.species.get(cleaned);
   if (!sp || !sp.exists) return undefined;
-  return { num: sp.num, types: [...sp.types], baseSpecies: sp.baseSpecies || sp.name, forme: sp.forme || '' };
+  return {
+    name: sp.name, num: sp.num, types: [...sp.types], baseSpecies: sp.baseSpecies || sp.name, forme: sp.forme || '',
+    requiredItem: (sp as any).requiredItem || undefined,
+  };
 }
 
 /**

@@ -7,7 +7,7 @@
 import type { Generation } from '@pkmn/data';
 import type { MatchedSet } from '../types.js';
 import { toID, speciesMeta } from '../data/dex.js';
-import { NATIONAL_DEX_UBERS_VR, VR_TIER_SCORE } from './tiers/gen9nationaldexubers.js';
+import { VR_TIER_SCORE, type VrTier } from './vr-thread.js';
 
 export interface RequirementCandidate {
   species: string;
@@ -71,6 +71,10 @@ export interface ViabilityResult {
 
 export interface ViabilityContext {
   usageRanks: Map<string, number>; // toID(species) -> 1-indexed real-usage rank
+  /** The current tier's live-fetched Viability Rankings list (see
+   *  vr-thread.ts), re-fetched fresh for every buildCounterTeam call — null
+   *  if this tier has no VR thread configured, or the fetch/parse failed. */
+  vrMap: Record<string, VrTier> | null;
 }
 
 // Usage% is heavily right-skewed (staples at 20-90%, everything else falls
@@ -93,11 +97,17 @@ function usageRankViability(maxRank: number, weight: number) {
 // (see candidate-pool.ts's dex-analysis-over-usage-stats preference for the
 // same principle applied to sets). D rank ("unviable, but legal by tiering")
 // does not pass — being on the tier's own banlist-adjacent bottom shelf is
-// exactly what this is meant to filter out.
-function vrListViability(vrMap: Record<string, import('./tiers/gen9nationaldexubers.js').VrTier>, weight: number) {
-  const byId = new Map(Object.entries(vrMap).map(([k, v]) => [toID(k), v]));
-  return (species: string): ViabilityResult => {
-    const tier = byId.get(toID(species));
+// exactly what this is meant to filter out. Reads ctx.vrMap rather than a
+// closed-over static map, since it's fetched fresh per buildCounterTeam call
+// (see vr-thread.ts) — a species missing from a fetch that failed entirely
+// (vrMap null) correctly fails here too, same as one genuinely unlisted.
+function vrListViability(weight: number) {
+  return (species: string, ctx: ViabilityContext): ViabilityResult => {
+    if (!ctx.vrMap) return { passes: false, score: 0, label: 'Viability Rankings unavailable (fetch failed)' };
+    // toID-normalized lookup, not a direct key match — candidateSpecies can
+    // carry whatever exact casing/hyphenation its own source (local store,
+    // Smogon usage stats) used, which won't always match the VR thread's.
+    const tier = Object.entries(ctx.vrMap).find(([k]) => toID(k) === toID(species))?.[1];
     if (!tier) return { passes: false, score: 0, label: 'not on the Viability Rankings list' };
     const score = VR_TIER_SCORE[tier];
     return { passes: score > 0, score: score * weight, label: `${tier} rank on the Viability Rankings` };
@@ -109,8 +119,9 @@ export interface TierConfig {
   requirements: Requirement[];
   /** Species to always include in the candidate pool alongside whatever
    *  allCandidateSpecies() already finds (locally-scouted + Smogon usage-
-   *  tracked) — for a VR-driven tier this is every non-D-rank VR entry, so a
-   *  real staple isn't missed just because it's thin on usage-stat data. */
+   *  tracked). Ignored for a VR-driven tier (vrThreadUrl set) — there, the
+   *  live-fetched VR list itself IS the entire candidate pool; see
+   *  buildCounterTeam in team-builder.ts. */
   extraCandidateSpecies: string[];
   getViability: (species: string, ctx: ViabilityContext) => ViabilityResult;
   /** Skip team-builder.ts's own AG/Illegal/CAP/isNonstandard legality check
@@ -124,6 +135,14 @@ export interface TierConfig {
    *  using" for this format, so the dex-table check is skipped entirely
    *  rather than producing false negatives. */
   trustCuratedLegality?: boolean;
+  /** The tier's Viability Rankings thread — when set, buildCounterTeam
+   *  fetches it fresh (see vr-thread.ts) at the start of every call and
+   *  restricts the ENTIRE candidate pool to species that list ranks as
+   *  viable (non-D). Nothing outside that list is usable, no matter how
+   *  common it is locally or in Smogon's usage stats — the VR council's
+   *  current judgment is the authority for this kind of tier, not raw
+   *  popularity. */
+  vrThreadUrl?: string;
 }
 
 const GENERIC_CONFIG: TierConfig = {
@@ -132,10 +151,6 @@ const GENERIC_CONFIG: TierConfig = {
   extraCandidateSpecies: [],
   getViability: usageRankViability(45, 3),
 };
-
-const NATDEX_UBERS_VIABLE_SPECIES = Object.entries(NATIONAL_DEX_UBERS_VR)
-  .filter(([, tier]) => tier !== 'D')
-  .map(([species]) => species);
 
 const CONFIGS: Record<string, TierConfig> = {
   gen9ubers: {
@@ -157,9 +172,10 @@ const CONFIGS: Record<string, TierConfig> = {
       typeRequirement('Poison', true),
       speedControlRequirement(),
     ],
-    extraCandidateSpecies: NATDEX_UBERS_VIABLE_SPECIES,
-    getViability: vrListViability(NATIONAL_DEX_UBERS_VR, 3),
+    extraCandidateSpecies: [],
+    getViability: vrListViability(3),
     trustCuratedLegality: true,
+    vrThreadUrl: 'https://www.smogon.com/forums/threads/national-dex-ubers-viability-rankings-update-12-at-post-377.3712169/',
   },
 };
 

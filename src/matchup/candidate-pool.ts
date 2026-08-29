@@ -12,12 +12,38 @@
 import type { Generation } from '@pkmn/data';
 import type { Datastore } from '../store/datastore.js';
 import type { DexSet, MatchedSet } from '../types.js';
-import { toID, resolveSpecies } from '../data/dex.js';
+import { toID, resolveSpecies, speciesMeta } from '../data/dex.js';
 import { getUsageSets, getAllUsageSpecies } from '../data/usage-provider.js';
 import { getSetsForSpecies } from '../data/sets-provider.js';
 
 function pickFirst(v: string | string[] | undefined): string | undefined {
   return Array.isArray(v) ? v[0] : v;
+}
+
+/**
+ * Smogon's dex-analysis sets aren't consistently keyed per-forme: an
+ * alternate forme like Zacian-Crowned, Necrozma-Dusk-Mane, or Giratina-Origin
+ * gets its own page and its own entry, but a Primal forme (Groudon-Primal,
+ * Kyogre-Primal) doesn't — Smogon bundles those onto the plain base-species
+ * page instead (dex.sv/pokemon/groudon/..., not .../groudon-primal/...), so
+ * a direct lookup by the exact forme name comes up empty even though real,
+ * curated sets for it exist. This is genuinely case-by-case (which formes
+ * get their own page isn't a rule to hardcode), so it always tries the exact
+ * name FIRST and only falls back to the base species when that's empty. On
+ * fallback, if the forme requires a specific item (Red Orb, Blue Orb, ...),
+ * results get filtered to sets actually carrying it — the base page could in
+ * principle mix formes, and this keeps the fallback from grabbing a set for
+ * the wrong one. (Smogon's usage-stats chaos data, unlike dex sets, DOES key
+ * every observed forme separately — this fallback is dex-analysis-only.) */
+async function dexSetsFor(gen: Generation, formatid: string, species: string): Promise<DexSet[]> {
+  const direct = await getSetsForSpecies(formatid, species);
+  if (direct.length) return direct;
+  const meta = speciesMeta(gen, species);
+  if (!meta || meta.baseSpecies === meta.name) return direct; // no distinct base species to fall back to
+  const fallback = await getSetsForSpecies(formatid, meta.baseSpecies);
+  if (!fallback.length || !meta.requiredItem) return fallback;
+  const requiredId = toID(meta.requiredItem);
+  return fallback.filter((ds) => toID(pickFirst(ds.item) ?? '') === requiredId);
 }
 
 /** Turn a Smogon DexSet (usage-stats or dex-analysis) into a standalone
@@ -85,7 +111,7 @@ export async function getBestKnownSet(
     return { set: local[0]!.set, source: 'store', localCount };
   }
 
-  const dexSets = await getSetsForSpecies(formatid, baseSpecies);
+  const dexSets = await dexSetsFor(gen, formatid, baseSpecies);
   if (dexSets.length) {
     return { set: dexSetToMatchedSet(gen, baseSpecies, dexSets[0]!, `Smogon dex analysis (${formatid}) — not locally scouted.`), source: 'dex' };
   }
@@ -123,7 +149,7 @@ export async function getKnownSetVariants(
     });
   for (const u of local.slice(0, 4)) out.push({ set: u.set, source: 'store', localCount: u.count });
 
-  const dexSets = await getSetsForSpecies(formatid, baseSpecies);
+  const dexSets = await dexSetsFor(gen, formatid, baseSpecies);
   for (const ds of dexSets.slice(0, 4)) {
     out.push({ set: dexSetToMatchedSet(gen, baseSpecies, ds, `Smogon dex analysis (${formatid}).`), source: 'dex' });
   }
@@ -155,7 +181,7 @@ export async function fillRealisticSet(gen: Generation, formatid: string, known:
   const needsSpread = evTotal(known.set.evs) < 500; // a real 508-total spread rounds down to increments of 4
   if (!needsMoves && !needsSpread) return known;
 
-  const dexSets = await getSetsForSpecies(formatid, known.set.baseSpecies);
+  const dexSets = await dexSetsFor(gen, formatid, known.set.baseSpecies);
   const usageSets = dexSets.length ? [] : await getUsageSets(gen, formatid, known.set.baseSpecies);
   const fallback = dexSets[0] ?? usageSets[0];
   if (!fallback) return known;
