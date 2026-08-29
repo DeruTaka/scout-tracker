@@ -378,27 +378,104 @@ function wireCopy(container){
   });
 }
 
-async function run(endpoint) {
+// Shared POST-then-poll driver for a background job endpoint (see
+// src/web/job.ts) — /api/ingest, /api/scout-user, /api/refresh all work this
+// way, since bulk replay work can run for minutes, well past what a reverse
+// proxy holds a request open for. A transient failure WHILE polling (a
+// dropped response, a slow request that itself times out) must never
+// silently kill the poll loop — that leaves the UI stuck forever with no
+// explanation. Failures are retried with backoff, not fatal; only an actual
+// job-level error (returned by the server once the job finishes) ends it.
+function pollJob(endpoint, { onTick, onDone, onPollError }) {
+  let failures = 0;
+  async function tick() {
+    let s;
+    try {
+      s = await (await fetch(endpoint)).json();
+      failures = 0;
+    } catch (e) {
+      failures++;
+      onPollError?.(e, failures);
+      setTimeout(tick, Math.min(2000 * failures, 10000));
+      return;
+    }
+    if (s.running) {
+      onTick(s);
+      setTimeout(tick, 1200);
+    } else {
+      onDone(s);
+    }
+  }
+  tick();
+}
+
+/** POST to start a background job. Returns true if it started; on failure
+ *  (bad input, or one of this kind already running) calls onError and
+ *  returns false — never throws uncaught. */
+async function startJob(endpoint, body, onError) {
+  try {
+    const opts = body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : { method: 'POST' };
+    const r = await (await fetch(endpoint, opts)).json();
+    if (r.error) { onError(r.error); return false; }
+    return true;
+  } catch (e) {
+    onError(e.message || e);
+    return false;
+  }
+}
+
+function ingestResultList(results) {
+  return results.map((x)=> x.error ? `<div class="err">✗ ${esc(x.id)}: ${esc(x.error)}</div>` : x.skipped ? `<div class="card pad note-line">• ${esc(x.id)} already stored</div>` : renderReplay(x.scouted)).join('');
+}
+function outputBanner(output) {
+  return output ? `<div class="card pad note-line">Wrote ${esc(output.xlsxPath)}${output.sheetUrl?` · <a href="${esc(output.sheetUrl)}" target="_blank">open Google Sheet</a>`:''}${output.sheetError?` · sheet error: ${esc(output.sheetError)}`:''}</div>` : '';
+}
+
+async function runPreview() {
   const urls = $('urls').value;
   if (!urls.trim()) return;
   $('busy').innerHTML = '<span class="busy"><span class="spin"></span> working…</span>';
   $('ingestBtn').disabled = $('previewBtn').disabled = true;
   try {
-    const body = { urls, force: $('force').checked };
-    const r = await (await fetch(endpoint, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) })).json();
+    const r = await (await fetch('/api/preview', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ urls }) })).json();
     if (r.error) { $('results').innerHTML = `<div class="err">${esc(r.error)}</div>`; return; }
-    const list = endpoint.endsWith('ingest')
-      ? r.results.map((x)=> x.error ? `<div class="err">✗ ${esc(x.id)}: ${esc(x.error)}</div>` : x.skipped ? `<div class="card pad note-line">• ${esc(x.id)} already stored</div>` : renderReplay(x.scouted)).join('')
-      : r.scouted.map(renderReplay).join('');
-    let banner = '';
-    if (endpoint.endsWith('ingest') && r.output) {
-      banner = `<div class="card pad note-line">Wrote ${esc(r.output.xlsxPath)}${r.output.sheetUrl?` · <a href="${esc(r.output.sheetUrl)}" target="_blank">open Google Sheet</a>`:''}${r.output.sheetError?` · sheet error: ${esc(r.output.sheetError)}`:''}</div>`;
-    }
-    $('results').innerHTML = banner + (list || emptyResults());
+    $('results').innerHTML = r.scouted.map(renderReplay).join('') || emptyResults();
     wireCopy($('results'));
-    loadStatus();
   } catch (e) { $('results').innerHTML = `<div class="err">${esc(e.message||e)}</div>`; }
   finally { $('busy').textContent=''; $('ingestBtn').disabled=$('previewBtn').disabled=false; }
+}
+
+async function runIngest() {
+  const urls = $('urls').value;
+  if (!urls.trim()) return;
+  $('ingestBtn').disabled = $('previewBtn').disabled = true;
+  $('busy').innerHTML = '<span class="busy"><span class="spin"></span> starting…</span>';
+  const finish = () => { $('busy').textContent=''; $('ingestBtn').disabled=$('previewBtn').disabled=false; };
+  const ok = await startJob('/api/ingest', { urls, force: $('force').checked }, (err) => {
+    $('results').innerHTML = `<div class="err">${esc(err)}</div>`;
+    finish();
+  });
+  if (!ok) return;
+  pollIngest();
+}
+
+function pollIngest() {
+  pollJob('/api/ingest', {
+    onTick: (s) => {
+      $('ingestBtn').disabled = $('previewBtn').disabled = true;
+      $('busy').innerHTML = `<span class="busy"><span class="spin"></span> ${s.done}/${s.total} — ${esc(s.currentId||'')}</span>`;
+    },
+    onPollError: () => { $('busy').innerHTML = '<span class="busy"><span class="spin"></span> reconnecting…</span>'; },
+    onDone: (s) => {
+      $('busy').textContent=''; $('ingestBtn').disabled=$('previewBtn').disabled=false;
+      if (!s.finishedAt) return; // nothing has ever run — stay quiet (page-load resume check)
+      if (s.error) { $('results').innerHTML = `<div class="err">${esc(s.error)}</div>`; return; }
+      const r = s.result;
+      $('results').innerHTML = outputBanner(r.output) + (ingestResultList(r.results) || emptyResults());
+      wireCopy($('results'));
+      loadStatus();
+    },
+  });
 }
 
 async function runUser() {
@@ -406,55 +483,73 @@ async function runUser() {
   if (!user) return;
   const max = Number($('scoutUserMax').value) || 50;
   const format = $('scoutUserFormat').value.trim();
-  $('userBusy').innerHTML = '<span class="busy"><span class="spin"></span> pulling replays…</span>';
   $('scoutUserBtn').disabled = true;
-  try {
-    const body = { user, max, force: $('scoutUserForce').checked, format: format || undefined };
-    const r = await (await fetch('/api/scout-user', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) })).json();
-    if (r.error) { $('results').innerHTML = `<div class="err">${esc(r.error)}</div>`; return; }
-    const list = r.results.map((x)=> x.error ? `<div class="err">✗ ${esc(x.id)}: ${esc(x.error)}</div>` : x.skipped ? `<div class="card pad note-line">• ${esc(x.id)} already stored</div>` : renderReplay(x.scouted)).join('');
-    const banner = `<div class="card pad note-line">Found ${r.found} replay(s) for ${esc(r.user)}${format?` in ${esc(format)}`:''}.${r.output?.sheetUrl?` · <a href="${esc(r.output.sheetUrl)}" target="_blank">open Google Sheet</a>`:''}</div>`;
-    $('results').innerHTML = banner + (list || emptyResults());
-    wireCopy($('results'));
-    loadStatus();
-  } catch (e) { $('results').innerHTML = `<div class="err">${esc(e.message||e)}</div>`; }
-  finally { $('userBusy').textContent=''; $('scoutUserBtn').disabled=false; }
+  $('userBusy').innerHTML = '<span class="busy"><span class="spin"></span> starting…</span>';
+  const finish = () => { $('userBusy').textContent=''; $('scoutUserBtn').disabled=false; };
+  const ok = await startJob('/api/scout-user', { user, max, force: $('scoutUserForce').checked, format: format || undefined }, (err) => {
+    $('results').innerHTML = `<div class="err">${esc(err)}</div>`;
+    finish();
+  });
+  if (!ok) return;
+  pollScoutUser();
 }
 
-async function pollRefresh() {
-  const s = await (await fetch('/api/refresh')).json();
-  if (s.running) {
-    $('refreshStatus').innerHTML = `<span class="busy"><span class="spin"></span> ${s.done}/${s.total} — ${esc(s.currentId||'')}</span>`;
-    $('refreshBtn').disabled = true;
-    setTimeout(pollRefresh, 1000);
-  } else {
-    $('refreshBtn').disabled = false;
-    if (s.finishedAt) {
-      const errCount = (s.errors||[]).length;
+function pollScoutUser() {
+  pollJob('/api/scout-user', {
+    onTick: (s) => {
+      $('scoutUserBtn').disabled = true;
+      $('userBusy').innerHTML = `<span class="busy"><span class="spin"></span> ${s.done}/${s.total} — ${esc(s.currentId||'')}</span>`;
+    },
+    onPollError: () => { $('userBusy').innerHTML = '<span class="busy"><span class="spin"></span> reconnecting…</span>'; },
+    onDone: (s) => {
+      $('userBusy').textContent=''; $('scoutUserBtn').disabled=false;
+      if (!s.finishedAt) return; // nothing has ever run — stay quiet (page-load resume check)
+      if (s.error) { $('results').innerHTML = `<div class="err">${esc(s.error)}</div>`; return; }
+      const r = s.result;
+      const banner = `<div class="card pad note-line">Found ${r.found} replay(s) for ${esc(r.user)}.${r.output?.sheetUrl?` · <a href="${esc(r.output.sheetUrl)}" target="_blank">open Google Sheet</a>`:''}</div>`;
+      $('results').innerHTML = banner + (ingestResultList(r.results) || emptyResults());
+      wireCopy($('results'));
+      loadStatus();
+    },
+  });
+}
+
+function pollRefresh() {
+  pollJob('/api/refresh', {
+    onTick: (s) => {
+      $('refreshStatus').innerHTML = `<span class="busy"><span class="spin"></span> ${s.done}/${s.total} — ${esc(s.currentId||'')}</span>`;
+      $('refreshBtn').disabled = true;
+    },
+    onPollError: () => { $('refreshStatus').innerHTML = '<span class="busy"><span class="spin"></span> reconnecting…</span>'; },
+    onDone: (s) => {
+      $('refreshBtn').disabled = false;
+      if (!s.finishedAt) return; // nothing has ever run — stay quiet
+      if (s.error) { $('refreshStatus').innerHTML = `<span class="err">${esc(s.error)}</span>`; return; }
+      const errCount = (s.result?.errors || []).length;
       $('refreshStatus').innerHTML = errCount
         ? `<span class="err">Done. ${s.total-errCount}/${s.total} succeeded, ${errCount} failed.</span>`
         : `<span class="note-line">Done — ${s.total} replay(s) re-derived.</span>`;
       loadStatus();
-    }
-  }
+    },
+  });
 }
 
 async function runRefresh() {
   if (!confirm(`Re-derive all ${$('statReplays').textContent} stored replays from their saved logs? This rebuilds every EV spread and the whole unique-set library from scratch — it does not touch which replays are stored.`)) return;
   $('refreshBtn').disabled = true;
   $('refreshStatus').innerHTML = '<span class="busy"><span class="spin"></span> starting…</span>';
-  try {
-    const r = await (await fetch('/api/refresh', { method: 'POST' })).json();
-    if (r.error) { $('refreshStatus').innerHTML = `<span class="err">${esc(r.error)}</span>`; $('refreshBtn').disabled = false; return; }
-    pollRefresh();
-  } catch (e) { $('refreshStatus').innerHTML = `<span class="err">${esc(e.message||e)}</span>`; $('refreshBtn').disabled = false; }
+  const ok = await startJob('/api/refresh', null, (err) => {
+    $('refreshStatus').innerHTML = `<span class="err">${esc(err)}</span>`;
+    $('refreshBtn').disabled = false;
+  });
+  if (ok) pollRefresh();
 }
 
 /* ---- Wiring ---- */
 $('themeBtn').onclick = toggleTheme;
 document.querySelectorAll('.nav-item[data-view]').forEach((a)=> a.onclick = () => showView(a.dataset.view));
-$('ingestBtn').onclick = () => run('/api/ingest');
-$('previewBtn').onclick = () => run('/api/preview');
+$('ingestBtn').onclick = runIngest;
+$('previewBtn').onclick = runPreview;
 $('scoutUserBtn').onclick = runUser;
 $('refreshBtn').onclick = runRefresh;
 
@@ -463,6 +558,8 @@ $('results').innerHTML = emptyResults();
 showView(location.hash.slice(1) || 'scout');
 loadStatus();
 pollRefresh();
+pollIngest();
+pollScoutUser();
 </script>
 </body>
 </html>

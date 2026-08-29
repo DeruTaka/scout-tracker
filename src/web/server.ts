@@ -11,6 +11,7 @@ import { getGen, spriteSlug, genFromFormatId } from '../data/dex.js';
 import { buildThreatProfile } from '../matchup/threat-profile.js';
 import { buildCounterTeam } from '../matchup/team-builder.js';
 import { exportSet } from '../build/pokemon-set.js';
+import { BackgroundJob } from './job.js';
 
 function splitInputs(text: string): string[] {
   return String(text || '')
@@ -26,6 +27,23 @@ function serialize(scouted: ScoutedReplay) {
 }
 
 export function startServer(store: Datastore, config: Config, port: number): void {
+  // Defense in depth: an uncaught exception or unhandled rejection anywhere
+  // in the process — including in something fired-and-forgotten by a
+  // BackgroundJob, which Express's own per-route try/catch can't reach —
+  // otherwise crashes the ENTIRE server for every user, not just whatever
+  // request triggered it. That's a worse outcome than logging it and staying
+  // up: this is a single local/small-deployment process, not something with
+  // per-request isolation to fall back on, so losing the whole service over
+  // one bad response is the wrong tradeoff. Every code path that can throw
+  // should still be caught properly at its source — this only exists to stop
+  // something nobody caught from taking the whole app down with it.
+  process.on('uncaughtException', (err) => {
+    console.error('[uncaughtException] server stayed up, but this indicates a real bug:', err);
+  });
+  process.on('unhandledRejection', (reason) => {
+    console.error('[unhandledRejection] server stayed up, but this indicates a real bug:', reason);
+  });
+
   const app = express();
   app.use(express.json({ limit: '2mb' }));
 
@@ -71,80 +89,73 @@ export function startServer(store: Datastore, config: Config, port: number): voi
     }
   });
 
-  app.post('/api/ingest', async (req, res) => {
-    try {
-      const inputs = splitInputs(req.body?.urls);
-      const results = await ingestReplays(inputs, store, { force: !!req.body?.force });
+  // Bulk replay work (scouting a trainer's whole history, ingesting a big
+  // pasted list, re-deriving the whole store) can run for minutes — long
+  // past what any reverse proxy/host will hold a single request open for.
+  // A request that outlives that timeout comes back to the browser as an
+  // HTML error page, and `.json()`-ing that throws client-side; worse, the
+  // server keeps the original request running regardless, so a client that
+  // just retries piles up redundant work. All three run as a background job
+  // the client polls instead — the POST returns immediately, a GET reports
+  // progress, exactly like /api/refresh already did.
+  const ingestJob = new BackgroundJob<{ results: ReturnType<typeof serializeIngestResults>; output: Awaited<ReturnType<typeof writeOutputs>> }>();
+  const scoutUserJob = new BackgroundJob<{ user: string; found: number; results: ReturnType<typeof serializeIngestResults>; output: Awaited<ReturnType<typeof writeOutputs>> }>();
+  const refreshJob = new BackgroundJob<{ errors: { id: string; error: string }[] }>();
+
+  function serializeIngestResults(results: Awaited<ReturnType<typeof ingestReplays>>) {
+    return results.map((r) => ({
+      id: r.id,
+      skipped: r.skipped,
+      error: r.error,
+      stats: r.stats,
+      scouted: r.scouted ? serialize(r.scouted) : undefined,
+    }));
+  }
+
+  app.post('/api/ingest', (req, res) => {
+    const inputs = splitInputs(req.body?.urls);
+    if (!inputs.length) { res.status(400).json({ error: 'urls is required' }); return; }
+    const force = !!req.body?.force;
+    const { started, error } = ingestJob.start(inputs.length, async (onProgress) => {
+      const results = await ingestReplays(inputs, store, { force, onProgress });
       store.save();
       const output = await writeOutputs(store, config.xlsxPath);
-      res.json({
-        results: results.map((r) => ({
-          id: r.id,
-          skipped: r.skipped,
-          error: r.error,
-          stats: r.stats,
-          scouted: r.scouted ? serialize(r.scouted) : undefined,
-        })),
-        output,
-      });
-    } catch (e) {
-      res.status(400).json({ error: e instanceof Error ? e.message : String(e) });
-    }
+      return { results: serializeIngestResults(results), output };
+    });
+    if (!started) { res.status(409).json({ error }); return; }
+    res.json({ started: true, total: inputs.length });
   });
+  app.get('/api/ingest', (_req, res) => res.json(ingestJob.current));
 
-  app.post('/api/scout-user', async (req, res) => {
-    try {
-      const user = String(req.body?.user || '').trim();
-      if (!user) { res.status(400).json({ error: 'user is required' }); return; }
-      const max = Math.max(1, Math.min(200, Number(req.body?.max) || 50));
-      const format = req.body?.format ? String(req.body.format).trim() : undefined;
-      const { found, results } = await scoutUserReplays(user, store, { max, force: !!req.body?.force, format });
+  app.post('/api/scout-user', (req, res) => {
+    const user = String(req.body?.user || '').trim();
+    if (!user) { res.status(400).json({ error: 'user is required' }); return; }
+    const max = Math.max(1, Math.min(200, Number(req.body?.max) || 50));
+    const force = !!req.body?.force;
+    const format = req.body?.format ? String(req.body.format).trim() : undefined;
+    const { started, error } = scoutUserJob.start(max, async (onProgress) => {
+      const { found, results } = await scoutUserReplays(user, store, { max, force, format, onProgress });
       store.save();
       const output = await writeOutputs(store, config.xlsxPath);
-      res.json({
-        user,
-        found,
-        results: results.map((r) => ({
-          id: r.id,
-          skipped: r.skipped,
-          error: r.error,
-          stats: r.stats,
-          scouted: r.scouted ? serialize(r.scouted) : undefined,
-        })),
-        output,
-      });
-    } catch (e) {
-      res.status(400).json({ error: e instanceof Error ? e.message : String(e) });
-    }
+      return { user, found, results: serializeIngestResults(results), output };
+    });
+    if (!started) { res.status(409).json({ error }); return; }
+    res.json({ started: true });
   });
-
-  // Full re-derivation from stored replay logs (no network fetches) can take
-  // a while for a large store, well past a typical HTTP proxy timeout — so
-  // this runs as a background job the client polls, rather than one blocking
-  // request/response like the other endpoints here.
-  let refreshJob: { running: boolean; done: number; total: number; currentId: string; errors: { id: string; error: string }[]; finishedAt?: number } | null = null;
+  app.get('/api/scout-user', (_req, res) => res.json(scoutUserJob.current));
 
   app.post('/api/refresh', (_req, res) => {
-    if (refreshJob?.running) { res.status(409).json({ error: 'A refresh is already running.' }); return; }
     const total = store.replays.length;
-    refreshJob = { running: true, done: 0, total, currentId: '', errors: [] };
-    refreshStore(store, (done, tot, id) => {
-      if (refreshJob) { refreshJob.done = done; refreshJob.total = tot; refreshJob.currentId = id; }
-    })
-      .then(async ({ errors }) => {
-        store.save();
-        await writeOutputs(store, config.xlsxPath);
-        if (refreshJob) { refreshJob.running = false; refreshJob.errors = errors; refreshJob.finishedAt = Date.now(); }
-      })
-      .catch((e) => {
-        if (refreshJob) { refreshJob.running = false; refreshJob.errors = [{ id: refreshJob.currentId, error: e instanceof Error ? e.message : String(e) }]; refreshJob.finishedAt = Date.now(); }
-      });
+    const { started, error } = refreshJob.start(total, async (onProgress) => {
+      const { errors } = await refreshStore(store, onProgress);
+      store.save();
+      await writeOutputs(store, config.xlsxPath);
+      return { errors };
+    });
+    if (!started) { res.status(409).json({ error }); return; }
     res.json({ started: true, total });
   });
-
-  app.get('/api/refresh', (_req, res) => {
-    res.json(refreshJob ?? { running: false, done: 0, total: 0, currentId: '' });
-  });
+  app.get('/api/refresh', (_req, res) => res.json(refreshJob.current));
 
   app.post('/api/counter-team', async (req, res) => {
     try {

@@ -30,9 +30,10 @@ export interface IngestResult {
 export async function ingestReplays(
   inputs: string[],
   store: Datastore,
-  opts: { force?: boolean } = {},
+  opts: { force?: boolean; onProgress?: (done: number, total: number, id: string) => void } = {},
 ): Promise<IngestResult[]> {
   const results: IngestResult[] = [];
+  let done = 0;
   for (const input of inputs) {
     const id = normalizeReplayId(input);
     try {
@@ -61,6 +62,9 @@ export async function ingestReplays(
       });
     } catch (e) {
       results.push({ id, error: e instanceof Error ? e.message : String(e) });
+    } finally {
+      done++;
+      opts.onProgress?.(done, inputs.length, id);
     }
   }
   return results;
@@ -88,10 +92,10 @@ export interface ScoutUserResult {
 export async function scoutUserReplays(
   user: string,
   store: Datastore,
-  opts: { max?: number; force?: boolean; format?: string } = {},
+  opts: { max?: number; force?: boolean; format?: string; onProgress?: (done: number, total: number, id: string) => void } = {},
 ): Promise<ScoutUserResult> {
   const ids = await listUserReplays(user, opts.max ?? 50, opts.format);
-  const results = await ingestReplays(ids, store, { force: opts.force });
+  const results = await ingestReplays(ids, store, { force: opts.force, onProgress: opts.onProgress });
   return { user, found: ids.length, results };
 }
 
