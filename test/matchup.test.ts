@@ -699,8 +699,8 @@ Rules<br />
     expect(known!.set.baseSpecies).toBe('Groudon-Primal');
   }, 20000);
 
-  it('fails loudly (not with an empty near-mandatory-only team) when a VR-driven tier\'s live fetch is unavailable and there is no saved fallback', async () => {
-    const store = new Datastore('/nonexistent/matchup-vr-fetch-fail-store.json');
+  it('falls back to the bundled VR snapshot (with a warning) when the live fetch fails and there is no saved copy either', async () => {
+    const store = new Datastore('/nonexistent/matchup-vr-bundled-fallback-store.json');
     const formatid = 'gen9nationaldexubers';
     const threatSets: MatchedSet[] = [
       mon({ species: 'Zacian-Crowned', baseSpecies: 'Zacian-Crowned', ability: 'Intrepid Sword', nature: 'Jolly', evs: { atk: 252, spe: 252 }, moves: ['Behemoth Blade'] }),
@@ -712,17 +712,20 @@ Rules<br />
 | 1    | Zacian-Crowned |   4 |  100.00% |  50.00% |
 | 2    | Kyogre         |   4 |  100.00% |  50.00% |
 `);
-    // A fetch that always fails (network down / Smogon unreachable) — this
-    // used to silently degrade to a near-empty candidate pool and surface
-    // as every coverage requirement failing at once, which reads like a
-    // real teambuilding problem rather than the actual network hiccup. With
-    // no saved fallback available either (a real first-ever run against a
-    // blocked host), there's genuinely nothing to build from — this is the
-    // one case that should still fail outright, clearly.
-    const alwaysFailFetch = (async () => { throw new Error('network unreachable'); }) as unknown as typeof fetch;
+    // A fetch that always fails (network down / a hosted deployment's IP
+    // blocked by Smogon's forum bot-protection — the real, reported case),
+    // AND no on-disk saved copy from a prior successful fetch either (a
+    // deployment that has genuinely never once gotten through) — this used
+    // to have nothing left to fall back to and hard-fail outright, reading
+    // like a real teambuilding problem. Now it uses the real snapshot
+    // bundled with the app instead, still builds a real team, and says so.
+    const alwaysFailFetch = (async () => { throw new Error('HTTP 403 (blocked)'); }) as unknown as typeof fetch;
     _clearVrCacheForTests();
     _clearSavedVrMapForTests(formatid);
-    await expect(buildCounterTeam(store, gen, formatid, threats, alwaysFailFetch)).rejects.toThrow(/Viability Rankings/);
+    const result = await buildCounterTeam(store, gen, formatid, threats, alwaysFailFetch);
+    expect(result.team.some((p) => p.species === 'Groudon-Primal')).toBe(true); // mandatory pick still resolved
+    expect(result.warnings.length).toBe(1);
+    expect(result.warnings[0]).toMatch(/bundled with the app/);
   }, 20000);
 
   it('falls back to the last successfully-fetched VR list (with a warning) when the live fetch fails but a saved copy exists', async () => {

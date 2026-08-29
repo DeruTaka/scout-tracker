@@ -200,27 +200,39 @@ export async function buildCounterTeam(
   // transient failure a couple of times, then falls back to the last
   // successfully-fetched copy on disk). Nothing outside it is usable here,
   // no matter how common it is locally or in Smogon's usage stats, so this
-  // replaces allCandidateSpecies() entirely rather than adding to it. Only
-  // fail outright when there's truly nothing to work with — no fresh fetch
-  // AND no saved fallback (e.g. this is the very first run and Smogon is
-  // unreachable) — rather than quietly proceeding with an empty pool, which
-  // used to surface as every single coverage requirement failing at once
-  // ("no legal option was available"), reading like a real teambuilding
-  // problem instead of the network/blocking issue it actually is.
+  // replaces allCandidateSpecies() entirely rather than adding to it.
+  //
+  // Three tiers of fallback, in order: (1) the live fetch; (2) the on-disk
+  // copy from whatever the last successful live fetch was (handled inside
+  // fetchLiveVrMap); (3) a real snapshot bundled with the app itself, for a
+  // deployment whose outbound IP Smogon's forum bot-protection blocks
+  // outright — that combination means NEITHER (1) nor (2) can ever
+  // succeed, since a fetch has to work at least once to populate (2). Only
+  // fail outright when even the bundled fallback isn't configured for this
+  // tier — that used to surface as every single coverage requirement
+  // failing at once ("no legal option was available"), reading like a real
+  // teambuilding problem instead of the network/blocking issue it actually
+  // is.
   const vrFetch = config.vrThreadUrl ? await fetchLiveVrMap(gen, config.vrThreadUrl, formatid, vrFetchImpl) : { map: null, reason: null, stale: false as const };
-  const vrMap = vrFetch.map;
-  if (config.vrThreadUrl && !vrMap) {
+  let vrMap = vrFetch.map;
+  const warnings: string[] = [];
+  if (config.vrThreadUrl && vrMap && vrFetch.stale) {
+    warnings.push(
+      `Couldn't reach the live Viability Rankings list (${vrFetch.reason}) — using the last successfully-fetched copy` +
+        ('savedAt' in vrFetch && vrFetch.savedAt ? ` from ${new Date(vrFetch.savedAt).toLocaleString()}` : '') +
+        '. Rankings may be slightly out of date.',
+    );
+  } else if (config.vrThreadUrl && !vrMap && config.bundledVrFallback) {
+    vrMap = config.bundledVrFallback;
+    warnings.push(
+      `Couldn't reach the live Viability Rankings list (${vrFetch.reason}), and no previously-fetched copy is saved yet — ` +
+        'using the version bundled with the app. Rankings may be out of date; this should resolve itself once a live fetch succeeds.',
+    );
+  } else if (config.vrThreadUrl && !vrMap) {
     throw new Error(
       `Couldn't fetch the live Viability Rankings list for ${formatid} (${config.vrThreadUrl}): ${vrFetch.reason}. Try again in a moment.`,
     );
   }
-  const warnings: string[] = vrFetch.stale
-    ? [
-        `Couldn't reach the live Viability Rankings list (${vrFetch.reason}) — using the last successfully-fetched copy` +
-          ('savedAt' in vrFetch && vrFetch.savedAt ? ` from ${new Date(vrFetch.savedAt).toLocaleString()}` : '') +
-          '. Rankings may be slightly out of date.',
-      ]
-    : [];
   const candidateSpecies = config.vrThreadUrl
     ? Object.entries(vrMap ?? {})
         .filter(([, tier]) => VR_TIER_SCORE[tier] > 0)

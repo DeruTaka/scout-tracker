@@ -8,6 +8,7 @@ import type { Generation } from '@pkmn/data';
 import type { MatchedSet } from '../types.js';
 import { toID, speciesMeta } from '../data/dex.js';
 import { VR_TIER_SCORE, type VrTier } from './vr-thread.js';
+import { GEN9_NATDEX_UBERS_BUNDLED_VR } from './tiers/gen9nationaldexubers-bundled-vr.js';
 
 export interface RequirementCandidate {
   species: string;
@@ -143,6 +144,14 @@ export interface TierConfig {
    *  current judgment is the authority for this kind of tier, not raw
    *  popularity. */
   vrThreadUrl?: string;
+  /** Last-resort fallback for a VR-driven tier: a real snapshot shipped
+   *  WITH the app, used only when BOTH the live fetch AND the on-disk
+   *  last-known-good copy (see vr-thread.ts) come up empty — in practice,
+   *  a deployment whose outbound IP is blocked by Smogon's forum
+   *  bot-protection and has never once completed a live fetch, so there's
+   *  no saved copy to fall back to either. Ignored for tiers without a
+   *  vrThreadUrl. */
+  bundledVrFallback?: Record<string, VrTier>;
 }
 
 const GENERIC_CONFIG: TierConfig = {
@@ -176,6 +185,7 @@ const CONFIGS: Record<string, TierConfig> = {
     getViability: vrListViability(3),
     trustCuratedLegality: true,
     vrThreadUrl: 'https://www.smogon.com/forums/threads/national-dex-ubers-viability-rankings-update-12-at-post-377.3712169/',
+    bundledVrFallback: GEN9_NATDEX_UBERS_BUNDLED_VR,
   },
 };
 
