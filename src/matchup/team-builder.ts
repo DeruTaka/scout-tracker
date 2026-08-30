@@ -15,7 +15,7 @@ import type { Datastore } from '../store/datastore.js';
 import type { MatchedSet } from '../types.js';
 import { toID, speciesMeta, canTerastallize } from '../data/dex.js';
 import type { ThreatProfile } from './threat-profile.js';
-import { getBestKnownSet, getKnownSetVariants, fillRealisticSet, allCandidateSpecies, type KnownSet, type KnownSetSource } from './candidate-pool.js';
+import { getBestKnownSet, getKnownSetVariants, fillRealisticSet, allCandidateSpecies, POWER_HERB_LOCKED_MOVES, type KnownSet, type KnownSetSource } from './candidate-pool.js';
 import { scoreMatchup, type MatchupResult } from './score.js';
 import { getHistoricalWinRates, type WinRate } from './historical.js';
 import { getUsageWeight, getUsageRankMap, getTeammateAffinity } from '../data/usage-provider.js';
@@ -471,7 +471,7 @@ export async function buildCounterTeam(
 
   const affinity = await buildAffinityMatrix(formatid, scored);
   const picked = searchTeam(scored, resolvedThreats, affinity, mandatoryIdx);
-  const { team: requirementsFixed, unmet } = await enforceRequirements(picked, scored, gen, config.requirements, config.mandatorySpecies, affinity, store, formatid);
+  const { team: requirementsFixed, unmet } = await enforceRequirements(picked, scored, gen, config.requirements, config.mandatorySpecies, affinity, store, formatid, scoreKnownSet);
   const bulked = await enforceBulkRequirement(requirementsFixed, scored, gen, config.requirements, config.mandatorySpecies, affinity, store, formatid, scoreKnownSet);
   const capped = enforceTopTierCap(bulked, scored, gen, config.requirements, config.mandatorySpecies, affinity);
   const { team: removalFixed, warning: removalWarning } = enforceHazardRemoval(capped, scored, gen, config.requirements, config.mandatorySpecies, affinity);
@@ -751,12 +751,50 @@ async function enforceRequirements(
   affinity: Map<string, number>,
   store: Datastore,
   formatid: string,
+  scoreKnownSet: (species: string, known: KnownSet) => Promise<ScoredCandidate | null>,
 ): Promise<{ team: ScoredCandidate[]; unmet: string[] }> {
   const team = [...picked];
   const unmet: string[] = [];
 
   for (const req of requirements) {
     if (team.some((p) => req.satisfies(gen, p))) continue;
+
+    // Cheapest fix first: does any CURRENT team member already have a real
+    // alternate build (same species, different set) that satisfies this on
+    // its own — e.g. Groudon-Primal's own defensive dex set carries Stealth
+    // Rock, or Arceus-Ground has a support role that does. Swapping the SET
+    // costs nothing structurally (same species, same dex-number/hazard
+    // footprint, same tier) and keeps a genuinely strong pick in the slot
+    // instead of importing a whole separate, often lower-tier species just
+    // to cover one requirement (e.g. reaching for a mid-tier hazard-setter
+    // when the team's own top-tier Arceus/Groudon could just run Stealth
+    // Rock instead).
+    let variantSwapped = false;
+    for (let i = 0; i < team.length; i++) {
+      const current = team[i]!;
+      const variants = await getKnownSetVariants(store, gen, formatid, current.species);
+      let matched: ScoredCandidate | null = null;
+      for (const rawKnown of variants) {
+        const filled = await fillRealisticSet(gen, formatid, rawKnown);
+        if (!req.satisfies(gen, { species: current.species, set: filled.set })) continue;
+        const rescored = await scoreKnownSet(current.species, filled);
+        if (rescored && (!matched || rescored.standaloneCeiling > matched.standaloneCeiling)) matched = rescored;
+      }
+      if (!matched) continue;
+
+      const otherRequirements = requirements.filter((r) => r !== req);
+      const stillOk = otherRequirements.every((r) => {
+        const satisfiedBefore = team.some((q) => r.satisfies(gen, q));
+        if (!satisfiedBefore) return true;
+        return team.some((q, j) => (j === i ? r.satisfies(gen, matched!) : r.satisfies(gen, q)));
+      });
+      if (!stillOk) continue;
+
+      team[i] = { ...matched, rationale: [...matched.rationale, `Switched to a real set that also covers required ${req.label}.`] };
+      variantSwapped = true;
+      break;
+    }
+    if (variantSwapped) continue;
 
     // Prefer reassigning an existing team member's Tera over swapping in a
     // whole different species — a real top-tier pick's Tera slot is
@@ -1134,6 +1172,11 @@ function enforceHazardRemoval(
     const forcedItem = speciesMeta(gen, p.set.baseSpecies)?.requiredItem;
     if (forcedItem) return p; // Rusted Sword / Red Orb / Blue Orb / a Mega Stone — can't be swapped off
     if (toID(p.set.item || '') === 'heavydutyboots') return p;
+    // Power Herb is functionally just as locked-in as a forme's required
+    // item when the set is actually holding a move that depends on it
+    // (Meteor Beam, Geomancy) — swapping it for Boots would leave that move
+    // stranded with no way to skip its charge turn.
+    if (toID(p.set.item || '') === 'powerherb' && p.set.moves.some((m) => POWER_HERB_LOCKED_MOVES.has(toID(m)))) return p;
     const simulated: ScoredCandidate = { ...p, set: { ...p.set, item: 'Heavy-Duty Boots' } };
     const breaksRequirement = requirements.some((r) => {
       const satisfiedBefore = team.some((q) => r.satisfies(gen, q));

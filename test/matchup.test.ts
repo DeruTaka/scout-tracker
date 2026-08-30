@@ -766,7 +766,17 @@ Rules<br />
     );
     expect(poisonSatisfier).toBeDefined();
     expect((poisonSatisfier!.set.tera ?? '').toLowerCase()).toBe('poison');
-    expect(poisonSatisfier!.rationale.some((r) => r.includes('Tera changed to Poison'))).toBe(true);
+    // Either repair path is a legitimate way to land here: reassigning this
+    // pick's Tera slot (no real precedent needed beyond fit), or swapping in
+    // a different real, already-evidenced set for the SAME species that
+    // happens to carry Tera Poison natively (checked first — it's strictly
+    // better-evidenced when available). Either way this must NOT be the
+    // species-swap fallback (which would show up as "Added for required").
+    expect(
+      poisonSatisfier!.rationale.some(
+        (r) => r.includes('Tera changed to Poison') || r.includes('Switched to a real set that also covers required Poison'),
+      ),
+    ).toBe(true);
     expect(result.unmetRequirements).not.toContain('Poison coverage (type or Tera)');
   }, 20000);
 

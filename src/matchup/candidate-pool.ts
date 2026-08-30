@@ -176,7 +176,35 @@ function evTotal(evs: Partial<Record<string, number>> | undefined): number {
  * is still a real, commonly-run build — never fabricated from nothing.
  * Already-complete sets pass through unchanged.
  */
+// A two-turn charge move that only makes sense held with Power Herb — the
+// item is the entire reason to run it, since it skips the charge turn.
+// Without Power Herb it's a wasted turn every time, and doubly so on a
+// Choice item: the lock repeats the same move, so the set is stuck
+// charging every other turn with no way to pick something else. A real
+// known set carrying one of these without Power Herb — from ANY source,
+// including a genuine scouted replay of a real (mis-)play — gets it
+// stripped before it's ever handed back as something to build into a team.
+export const POWER_HERB_LOCKED_MOVES = new Set(['meteorbeam', 'geomancy']);
+
+function stripPowerHerbLockedMoves(known: KnownSet): KnownSet {
+  const itemId = toID(known.set.item || '');
+  if (itemId === 'powerherb') return known;
+  const locked = known.set.moves.filter((m) => POWER_HERB_LOCKED_MOVES.has(toID(m)));
+  if (!locked.length) return known;
+  return {
+    ...known,
+    set: {
+      ...known.set,
+      moves: known.set.moves.filter((m) => !POWER_HERB_LOCKED_MOVES.has(toID(m))),
+      revealedMoves: known.set.revealedMoves.filter((m) => !POWER_HERB_LOCKED_MOVES.has(toID(m))),
+      notes: [...known.set.notes, `Dropped ${locked.join('/')} — needs Power Herb to skip the charge turn, and this set isn't holding it.`],
+    },
+  };
+}
+
 export async function fillRealisticSet(gen: Generation, formatid: string, known: KnownSet): Promise<KnownSet> {
+  known = stripPowerHerbLockedMoves(known);
+
   const needsMoves = known.set.moves.length < 4;
   const needsSpread = evTotal(known.set.evs) < 500; // a real 508-total spread rounds down to increments of 4
   if (!needsMoves && !needsSpread) return known;
@@ -210,7 +238,10 @@ export async function fillRealisticSet(gen: Generation, formatid: string, known:
       set.notes = [...set.notes, `Trimmed to this species' real known kit (${targetMoveCount} move${targetMoveCount === 1 ? '' : 's'} for ${formatid}) — a recorded move beyond that isn't actually part of it.`];
     } else if (set.moves.length < targetMoveCount) {
       const have = new Set(set.moves.map(toID));
-      const fallbackMoves = fallbackMoveList.filter((m) => !have.has(toID(m)));
+      const itemId = toID(set.item || '');
+      const fallbackMoves = fallbackMoveList.filter(
+        (m) => !have.has(toID(m)) && (itemId === 'powerherb' || !POWER_HERB_LOCKED_MOVES.has(toID(m))),
+      );
       set.moves = [...set.moves];
       for (const m of fallbackMoves) {
         if (set.moves.length >= targetMoveCount) break;
