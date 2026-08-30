@@ -799,7 +799,14 @@ async function enforceRequirements(
         return idle(a.p) - idle(b.p) || b.p.qualityScore - a.p.qualityScore;
       })[0];
 
-      if (reassignable) {
+      // A fit of 0 means NO current team member has any real precedent or
+      // offensive synergy for this Tera type — forcing it onto whichever one
+      // happens to have an idle slot would just be a different flavor of the
+      // same arbitrary pairing this whole scoring pass exists to avoid (e.g.
+      // Calyrex-Ice into Tera Poison). Only reassign when the best option is
+      // an actually-fitting one; otherwise fall through to bringing in a real
+      // species that naturally has this typing/precedent.
+      if (reassignable && reassignable.fit > 0) {
         team[reassignable.i] = {
           ...reassignable.p,
           set: { ...reassignable.p.set, tera: teraType },

@@ -80,6 +80,25 @@ function arceusFormRequirement(): Requirement {
   };
 }
 
+// Sticky Web, Stealth Rock, and Spikes only — Toxic Spikes and Steel Surge
+// don't count toward this mandate (they're fine to run alongside one of
+// these, just not a substitute for it: neither actually punishes switching
+// the way rocks/spikes/webs do on their own).
+const MANDATED_HAZARD_MOVES = new Set(['stickyweb', 'stealthrock', 'spikes']);
+
+/** At least one real entry-hazard setter (Sticky Web, Stealth Rock, or
+ *  Spikes — running more than one, e.g. rocks + spikes, is fine too, just
+ *  not required beyond the first). Every team needs some form of hazard
+ *  pressure; which specific one is left open since the right choice depends
+ *  on the rest of the team (a hyper-offense sash lead wants Spikes/Webs, a
+ *  bulkier team is often fine with just Stealth Rock). */
+function hazardRequirement(): Requirement {
+  return {
+    label: 'entry hazards (Sticky Web, Stealth Rock, or Spikes)',
+    satisfies: (_gen, pick) => pick.set.moves.map(toID).some((m) => MANDATED_HAZARD_MOVES.has(m)),
+  };
+}
+
 const SPEED_CONTROL_MOVES = new Set(['trickroom', 'tailwind', 'stickyweb', 'thunderwave', 'glare', 'nuzzle', 'icywind']);
 
 /** At least one real speed-control tool: Trick Room (flips the whole speed
@@ -212,6 +231,7 @@ const CONFIGS: Record<string, TierConfig> = {
       typeRequirement('Dark', true),
       typeRequirement('Fairy', true),
       speedControlRequirement(),
+      hazardRequirement(),
     ],
     extraCandidateSpecies: [],
     getViability: usageRankViability(45, 3),
@@ -225,6 +245,7 @@ const CONFIGS: Record<string, TierConfig> = {
       typeRequirement('Fairy', true), // unlike gen9ubers, Fairy can be satisfied via Tera here
       arceusFormRequirement(),
       speedControlRequirement(),
+      hazardRequirement(),
     ],
     extraCandidateSpecies: [],
     getViability: vrListViability(8),
