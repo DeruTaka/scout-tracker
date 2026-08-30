@@ -188,18 +188,38 @@ export async function fillRealisticSet(gen: Generation, formatid: string, known:
 
   const set = { ...known.set };
   if (needsMoves) {
-    const have = new Set(set.moves.map(toID));
-    const fallbackMoves = fallback.moves
-      .map((m) => (Array.isArray(m) ? m[0] : m))
-      .filter((m): m is string => !!m && !have.has(toID(m)));
-    set.moves = [...set.moves];
-    for (const m of fallbackMoves) {
-      if (set.moves.length >= 4) break;
-      set.moves.push(m);
-      have.add(toID(m));
-    }
-    if (set.moves.length > set.revealedMoves.length) {
-      set.notes = [...set.notes, `Filled out to a full moveset using ${known.source === 'store' ? 'this species’' : 'the'} common ${formatid} build — only ${set.revealedMoves.length} move(s) had real evidence.`];
+    // Most species run a full 4 moves, but some genuinely don't — Ditto's
+    // entire real kit is Transform, full stop. The real known build's own
+    // move-slot count is the actual target, not a blind assumption of 4:
+    // padding toward 4 for a species whose real kit is smaller would just
+    // add nothing (there's nothing legitimate left to add), but a bogus
+    // extra "observed" move (a mis-scouted replay artifact — Ditto
+    // Transforming into something and the log misattributing the
+    // transformed-into move to Ditto itself) needs to be trimmed back off
+    // rather than left in place.
+    const fallbackMoveList = fallback.moves.map((m) => (Array.isArray(m) ? m[0] : m)).filter((m): m is string => !!m);
+    const targetMoveCount = Math.min(4, fallbackMoveList.length || 4);
+    const fallbackMoveIds = new Set(fallbackMoveList.map(toID));
+
+    if (set.moves.length > targetMoveCount) {
+      // Keep whatever's ALSO in the real known kit first (legitimate),
+      // drop the rest, and cap at the real size.
+      const keep = set.moves.filter((m) => fallbackMoveIds.has(toID(m)));
+      const rest = set.moves.filter((m) => !fallbackMoveIds.has(toID(m)));
+      set.moves = [...keep, ...rest].slice(0, targetMoveCount);
+      set.notes = [...set.notes, `Trimmed to this species' real known kit (${targetMoveCount} move${targetMoveCount === 1 ? '' : 's'} for ${formatid}) — a recorded move beyond that isn't actually part of it.`];
+    } else if (set.moves.length < targetMoveCount) {
+      const have = new Set(set.moves.map(toID));
+      const fallbackMoves = fallbackMoveList.filter((m) => !have.has(toID(m)));
+      set.moves = [...set.moves];
+      for (const m of fallbackMoves) {
+        if (set.moves.length >= targetMoveCount) break;
+        set.moves.push(m);
+        have.add(toID(m));
+      }
+      if (set.moves.length > set.revealedMoves.length) {
+        set.notes = [...set.notes, `Filled out to a full moveset using ${known.source === 'store' ? 'this species’' : 'the'} common ${formatid} build — only ${set.revealedMoves.length} move(s) had real evidence.`];
+      }
     }
   }
   if (needsSpread && fallback.evs && evTotal(fallback.evs) >= 500) {

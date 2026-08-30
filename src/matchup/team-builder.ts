@@ -13,7 +13,7 @@
 import type { Generation, GenerationNum } from '@pkmn/data';
 import type { Datastore } from '../store/datastore.js';
 import type { MatchedSet } from '../types.js';
-import { toID, speciesMeta } from '../data/dex.js';
+import { toID, speciesMeta, canTerastallize } from '../data/dex.js';
 import type { ThreatProfile } from './threat-profile.js';
 import { getBestKnownSet, getKnownSetVariants, fillRealisticSet, allCandidateSpecies, type KnownSet, type KnownSetSource } from './candidate-pool.js';
 import { scoreMatchup, type MatchupResult } from './score.js';
@@ -131,15 +131,6 @@ function isTierLegal(sp: { tier?: string; isNonstandard?: string | null } | unde
 
 function hasBannedMove(set: MatchedSet): boolean {
   return set.moves.some((m) => BANNED_MOVES.has(toID(m)));
-}
-
-/** A Mega-evolved or Primal-Reverted forme is locked into that forme's own
- *  typing for the whole battle — the game doesn't let it also Terastallize
- *  (the two transformations are mutually exclusive), so it's never a valid
- *  target for the Tera-reassignment repair pass below. */
-function canTerastallize(gen: Generation, baseSpecies: string): boolean {
-  const forme = speciesMeta(gen, baseSpecies)?.forme ?? '';
-  return !/^Mega/.test(forme) && forme !== 'Primal';
 }
 
 function hazardMovesOf(set: MatchedSet): string[] {
@@ -480,11 +471,12 @@ export async function buildCounterTeam(
 
   const affinity = await buildAffinityMatrix(formatid, scored);
   const picked = searchTeam(scored, resolvedThreats, affinity, mandatoryIdx);
-  const { team: requirementsFixed, unmet } = enforceRequirements(picked, scored, gen, config.requirements, config.mandatorySpecies, affinity);
+  const { team: requirementsFixed, unmet } = await enforceRequirements(picked, scored, gen, config.requirements, config.mandatorySpecies, affinity, store, formatid);
   const bulked = await enforceBulkRequirement(requirementsFixed, scored, gen, config.requirements, config.mandatorySpecies, affinity, store, formatid, scoreKnownSet);
   const capped = enforceTopTierCap(bulked, scored, gen, config.requirements, config.mandatorySpecies, affinity);
-  const { team: repaired, warning: removalWarning } = enforceHazardRemoval(capped, scored, gen, config.requirements, config.mandatorySpecies, affinity);
+  const { team: removalFixed, warning: removalWarning } = enforceHazardRemoval(capped, scored, gen, config.requirements, config.mandatorySpecies, affinity);
   if (removalWarning) warnings.push(removalWarning);
+  const repaired = await enforceBestVariant(removalFixed, gen, config.requirements, config.mandatorySpecies, store, formatid, scoreKnownSet);
 
   const team = repaired.map((c) => ({ species: c.species, set: c.set, source: c.source, rationale: c.rationale }));
   return { threats, resolvedThreats, team, unmetRequirements: unmet, warnings };
@@ -715,6 +707,32 @@ function searchTeam(
   return best.pickedIdx.map((idx) => scored[idx]!);
 }
 
+/** Real evidence for whether Tera-ing a pick into `teraType` is a realistic
+ *  choice, not just a legal one: (a) does a real, known variant of this SAME
+ *  species actually run this Tera in practice — the strongest signal, since
+ *  it's direct precedent; (b) does the pick's own moveset already carry a
+ *  move of that type, so the Tera would boost an existing STAB-adjacent
+ *  attack (Tera-STAB) rather than sitting there for no reason at all.
+ *  (A "defensive synergy" signal — does this type remove a real weakness —
+ *  was tried and dropped: nearly any single type scores as a numeric
+ *  weakness-count improvement over a real dual-type combo, so it couldn't
+ *  actually tell a sensible pairing apart from an arbitrary one.)
+ *  Higher is more realistic; 0 means no real reason found for this pairing
+ *  on this specific Pokemon. */
+async function teraFitScore(
+  store: Datastore,
+  gen: Generation,
+  formatid: string,
+  species: string,
+  set: MatchedSet,
+  teraType: string,
+): Promise<number> {
+  const variants = await getKnownSetVariants(store, gen, formatid, species);
+  const hasPrecedent = variants.some((v) => (v.set.tera ?? '').toLowerCase() === teraType.toLowerCase());
+  const hasMoveOfType = set.moves.some((m) => toID(gen.moves.get(m)?.type ?? '') === toID(teraType));
+  return (hasPrecedent ? 2 : 0) + (hasMoveOfType ? 1 : 0);
+}
+
 /**
  * Hard-constraint repair pass: the search optimizes for threat coverage and
  * doesn't know about this tier's coverage requirements, so after it returns,
@@ -724,14 +742,16 @@ function searchTeam(
  * thing satisfying some other still-relevant requirement — so fixing one
  * requirement never silently breaks another.
  */
-function enforceRequirements(
+async function enforceRequirements(
   picked: ScoredCandidate[],
   scored: ScoredCandidate[],
   gen: Generation,
   requirements: Requirement[],
   mandatorySpecies: string[],
   affinity: Map<string, number>,
-): { team: ScoredCandidate[]; unmet: string[] } {
+  store: Datastore,
+  formatid: string,
+): Promise<{ team: ScoredCandidate[]; unmet: string[] }> {
   const team = [...picked];
   const unmet: string[] = [];
 
@@ -750,9 +770,9 @@ function enforceRequirements(
     if (req.teraType) {
       const teraType = req.teraType;
       const otherRequirements = requirements.filter((r) => r !== req);
-      const reassignable = team
+      const eligible = team
         .map((p, i) => ({ p, i }))
-        .filter(({ p }) => canTerastallize(gen, p.set.baseSpecies)) // Mega/Primal formes are locked to their own typing, no Tera
+        .filter(({ p }) => canTerastallize(gen, p.set.baseSpecies, p.set.item)) // Mega/Primal formes, or a held Z-Crystal, lock out Tera entirely
         .filter(({ p, i }) => {
           const simulated: ScoredCandidate = { ...p, set: { ...p.set, tera: teraType } };
           // Changing p's Tera must not break any OTHER requirement that
@@ -763,13 +783,21 @@ function enforceRequirements(
             if (!satisfiedBefore) return true; // already unmet — this swap can't make it worse
             return team.some((q, j) => (j === i ? r.satisfies(gen, simulated) : r.satisfies(gen, q)));
           });
-        })
-        .sort((a, b) => {
-          // Prefer a member whose Tera isn't already doing anything (free
-          // to reassign) over one that would be giving something up.
-          const idle = (p: ScoredCandidate) => (!p.set.tera || p.set.tera.toLowerCase() === 'nothing' ? 0 : 1);
-          return idle(a.p) - idle(b.p) || b.p.qualityScore - a.p.qualityScore;
-        })[0];
+        });
+
+      const scoredEligible = await Promise.all(
+        eligible.map(async ({ p, i }) => ({ p, i, fit: await teraFitScore(store, gen, formatid, p.species, p.set, teraType) })),
+      );
+      const reassignable = scoredEligible.sort((a, b) => {
+        // Real precedent/offensive synergy first — an "idle Tera slot" that
+        // makes no sense for the species (Calyrex-Ice into Poison, say)
+        // isn't actually a good answer just because it's technically free.
+        if (a.fit !== b.fit) return b.fit - a.fit;
+        // Then prefer a member whose Tera isn't already doing anything
+        // (free to reassign) over one that would be giving something up.
+        const idle = (p: ScoredCandidate) => (!p.set.tera || p.set.tera.toLowerCase() === 'nothing' ? 0 : 1);
+        return idle(a.p) - idle(b.p) || b.p.qualityScore - a.p.qualityScore;
+      })[0];
 
       if (reassignable) {
         team[reassignable.i] = {
@@ -781,25 +809,10 @@ function enforceRequirements(
       }
     }
 
-    const pickedIds = new Set(team.map((p) => toID(p.species)));
-    const pickedDexNums = new Set(team.map((p) => p.dexNum).filter((n): n is number => n !== undefined));
-    const pickedHazards = new Set(team.flatMap((p) => hazardMovesOf(p.set)));
-    const replacementOptions = scored
-      .filter((c) => !pickedIds.has(toID(c.species)))
-      .filter((c) => c.dexNum === undefined || !pickedDexNums.has(c.dexNum))
-      .filter((c) => !hazardMovesOf(c.set).some((m) => pickedHazards.has(m)))
-      .filter((c) => req.satisfies(gen, c))
-      .map((c) => ({
-        c,
-        value: c.qualityScore + c.weightedSum + team.reduce((s, p) => s + TEAMMATE_WEIGHT * pairAffinity(affinity, c.idx, p.idx), 0),
-      }))
-      .sort((a, b) => b.value - a.value);
-
-    if (!replacementOptions.length) {
-      unmet.push(req.label);
-      continue;
-    }
-
+    // Which slot to free up — decided BEFORE the replacement candidate
+    // pool, so that pool's own dex-number exclusion can leave that one
+    // slot's dex number open (a same-family swap, e.g. Arceus-Ghost being
+    // replaced by Arceus-Dark, must stay legal even though they share one).
     const removable = team
       .map((p, i) => ({ p, i }))
       .filter(({ p }) => !mandatorySpecies.includes(p.species))
@@ -812,6 +825,26 @@ function enforceRequirements(
       .sort((a, b) => a.p.qualityScore + a.p.weightedSum - (b.p.qualityScore + b.p.weightedSum))[0];
 
     if (!removable) {
+      unmet.push(req.label);
+      continue;
+    }
+
+    const others = team.filter((_, j) => j !== removable.i);
+    const pickedIds = new Set(others.map((p) => toID(p.species)));
+    const pickedDexNums = new Set(others.map((p) => p.dexNum).filter((n): n is number => n !== undefined));
+    const pickedHazards = new Set(others.flatMap((p) => hazardMovesOf(p.set)));
+    const replacementOptions = scored
+      .filter((c) => !pickedIds.has(toID(c.species)))
+      .filter((c) => c.dexNum === undefined || !pickedDexNums.has(c.dexNum))
+      .filter((c) => !hazardMovesOf(c.set).some((m) => pickedHazards.has(m)))
+      .filter((c) => req.satisfies(gen, c))
+      .map((c) => ({
+        c,
+        value: c.qualityScore + c.weightedSum + others.reduce((s, p) => s + TEAMMATE_WEIGHT * pairAffinity(affinity, c.idx, p.idx), 0),
+      }))
+      .sort((a, b) => b.value - a.value);
+
+    if (!replacementOptions.length) {
       unmet.push(req.label);
       continue;
     }
@@ -863,9 +896,14 @@ function enforceTopTierCap(
   const toUpgrade = lowTier.slice(MAX_LOW_TIER_PICKS);
 
   for (const { i } of toUpgrade) {
-    const pickedIds = new Set(result.map((q) => toID(q.species)));
-    const pickedDexNums = new Set(result.map((q) => q.dexNum).filter((n): n is number => n !== undefined));
-    const pickedHazards = new Set(result.flatMap((q) => hazardMovesOf(q.set)));
+    // Exclude slot i's OWN species/dex-number/hazards from the "already
+    // taken" blocklist — we're replacing that exact slot, not adding a 7th
+    // member, so a same-family upgrade (Arceus-Ghost -> Arceus-Dark) must
+    // stay legal even though they share a dex number.
+    const others = result.filter((_, j) => j !== i);
+    const pickedIds = new Set(others.map((q) => toID(q.species)));
+    const pickedDexNums = new Set(others.map((q) => q.dexNum).filter((n): n is number => n !== undefined));
+    const pickedHazards = new Set(others.flatMap((q) => hazardMovesOf(q.set)));
     const candidates = scored
       .filter((c) => c.isTopTier)
       .filter((c) => !pickedIds.has(toID(c.species)))
@@ -985,9 +1023,13 @@ async function enforceBulkRequirement(
       continue;
     }
 
-    const pickedIds = new Set(result.map((q) => toID(q.species)));
-    const pickedDexNums = new Set(result.map((q) => q.dexNum).filter((n): n is number => n !== undefined));
-    const pickedHazards = new Set(result.flatMap((q) => hazardMovesOf(q.set)));
+    // Exclude slot i's OWN species/dex-number/hazards — we're replacing
+    // that exact slot, so a same-family upgrade must stay legal even
+    // though it shares a dex number with what's currently there.
+    const others = result.filter((_, j) => j !== i);
+    const pickedIds = new Set(others.map((q) => toID(q.species)));
+    const pickedDexNums = new Set(others.map((q) => q.dexNum).filter((n): n is number => n !== undefined));
+    const pickedHazards = new Set(others.flatMap((q) => hazardMovesOf(q.set)));
     const candidates = scored
       .filter((c) => isBulky(c.set))
       .filter((c) => !pickedIds.has(toID(c.species)))
@@ -1044,27 +1086,33 @@ function enforceHazardRemoval(
 ): { team: ScoredCandidate[]; warning?: string } {
   if (team.some((p) => hasRemovalMove(p.set))) return { team };
 
-  const pickedIds = new Set(team.map((p) => toID(p.species)));
-  const pickedDexNums = new Set(team.map((p) => p.dexNum).filter((n): n is number => n !== undefined));
-  const pickedHazards = new Set(team.flatMap((p) => hazardMovesOf(p.set)));
-  const defoggers = scored
-    .filter((c) => hasRemovalMove(c.set))
-    .filter((c) => !pickedIds.has(toID(c.species)))
-    .filter((c) => c.dexNum === undefined || !pickedDexNums.has(c.dexNum))
-    .filter((c) => !hazardMovesOf(c.set).some((m) => pickedHazards.has(m)))
-    .sort((a, b) => (Number(b.isTopTier) - Number(a.isTopTier)) || b.qualityScore + b.weightedSum - (a.qualityScore + a.weightedSum));
+  // Which slot to free up — decided BEFORE the replacement candidate pool,
+  // so that pool's own dex-number exclusion can leave that one slot's dex
+  // number open (a same-family swap must stay legal even though it shares
+  // one).
+  const removable = team
+    .map((p, i) => ({ p, i }))
+    .filter(({ p }) => !mandatorySpecies.includes(p.species))
+    .filter(({ p }) => !requirements.some((r) => r.satisfies(gen, p) && team.filter((q) => q !== p).every((q) => !r.satisfies(gen, q))))
+    .sort(
+      (a, b) =>
+        a.p.qualityScore + a.p.weightedSum + team.reduce((s, q) => (q === a.p ? s : s + TEAMMATE_WEIGHT * pairAffinity(affinity, a.p.idx, q.idx)), 0) -
+        (b.p.qualityScore + b.p.weightedSum + team.reduce((s, q) => (q === b.p ? s : s + TEAMMATE_WEIGHT * pairAffinity(affinity, b.p.idx, q.idx)), 0)),
+    )[0];
 
-  if (defoggers.length) {
-    const removable = team
-      .map((p, i) => ({ p, i }))
-      .filter(({ p }) => !mandatorySpecies.includes(p.species))
-      .filter(({ p }) => !requirements.some((r) => r.satisfies(gen, p) && team.filter((q) => q !== p).every((q) => !r.satisfies(gen, q))))
-      .sort(
-        (a, b) =>
-          a.p.qualityScore + a.p.weightedSum + team.reduce((s, q) => s + TEAMMATE_WEIGHT * pairAffinity(affinity, a.p.idx, q.idx), 0) -
-          (b.p.qualityScore + b.p.weightedSum + team.reduce((s, q) => s + TEAMMATE_WEIGHT * pairAffinity(affinity, b.p.idx, q.idx), 0)),
-      )[0];
-    if (removable) {
+  if (removable) {
+    const others = team.filter((_, j) => j !== removable.i);
+    const pickedIds = new Set(others.map((p) => toID(p.species)));
+    const pickedDexNums = new Set(others.map((p) => p.dexNum).filter((n): n is number => n !== undefined));
+    const pickedHazards = new Set(others.flatMap((p) => hazardMovesOf(p.set)));
+    const defoggers = scored
+      .filter((c) => hasRemovalMove(c.set))
+      .filter((c) => !pickedIds.has(toID(c.species)))
+      .filter((c) => c.dexNum === undefined || !pickedDexNums.has(c.dexNum))
+      .filter((c) => !hazardMovesOf(c.set).some((m) => pickedHazards.has(m)))
+      .sort((a, b) => (Number(b.isTopTier) - Number(a.isTopTier)) || b.qualityScore + b.weightedSum - (a.qualityScore + a.weightedSum));
+
+    if (defoggers.length) {
       const next = [...team];
       const pick = defoggers[0]!;
       next[removable.i] = { ...pick, rationale: [...pick.rationale, 'Added for hazard removal — nothing else on the team could clear Stealth Rock/Spikes.'] };
@@ -1093,4 +1141,56 @@ function enforceHazardRemoval(
     team: next,
     warning: bootedAny ? 'No hazard removal was available for this team — every eligible pick was given Heavy-Duty Boots instead.' : undefined,
   };
+}
+
+/**
+ * Final polish: every non-mandatory pick's build only ever came from
+ * getBestKnownSet's SINGLE best-known set for that species — good most of
+ * the time, but not the same rigor the mandatory pick gets (which evaluates
+ * every real variant and picks whichever actually answers this matchup
+ * best). This does the same for the rest of the team: re-score every real
+ * variant of each already-picked species, and switch to a genuinely
+ * better-scoring one if it exists — reusing pickBestMandatoryVariant's own
+ * dex-over-usage-stats and hazard-flex preferences, so a build like a real
+ * Boots/Tera-Fire/Swords-Dance role can win out over whatever the first-
+ * listed dex-analysis role happened to be (a raw Choice Band set, say) when
+ * it's genuinely the stronger real answer here.
+ */
+async function enforceBestVariant(
+  team: ScoredCandidate[],
+  gen: Generation,
+  requirements: Requirement[],
+  mandatorySpecies: string[],
+  store: Datastore,
+  formatid: string,
+  scoreKnownSet: (species: string, known: KnownSet) => Promise<ScoredCandidate | null>,
+): Promise<ScoredCandidate[]> {
+  const result = [...team];
+  for (let i = 0; i < result.length; i++) {
+    const current = result[i]!;
+    if (mandatorySpecies.includes(current.species)) continue;
+
+    const variants = await getKnownSetVariants(store, gen, formatid, current.species);
+    const rescored: ScoredCandidate[] = [];
+    for (const rawKnown of variants) {
+      const filled = await fillRealisticSet(gen, formatid, rawKnown);
+      const cand = await scoreKnownSet(current.species, filled);
+      if (cand) rescored.push(cand);
+    }
+    if (!rescored.length) continue;
+
+    const best = pickBestMandatoryVariant(rescored);
+    if (!best || best.standaloneCeiling <= current.standaloneCeiling) continue;
+
+    const simulated: ScoredCandidate = { ...current, set: best.set, source: best.source, standaloneCeiling: best.standaloneCeiling };
+    const breaksRequirement = requirements.some((r) => {
+      const satisfiedBefore = result.some((q) => r.satisfies(gen, q));
+      if (!satisfiedBefore) return false;
+      return !result.some((q, j) => (j === i ? r.satisfies(gen, simulated) : r.satisfies(gen, q)));
+    });
+    if (breaksRequirement) continue;
+
+    result[i] = { ...best, idx: current.idx, rationale: [...best.rationale, 'Switched to a better-evidenced real build for this matchup.'] };
+  }
+  return result;
 }

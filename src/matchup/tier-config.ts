@@ -6,7 +6,7 @@
 // notion of "viable."
 import type { Generation } from '@pkmn/data';
 import type { MatchedSet } from '../types.js';
-import { toID, speciesMeta } from '../data/dex.js';
+import { toID, speciesMeta, canTerastallize } from '../data/dex.js';
 import { VR_TIER_SCORE, type VrTier } from './vr-thread.js';
 import { GEN9_NATDEX_UBERS_BUNDLED_VR } from './tiers/gen9nationaldexubers-bundled-vr.js';
 
@@ -36,7 +36,17 @@ function typeRequirement(type: string, allowTera: boolean): Requirement {
       const meta = speciesMeta(gen, pick.set.baseSpecies);
       const types = (meta?.types ?? []).map((t) => t.toLowerCase());
       if (types.includes(type.toLowerCase())) return true;
-      if (allowTera && (pick.set.tera ?? '').toLowerCase() === type.toLowerCase()) return true;
+      // A Mega/Primal forme or a Z-Crystal holder can't actually click
+      // Tera at all — a stray `tera` value on a set like that (a real
+      // Smogon set sometimes lists one purely as a legality-neutral
+      // default) never counts toward satisfying this.
+      if (
+        allowTera &&
+        (pick.set.tera ?? '').toLowerCase() === type.toLowerCase() &&
+        canTerastallize(gen, pick.set.baseSpecies, pick.set.item)
+      ) {
+        return true;
+      }
       return false;
     },
     teraType: allowTera ? type : undefined,

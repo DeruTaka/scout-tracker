@@ -141,6 +141,28 @@ export function speciesMeta(gen: Generation, name: string): SpeciesMeta | undefi
 }
 
 /**
+ * A Mega-evolved or Primal-Reverted forme is locked into that forme's own
+ * typing for the whole battle — the game doesn't let it also Terastallize
+ * (the two transformations are mutually exclusive). Separately, holding a
+ * Z-Crystal locks a Pokemon into using a Z-Move instead — also mutually
+ * exclusive with Terastallizing in any format that enables both mechanics
+ * at once (a National Dex-style format, for instance). Either one makes
+ * Tera unusable regardless of what a set's own `tera` field claims.
+ */
+export function canTerastallize(gen: Generation, baseSpecies: string, item?: string): boolean {
+  const forme = speciesMeta(gen, baseSpecies)?.forme ?? '';
+  if (/^Mega/.test(forme) || forme === 'Primal') return false;
+  // Z-Crystals are a gen7-only mechanic, so gen9's own wrapped item table
+  // doesn't carry the zMove flag (same restricted-table issue speciesMeta
+  // works around above) — fall back to the ungenned base Dex, which does.
+  if (item) {
+    const it = gen.items.get(item) ?? Dex.items.get(item);
+    if (it && (it as any).zMove) return false;
+  }
+  return true;
+}
+
+/**
  * Filename slug for play.pokemonshowdown.com/sprites/gen5/<slug>.png. NOT
  * simply toID(displayName) — Showdown IDs the base species and forme
  * SEPARATELY then joins with one hyphen, which only matters when a name has
