@@ -9,6 +9,7 @@ import type { MatchedSet } from '../types.js';
 import { toID, speciesMeta, canTerastallize } from '../data/dex.js';
 import { VR_TIER_SCORE, type VrTier } from './vr-thread.js';
 import { GEN9_NATDEX_UBERS_BUNDLED_VR } from './tiers/gen9nationaldexubers-bundled-vr.js';
+import { GEN9_CAP_BUNDLED_VR } from './tiers/gen9cap-bundled-vr.js';
 
 export interface RequirementCandidate {
   species: string;
@@ -252,6 +253,23 @@ const CONFIGS: Record<string, TierConfig> = {
     trustCuratedLegality: true,
     vrThreadUrl: 'https://www.smogon.com/forums/threads/national-dex-ubers-viability-rankings-update-12-at-post-377.3712169/',
     bundledVrFallback: GEN9_NATDEX_UBERS_BUNDLED_VR,
+  },
+  gen9cap: {
+    // No single centralizing mandatory pick the way Ubers has one (Koraidon,
+    // Groudon-Primal) — CAP's own custom mons spread the metagame's
+    // must-answer threats across several different species instead of one.
+    // Kept intentionally general (speed control + hazards only, not
+    // meta-specific type mandates): those Ubers-only requirements exist to
+    // answer a small set of known, dominant Ubers-only threats, and
+    // asserting the same for CAP without that same domain grounding would
+    // just be guessing at what actually defines this metagame.
+    mandatorySpecies: [],
+    requirements: [speedControlRequirement(), hazardRequirement()],
+    extraCandidateSpecies: [],
+    getViability: vrListViability(8),
+    trustCuratedLegality: true, // every CAP-created species is isNonstandard: "CAP" in @pkmn/dex — the VR list itself is this format's legality authority, not the regional dex
+    vrThreadUrl: 'https://www.smogon.com/forums/threads/sv-cap-viability-rankings.3714023/',
+    bundledVrFallback: GEN9_CAP_BUNDLED_VR,
   },
 };
 

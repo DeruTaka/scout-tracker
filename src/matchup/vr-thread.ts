@@ -131,6 +131,8 @@ export function parseVrThreadFirstPost(html: string): RawVrEntry[] | null {
   let currentTier: VrTier | null = null;
   for (const line of lines) {
     if (line === 'Rules') break; // end of the tier list section
+    if (/^Last edited:/i.test(line)) break; // no "Rules" line at all on some threads (e.g. CAP's) — the post footer is the real end
+    if (/^Reactions:/i.test(line)) break;
     if ((TIER_LABELS as readonly string[]).includes(line)) {
       currentTier = line as VrTier;
       continue;
@@ -139,9 +141,23 @@ export function parseVrThreadFirstPost(html: string): RawVrEntry[] | null {
       currentTier = 'D'; // D has no separate short label of its own — "D Rank" IS the label
       continue;
     }
-    if (/^[SABC] Rank\b/.test(line)) continue; // group divider (e.g. "A Rank"), not a tier change
+    // Some threads (e.g. CAP's) write each real tier header as "<Tier>
+    // Rank:" WITH a colon, including the bare no-modifier ones ("S Rank:",
+    // "C Rank:") — unlike the bare-label style above, here that bare form
+    // IS a real tier, not a group divider. The colon is what disambiguates
+    // it from that same thread's own OWN plural group dividers ("A Ranks:").
+    const colonMatch = /^([SABC][+-]?) Rank:$/i.exec(line);
+    if (colonMatch) {
+      const code = colonMatch[1]!.toUpperCase() as VrTier;
+      if ((TIER_LABELS as readonly string[]).includes(code)) {
+        currentTier = code;
+        continue;
+      }
+    }
+    if (/^[SABC] Ranks?:?$/i.test(line)) continue; // group divider ("A Rank" or "A Ranks:"), not a tier change
     if (!currentTier) continue;
     if (/^Reminder:/i.test(line)) continue; // D tier's own description line
+    if (/^Empty$/i.test(line)) continue; // a tier with nothing currently ranked in it (seen on CAP's S rank)
 
     entries.push({ tier: currentTier, displayName: line });
   }
